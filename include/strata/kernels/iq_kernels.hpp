@@ -76,6 +76,8 @@ void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int
 /// One decode token's top-k mix on the card: out[i] = sum_k w[k] * parts[k * H + i] in double, k in order (== the
 /// tier's host loop bit for bit); w[k] == 0 skips row k.
 void decode_rows_sum(const float* parts, const float* w, int K, int64_t H, float* out, void* stream);
+/// The same, added to what out already holds (STRATA_DEFER: the previous layer's deferred experts of one token).
+void decode_rows_add(const float* parts, const float* w, int K, int64_t H, float* out, void* stream);
 
 /// A770 port (STRATA_PF_XMX=2): up to kXmxGroupMax experts' products in one XMX launch, the weights decoded from the
 /// quantized rows into local memory.  Expert i: Y_i[cnt[i]][N] = X_i . W_i^T (X FP16, Y FP32, rows back to back).

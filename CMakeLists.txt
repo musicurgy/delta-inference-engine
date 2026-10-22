@@ -1239,8 +1239,9 @@ add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
-# and the engine picks the kernels at run time (cpu_avx512_ok).
-if(MSVC)
+# and the engine picks the kernels at run time (cpu_avx512_ok).  clang-cl counts as MSVC but, like clang, needs every
+# feature its intrinsics use (/arch:AVX512 has no VNNI / VBMI): it takes the GCC/Clang spelling below.
+if(MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 else()
@@ -1373,7 +1374,7 @@ if(STRATA_NATIVE_EXPERTS)
                                            src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
                                            src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
-  if(MSVC)
+  if(MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")   # clang-cl: the GCC/Clang flags below (see expert.cpp)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
                                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")

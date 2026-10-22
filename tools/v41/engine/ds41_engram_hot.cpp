@@ -15,6 +15,7 @@
 //   ds41_engram_hot pack --gguf G --dir D1:D2 --rank rank.bin --gib 4 --out hot.bin [--threads 32]
 //       Reads the top rows from the tables and writes the pack (format in ds41_engram.cpp, load_hot).
 #include "ds41_engram.hpp"
+#include "ds41_sys.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -314,13 +315,18 @@ int main(int argc, char ** argv) {
     }
     const int nel = (int) G.engram_layers.size();
     Ds41Engram eng;
+#ifdef _WIN32
+    const char kDirSep = ';';   // ':' follows the drive letter on Windows
+#else
+    const char kDirSep = ':';
+#endif
     if (cmd == "pack") {
         if (dir.empty() || rank.empty() || out.empty()) { std::fprintf(stderr, "hot: pack needs --dir --rank --out\n"); return 2; }
         std::vector<std::string> dirs;
-        for (size_t a = 0, b; a <= dir.size(); a = b + 1) { b = dir.find(':', a); if (b == std::string::npos) b = dir.size(); if (b > a) dirs.push_back(dir.substr(a, b - a)); }
+        for (size_t a = 0, b; a <= dir.size(); a = b + 1) { b = dir.find(kDirSep, a); if (b == std::string::npos) b = dir.size(); if (b > a) dirs.push_back(dir.substr(a, b - a)); }
         std::string e;
-        ::setenv("STRATA_ENGRAM_CACHE_ROWS", "0", 1);   // no row cache / hot set in the reader we pack from
-        ::setenv("STRATA_ENGRAM_HOT", "0", 1);
+        ds41_sys::setenv("STRATA_ENGRAM_CACHE_ROWS", "0", 1);   // no row cache / hot set in the reader we pack from
+        ds41_sys::setenv("STRATA_ENGRAM_HOT", "0", 1);
         if (!eng.open(G, dirs, 1, e)) { std::fprintf(stderr, "hot: engram open: %s\n", e.c_str()); return 1; }
         return cmd_pack(eng, rank, gib, out, threads);
     }

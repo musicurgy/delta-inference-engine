@@ -117,6 +117,8 @@ public:
     /// The routed-sum input tensor's device memory (columns of n_embd floats; null on the CPU backend): the tier can
     /// write a layer-major batch's routed sums straight into it (run_chunk_dev) instead of upload_routed's host trip.
     float * routed_dev();
+    /// The dense stream waits (on the card, no host sync) for a CUDA event recorded elsewhere (cudaEvent_t as void*).
+    bool wait_event(void * cuda_event);
     bool finish_span(int il, int col0, int n);
     /// STRATA_DENSE_PROF=1: print + reset the batch dense split (build / alloc / compute / Engram / readback) - diagnostic
     void prof_report(const char * tag);
@@ -140,7 +142,11 @@ public:
     /// Layer il of the current pass: Engram (layers 1/14), attention, hc, ffn_norm, router, shared expert.
     /// ids / wts: n * n_used (token-major); *fn_host: n * n_embd floats (the routed experts' input, valid until the
     /// next call).  `fn_dev` (optional): the same activations on the backend.
-    bool attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev = nullptr);
+    bool attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev = nullptr,
+                     bool defer_shexp = false);
+    /// STRATA_SHEXP_SPLIT=1: launch this layer's shared expert (its own graph, from o_fn) - call after attn_router, before
+    /// the routed tier; a no-op without the switch or for n > 1 (the attention graph then computes it itself).
+    bool shexp_launch(int il);
     /// Prefetch hint for layer il of a one-token pass (call before attn_router(il)): the layer's router applied to
     /// rms_norm(hc_pre(state, pre)) * ffn_norm.weight, + the selection bias, ranked; top_ids gets n_top (<= 16).
     /// A hint only: the result does not depend on it.
@@ -154,6 +160,21 @@ public:
     /// layer reads the state finish just wrote, so the result is identical to finish() then predict(), with one graph
     /// launch / sync / readback less per layer.  top_ids gets the next layer's top n_top (<= 16) predicted experts.
     bool finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top);
+    /// STRATA_PF_OVERLAP: finish_predict split in two - launch (the graph, the prediction's readback into pinned memory
+    /// behind an event; no host wait) and predict_wait.  attn_router split the same way: launch (the cached graph) and
+    /// collect (the three readbacks and the sync).  The same graphs and results as finish_predict / attn_router; only the
+    /// host order changes, so the next layer's attention is already running while the host waits for the prediction.
+    bool finish_predict_launch(int il, const float * routed_sum, int next_il);
+    bool predict_wait(int * top_ids, int n_top);
+    void * predict_event();                             ///< the pending prediction's cudaEvent_t (null: none)
+    bool predict_take(int * top_ids, int n_top);        ///< predict_wait without the wait (the caller polled the event)
+    bool attn_router_launch(int il);   ///< n == 1, or a multi-row pass with STRATA_PASS_GRAPHS (its cached graph)
+    bool attn_router_collect(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev = nullptr);
+    /// STRATA_D3_PF_ASYNC: predict_multi split in two - launch (the graph, its readback into pinned memory behind an
+    /// event, no host wait) and wait (that event only; unpack each row's 16).  Between them the caller launches the
+    /// layer's attention (attn_router_launch), so the prefetch the prediction drives overlaps it.
+    bool predict_multi_launch(int il);
+    bool predict_multi_wait(int * top_ids);
     /// finish_predict + the routing predictions of the `ahead` layers after next_il, from the same state, in the same
     /// graph: ahead_ids[a * 16 ..] = layer next_il + 1 + a's top 16 (-1 past the last layer).  For speculative
     /// file-tier reads; a hint only.

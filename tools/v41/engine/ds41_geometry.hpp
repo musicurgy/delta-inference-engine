@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "ds41_posix.hpp"
+
 namespace strata::v41 {
 
 namespace ty {
@@ -401,7 +403,12 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
     }
     for (size_t s = 0; s < m.size(); ++s)
         for (const auto & t : m.shard(s).tensors())
-            if (!want.count(t.name)) return "unexpected tensor " + t.name;
+            if (!want.count(t.name)) {
+                // a DwarfStar (antirez/ds4) single-file GGUF carries the Engram tables inline as blk.L.engram_embd.weight;
+                // this engine reads Engram from --engram (the HF shards), so those tensors are simply not used
+                if (t.name.rfind("blk.", 0) == 0 && t.name.size() > 19 && t.name.compare(t.name.size() - 19, 19, ".engram_embd.weight") == 0) continue;
+                return "unexpected tensor " + t.name;
+            }
     return {};
 }
 

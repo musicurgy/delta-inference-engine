@@ -7,6 +7,19 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+
+// GCC/Clang compile only these functions for AVX2 (+FMA/F16C); MSVC takes the intrinsics anywhere (run-time dispatch
+// still picks them only where the CPU has AVX2), so the attribute is empty there.
+#if defined(__GNUC__) || defined(__clang__)
+#define PTQ1_FN_AVX2 __attribute__((target("avx2")))
+#define PTQ1_FN_AVX2_FMA __attribute__((target("avx2,fma,f16c")))
+#define PTQ1_FMA_F16C_OK (__builtin_cpu_supports("f16c") && __builtin_cpu_supports("fma"))
+#else
+#define PTQ1_FN_AVX2
+#define PTQ1_FN_AVX2_FMA
+#define _cvtsh_ss(h) _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) (h))))
+#define PTQ1_FMA_F16C_OK true   // cpu_avx2_ok() already requires FMA + F16C
+#endif
 #define STRATA_PTQ1_X86 1
 #endif
 

@@ -39,6 +39,27 @@ __global__ void decode_rows_sum_kernel(const float* __restrict__ parts, const fl
     }
 }
 
+// STRATA_DEFER (multi-row): out[i] += sum over k of w[k] * parts[k][i] - the previous layer's deferred experts of one
+// token added to that token's routed sum (decode_rows_sum has already written it)
+__global__ void decode_rows_add_kernel(const float* __restrict__ parts, const float* __restrict__ w, int K, int64_t H,
+                                       float* __restrict__ out) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < H; i += (int64_t) gridDim.x * blockDim.x) {
+        double s = (double) out[i];
+        for (int k = 0; k < K; ++k) {
+            const float wk = w[k];
+            if (wk == 0.0f) continue;
+            s = __dadd_rn(s, __dmul_rn((double) wk, (double) parts[(int64_t) k * H + i]));
+        }
+        out[i] = (float) s;
+    }
+}
+
+void decode_rows_add(const float* parts, const float* w, int K, int64_t H, float* out, void* stream) {
+    const unsigned blocks = (unsigned) std::min<int64_t>((H + 255) / 256, 1024);
+    decode_rows_add_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, out);
+    check("decode_rows_add");
+}
+
 void decode_rows_sum(const float* parts, const float* w, int K, int64_t H, float* out, void* stream) {
     const unsigned blocks = (unsigned) std::min<int64_t>((H + 255) / 256, 1024);
     decode_rows_sum_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, out);

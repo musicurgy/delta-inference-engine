@@ -268,6 +268,10 @@ private:
 
 /// Experts ranked by calibration routing counts (tools/v41/engine/v41_rank.py writes int32 (layer, expert) pairs).
 std::vector<std::pair<int32_t, int32_t>> ds41_read_ranked(const std::string& path, std::string& err);
+/// STRATA_CUDA_SPIN=1: cudaDeviceScheduleSpin for the process (call before any CUDA context exists; no-op on CPU builds)
+void ds41_cuda_schedule_from_env();
+/// Busy-poll a cudaEvent_t (as void*) until it completes (no-op on CPU builds or a null event).
+void ds41_cuda_event_spin(void* ev);
 
 // ================================ configuration ================================
 
@@ -357,6 +361,7 @@ struct Ds41MoeStats {
     int64_t cpu = 0;                ///< computed by the CPU pool
     int64_t pcie = 0;               ///< misses DMA'd to the GPU and computed there
     int64_t file_tier = 0;          ///< reads served by the blob source instead of the arena
+    int64_t pageable_staged = 0;    ///< STRATA_PAGEABLE_STAGE: misses copied from the unpinned arena into h_fstage (counted in file_tier too)
     double gap_ms = 0, hit_ms = 0, pcie_ms = 0, cpu_ms = 0, wall_ms = 0;
     double file_ms = 0;             ///< time spent reading file-tier blobs (inside run / prefetch)
     int64_t arena_swaps = 0;        ///< arena_adapt: file-tier experts moved into the arena
@@ -431,6 +436,10 @@ public:
     /// VRAM-resident nor outside the arena are DMA'd into the prefetch slots on the prefetch stream; run_multi_to_dev
     /// computes a routed one from its slot (a hit).  Independent of pf_b.  A hint only: results do not depend on it.
     void prefetch_multi(int64_t layer, const int32_t* ids, int n, int max_slots);
+    /// STRATA_D3_L3WARM: after prefetch_multi(layer), the first `k` of `ids` that are neither VRAM-resident nor in a
+    /// prefetch slot but in the RAM arena are read into the CPU's last-level cache by background threads while the
+    /// layer's attention runs, so the tier's pool finds them there.  Stopped by the tier before its pool runs.  A hint.
+    void warm_multi(int64_t layer, const int32_t* ids, int n, int k);
     /// Decode file-tier readahead: for the predicted experts of `layer` that are neither VRAM-resident nor in the RAM
     /// arena, ask the kernel to read their bytes into the page cache now (posix_fadvise WILLNEED), so the tier's
     /// buffered read later is a page-cache copy.  The SSD is otherwise idle in decode, so a wrong guess costs ~nothing.
@@ -444,7 +453,13 @@ public:
     /// `run` with the weighted sum computed on the card and written to the device row `out_dev` (n_embd floats, e.g.
     /// the dense half's routed tensor): the same bits as `run`'s host sum, without its parts readback and upload.
     /// GPU tier only (false in cpu_only).
-    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev);
+    /// x_dev (optional): the same activation already on the card (the dense half's output tensor) - quantized there
+    /// instead of uploaded again (STRATA_X_DEV=0: the upload path).  It must stay unchanged until this call returns.
+    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev,
+                    const void* x_dev = nullptr);
+    /// STRATA_SUM_NOSYNC: the cudaEvent_t (as void*) that marks the last run_to_dev's sum as written, once; null if
+    /// none is pending.  The caller makes the stream that reads out_dev wait on it (Ds41Dense::wait_event).
+    void* take_sum_event();
     /// The same with `x` already on the device (the engine's attention output).  CUDA modes only.
     bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out);
 

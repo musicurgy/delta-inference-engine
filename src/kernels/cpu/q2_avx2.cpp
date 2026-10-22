@@ -11,7 +11,9 @@
 
 #include <immintrin.h>
 
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -173,6 +175,13 @@ void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, 
                                float* const* out, int r0, int r1) {
     bool bp = kBitplane && nblocks % 2 == 0;
     for (int t = 0; t < nt && bp; ++t) bp = a[t]->bp_pairs == nblocks / 2;
+    if (kBitplane) {   // once per outcome: whether the bit-plane kernel ran, and if not why (Xolotl win3090, round 51)
+        static std::atomic<int> said{0};
+        const int bit = bp ? 1 : 2;
+        if ((said.fetch_or(bit) & bit) == 0)
+            std::fprintf(stderr, "q2 bitplane: %s (nblocks %d, nt %d, bp_pairs[0] %d)\n", bp ? "ON" : "fallback", nblocks,
+                         nt, nt > 0 ? a[0]->bp_pairs : -1);
+    }
     if (!bp) {
         q2_0_gguf_rows_multi_avx2_legacy(w, row_bytes, nblocks, a, nt, out, r0, r1);
         return;

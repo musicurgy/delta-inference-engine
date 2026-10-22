@@ -177,11 +177,50 @@ static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int
 #endif
 }
 
-static inline ssize_t tread(int fd, const std::shared_ptr<Ds41Engram::RawMap> & m, void * buf, size_t n, uint64_t off) {
+// STRATA_ENGRAM_DIRECT=1: a row read through an unbuffered handle (O_DIRECT: FILE_FLAG_NO_BUFFERING on Windows) - the
+// 4 KiB-aligned span around the bytes into an aligned per-thread buffer, then the bytes copied out.  It skips the
+// cache manager's buffered path for these ~20K small random reads per few hundred tokens; the row cache and the hot
+// set still catch repeats.  The same bytes either way.
+static bool engram_direct() {
+    static const bool on = std::getenv("STRATA_ENGRAM_DIRECT") && std::getenv("STRATA_ENGRAM_DIRECT")[0] == '1';
+    return on;
+}
+
+static ssize_t direct_read(int dfd, void * buf, size_t n, uint64_t off) {
+    constexpr uint64_t kAl = 4096;
+    struct ABuf {   // grows by whole pages; freed with the thread
+        uint8_t * p = nullptr;
+        size_t cap = 0;
+        ~ABuf() { if (p) ds41_sys::aligned_free(p); }
+    };
+    thread_local ABuf ab;
+    const uint64_t a0 = off & ~(kAl - 1), a1 = (off + n + kAl - 1) & ~(kAl - 1);
+    const size_t span = (size_t) (a1 - a0);
+    if (span > ab.cap) {
+        if (ab.p) ds41_sys::aligned_free(ab.p);
+        ab.cap = std::max<size_t>(span, 64 * 1024);
+        ab.p = (uint8_t *) ds41_sys::aligned_alloc(kAl, ab.cap);
+        if (!ab.p) { ab.cap = 0; return -1; }
+    }
+    const ssize_t r = ds41_sys::pread(dfd, ab.p, span, (int64_t) a0);
+    if (r < (ssize_t) (off - a0)) return -1;
+    const size_t got = std::min<size_t>(n, (size_t) r - (size_t) (off - a0));   // a short read at the end of the file
+    std::memcpy(buf, ab.p + (off - a0), got);
+    return (ssize_t) got;
+}
+
+static inline ssize_t tread(int fd, const std::shared_ptr<Ds41Engram::RawMap> & m, void * buf, size_t n, uint64_t off,
+                            int dfd = -1) {
+    if (dfd >= 0) return direct_read(dfd, buf, n, off);
     return m ? m->read(buf, n, off) : ds41_sys::pread(fd, buf, n, (int64_t) off);
 }
 
 Ds41Engram::~Ds41Engram() {
+    if (hot_hits_ + cache_hits_ + cache_miss_ > 0)   // where the rows came from, and what waiting for the disk cost
+        std::fprintf(stderr, "engram: %llu rows from the hot set, %llu from the row cache, %llu read (%llu read groups, "
+                             "%.1f MB); waited %.0f ms over %llu waits\n",
+                     (unsigned long long) hot_hits_, (unsigned long long) cache_hits_, (unsigned long long) cache_miss_,
+                     (unsigned long long) reads_, (double) bytes_ / 1e6, wait_ms_, (unsigned long long) waits_);
     {
         std::lock_guard<std::mutex> lk(mu_);
         stop_ = true;
@@ -191,6 +230,8 @@ Ds41Engram::~Ds41Engram() {
     for (auto & t : tables_) {
         if (t.fd_w >= 0) ds41_sys::close(t.fd_w);
         if (t.fd_s >= 0) ds41_sys::close(t.fd_s);
+        if (t.dfd_w >= 0) ds41_sys::close(t.dfd_w);
+        if (t.dfd_s >= 0) ds41_sys::close(t.dfd_s);
     }
 }
 
@@ -231,8 +272,8 @@ bool Ds41Engram::read_raw(int e, uint32_t row, uint8_t * dst) const {
     const Table & T = tables_[(size_t) e];
     if ((int64_t) row >= T.rows) return false;
     const uint64_t srsz = (uint64_t) dim_ / 32;
-    return tread(T.fd_w, T.rm_w, dst, (size_t) dim_, T.off_w + (uint64_t) row * (uint64_t) dim_) == (ssize_t) dim_ &&
-           tread(T.fd_s, T.rm_s, dst + dim_, (size_t) srsz, T.off_s + (uint64_t) row * srsz) == (ssize_t) srsz;
+    return tread(T.fd_w, T.rm_w, dst, (size_t) dim_, T.off_w + (uint64_t) row * (uint64_t) dim_, T.dfd_w) == (ssize_t) dim_ &&
+           tread(T.fd_s, T.rm_s, dst + dim_, (size_t) srsz, T.off_s + (uint64_t) row * srsz, T.dfd_s) == (ssize_t) srsz;
 }
 
 // Hot-set pack (written by ds41_engram_hot pack):
@@ -242,23 +283,23 @@ bool Ds41Engram::read_raw(int e, uint32_t row, uint8_t * dst) const {
 // from another checkpoint's Engram (e.g. V4.1 vs 1017 - same geometry, different weights) is caught and skipped.
 bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
     const auto t0 = std::chrono::steady_clock::now();
-    const int fd = ::open(path.c_str(), O_RDONLY);
+    const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
     if (fd < 0) { err = "cannot open"; return false; }
     struct Hdr { char magic[8]; uint32_t version, slots, dim, srsz; uint64_t fp, count; } h {};
     const int64_t srsz = dim_ / 32, rsz = dim_ + srsz;
-    bool ok = ::pread(fd, &h, sizeof h, 0) == (ssize_t) sizeof h;
+    bool ok = ds41_sys::pread(fd, &h, sizeof h, 0) == (ssize_t) sizeof h;
     if (ok && (std::memcmp(h.magic, "XENGHOT1", 8) != 0 || h.version != 1)) { err = "not a hot-set pack"; ok = false; }
     if (ok && (h.slots != tables_.size() || h.dim != (uint32_t) dim_ || h.srsz != (uint32_t) srsz)) { err = "shape mismatch"; ok = false; }
     if (ok && h.fp != geometry_fingerprint()) { err = "geometry fingerprint mismatch (built for another model)"; ok = false; }
-    struct stat st;
-    if (ok && (::fstat(fd, &st) != 0 || (uint64_t) st.st_size != sizeof h + h.count * (8 + (uint64_t) rsz))) { err = "truncated"; ok = false; }
+    ds41_sys::Stat st;
+    if (ok && (ds41_sys::fstat(fd, &st) != 0 || (uint64_t) st.st_size != sizeof h + h.count * (8 + (uint64_t) rsz))) { err = "truncated"; ok = false; }
     if (ok) {
-        ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
         hot_keys_.resize((size_t) h.count);
         hot_pool_.resize((size_t) h.count * (size_t) rsz);
         auto rd = [&](void * dst, uint64_t n, uint64_t off) {
             for (uint64_t done = 0; done < n;) {
-                const ssize_t r = ::pread(fd, (uint8_t *) dst + done, (size_t) std::min<uint64_t>(n - done, 1ull << 28), (off_t) (off + done));
+                const ssize_t r = ds41_sys::pread(fd, (uint8_t *) dst + done, (size_t) std::min<uint64_t>(n - done, 1ull << 28), (int64_t) (off + done));
                 if (r <= 0) return false;
                 done += (uint64_t) r;
             }
@@ -267,7 +308,7 @@ bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
         ok = rd(hot_keys_.data(), h.count * 8, sizeof h) && rd(hot_pool_.data(), hot_pool_.size(), sizeof h + h.count * 8);
         if (!ok) err = "read failed";
     }
-    ::close(fd);
+    ds41_sys::close(fd);
     for (size_t i = 1; ok && i < hot_keys_.size(); ++i)
         if (hot_keys_[i] <= hot_keys_[i - 1]) { err = "keys not sorted"; ok = false; }
     for (size_t i = 0; ok && i < hot_keys_.size(); ++i) {
@@ -325,6 +366,8 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
             (k ? t.fd_s : t.fd_w) = fd;
             (k ? t.off_s : t.off_w) = off;
             (k ? t.rm_s : t.rm_w) = raw_map(path, fd);
+            if (engram_direct())   // STRATA_ENGRAM_DIRECT: a second, unbuffered handle for the row reads (-1: buffered)
+                (k ? t.dfd_s : t.dfd_w) = ds41_sys::open(path.c_str(), O_RDONLY | O_DIRECT);
             t.rows = rows;
         }
         tables_.push_back(t);
@@ -580,8 +623,8 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                 const ReadGroup & G = bp->groups[(size_t) g];
                 const Table & T = tables_[(size_t) G.e];
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
-                    tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w) != (ssize_t) G.len_w ||
-                    tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); continue; }
+                    tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w, T.dfd_w) != (ssize_t) G.len_w ||
+                    tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s, T.dfd_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); continue; }
                 bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
                 const auto & uq = bp->uniq[(size_t) G.e];
                 const auto & pk = bp->packed[(size_t) G.e];
@@ -629,7 +672,12 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
 
 bool Ds41Engram::wait(const std::shared_ptr<Batch> & b, std::string & err) {
     if (!b) { err = "engram: null batch"; return false; }
-    if (b->read_task) b->read_task->wait();
+    if (b->read_task) {   // the time the caller (the dense half's Engram layer) stands waiting for the disk
+        const auto t0 = std::chrono::steady_clock::now();
+        b->read_task->wait();
+        wait_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++waits_;
+    }
     reads_ += (uint64_t) b->groups.size();
     bytes_ += b->bytes.load();
     if (b->bad.load()) { err = "engram: " + std::to_string(b->bad.load()) + " row reads failed"; return false; }

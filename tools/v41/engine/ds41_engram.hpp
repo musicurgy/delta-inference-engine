@@ -76,7 +76,8 @@ public:
 
 private:
     struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0; int64_t rows = 0;
-                   std::shared_ptr<RawMap> rm_w, rm_s; };
+                   std::shared_ptr<RawMap> rm_w, rm_s;
+                   int dfd_w = -1, dfd_s = -1; };   // STRATA_ENGRAM_DIRECT: unbuffered handles for the row reads
     struct ReadGroup;               // one coalesced pread (defined in the .cpp)
     const Ds41Geometry * g_ = nullptr;
     std::vector<Table> tables_;
@@ -97,6 +98,8 @@ private:
     std::vector<uint8_t> hot_pool_;
     std::vector<size_t> hot_begin_;   // [slot + 1]: slot e's keys are hot_keys_[hot_begin_[e] .. hot_begin_[e + 1])
     uint64_t hot_hits_ = 0;
+    double wait_ms_ = 0;      // wait(): the caller's time blocked on reads (printed at exit)
+    uint64_t waits_ = 0;
     bool load_hot(const std::string & path, std::string & err);
     std::vector<int64_t> hist_;      // compressed ids by position
     std::vector<int64_t> offsets_;   // [slot * cols + col] bucket range start

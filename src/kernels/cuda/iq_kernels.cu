@@ -2388,6 +2388,14 @@ __global__ void __launch_bounds__(256) s26_gu_l_kernel(const unsigned long long*
 
 constexpr int S26_HMAX = 640 / 32;    // q8_1 blocks of one SwiGLU row (n_ff 640)
 
+// compile-time loop f(integral_constant<int, I>) for I in [B, E): the C++17 stand-in for a lambda template pack
+template<int B, int E, class F> __device__ __forceinline__ void s26_sfor(F&& f) {
+    if constexpr (B < E) {
+        f(std::integral_constant<int, B>{});
+        s26_sfor<B + 1, E>(f);
+    }
+}
+
 template<bool LX, int RPW, bool SL = false, bool TS = false, int BAL = 0>
 __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                          const int32_t* __restrict__ grp_start,
@@ -2434,19 +2442,25 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
         if constexpr (BAL > 0) {   // S26: 5 items per lane instead of 8 / 4, in BAL groups (loads first)
             constexpr int NI = 2 * S26_HMAX, IT = RPW * NI / 32;
             static_assert(RPW * NI % 32 == 0, "whole steps");
-            auto group = [&]<int G0, int... J>(std::integer_sequence<int, J...>) {
-                Split<20>::W w[sizeof...(J)];
-                int kk[sizeof...(J)];
-                bool hh[sizeof...(J)];
-                ([&] {
+            // C++17 form (nvcc + MSVC 2019 has no C++20): s26_sfor unrolls at compile time like the pack expansions did
+            constexpr int G = (IT + BAL - 1) / BAL;
+            s26_sfor<0, BAL>([&](auto qc) {
+                constexpr int G0 = decltype(qc)::value * G;
+                constexpr int NJ = IT - G0 < G ? IT - G0 : G;
+                Split<20>::W w[NJ > 0 ? NJ : 1];
+                int kk[NJ > 0 ? NJ : 1];
+                bool hh[NJ > 0 ? NJ : 1];
+                s26_sfor<0, NJ>([&](auto jc) {
+                    constexpr int J = decltype(jc)::value;
                     using B = S26Bal<G0 + J, NI, RPW>;
                     hh[J] = B::QB != B::QA && lane >= B::THR;
                     kk[J] = B::P0 + lane - (hh[J] ? B::QB : B::QA) * NI;
                     const uint8_t* rp = hh[J] ? wr[B::QB] : wr[B::QA];
                     if constexpr (SL) w[J] = S26Split<20, false>::load(rp, kk[J] / 2, 2 * (kk[J] % 2));
                     else w[J] = Split<20>::load(rp, kk[J] / 2, 2 * (kk[J] % 2));
-                }(), ...);
-                ([&] {
+                });
+                s26_sfor<0, NJ>([&](auto jc) {
+                    constexpr int J = decltype(jc)::value;
                     using B = S26Bal<G0 + J, NI, RPW>;
 #pragma unroll
                     for (int c = 0; c < GRP_NC; ++c)
@@ -2454,12 +2468,8 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
                             const float v = Split<20>::apply(w[J], hbase + off[c] + kk[J] / 2, 2 * (kk[J] % 2));
                             if (hh[J]) s[B::QB][c] += v; else s[B::QA][c] += v;
                         }
-                }(), ...);
-            };
-            constexpr int G = (IT + BAL - 1) / BAL;
-            [&]<int... Q>(std::integer_sequence<int, Q...>) {
-                (group.template operator()<Q * G>(std::make_integer_sequence<int, (IT - Q * G < G ? IT - Q * G : G)>{}), ...);
-            }(std::make_integer_sequence<int, BAL>{});
+                });
+            });
         } else
         for (int k = lane; k < nb * 2; k += 32) {
             const int kbx = k / 2, iqs = 2 * (k % 2);

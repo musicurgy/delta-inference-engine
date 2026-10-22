@@ -24,7 +24,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 static bool is_routed_expert(const char * name) {
@@ -45,12 +47,17 @@ static ggml_type parse_type(const std::string & s) {
 
 int main(int argc, char ** argv) {
     std::string in, out, ts;
+    // --uniform-imatrix: the i-quants that need importance weights (IQ2_XXS, IQ2_XS, IQ1_*) get all-equal ones.  Only
+    // the drafter's acceptance can move (every draft is verified), and the drafter's precision barely moved it so far
+    // (iq3_xxs / q2_K / MXFP4 all tied): the smaller type frees VRAM for the trunk's expert cache.
+    bool uniform = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto nx = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
         if (a == "--in") in = nx();
         else if (a == "--out") out = nx();
         else if (a == "--type") ts = nx();
+        else if (a == "--uniform-imatrix") uniform = true;
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (in.empty() || out.empty() || ts.empty()) {
@@ -62,11 +69,13 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "unknown type %s\n", ts.c_str());
         return 2;
     }
-    if (ggml_quantize_requires_imatrix(target)) {
-        std::fprintf(stderr, "type %s requires an imatrix - not available\n", ts.c_str());
+    const bool needs_im = ggml_quantize_requires_imatrix(target);
+    if (needs_im && !uniform) {
+        std::fprintf(stderr, "type %s requires an imatrix - not available (--uniform-imatrix: all-equal weights)\n", ts.c_str());
         return 3;
     }
     const ggml_type_traits * tr_dst = ggml_get_type_traits(target);
+    ggml_quantize_init(target);   // the i-quant grids, once, before the worker threads
 
     // Read metadata + tensor infos, then load the whole data blob into a ggml context (params.ctx != NULL) so the
     // source tensor bytes are reachable via the per-tensor ggml_tensor objects it creates.
@@ -103,14 +112,27 @@ int main(int argc, char ** argv) {
 
         std::vector<uint8_t> dst(rs_dst * (size_t) nrows);
         const int64_t chunk = std::max<int64_t>(1, (16 * 1024 * 1024) / (nprow * 4));   // ~64 MB of f32 at a time
-        std::vector<float> f32((size_t) (nprow * chunk));
         const ggml_to_float_t src_to_f32 = ggml_get_type_traits(GGML_TYPE_MXFP4)->to_float;
-        for (int64_t r0 = 0; r0 < nrows; r0 += chunk) {
-            const int64_t nr = std::min(chunk, nrows - r0);
-            src_to_f32((const char *) t->data + (size_t) r0 * rs_src, f32.data(), nr * nprow);
-            const size_t wrote = ggml_quantize_chunk(target, f32.data(), dst.data() + (size_t) r0 * rs_dst, 0, nr, nprow, nullptr);
-            if (wrote != (size_t) nr * rs_dst) { std::fprintf(stderr, "%s: quantize wrote %zu != %zu\n", nm, wrote, (size_t) nr * rs_dst); return 1; }
-        }
+        const std::vector<float> ones(needs_im ? (size_t) nprow : 0, 1.0f);
+        // the i-quant search is slow (~minutes single-threaded for 3.4 G weights): chunks over the CPU threads
+        const int64_t nchunks = (nrows + chunk - 1) / chunk;
+        std::atomic<int64_t> next { 0 };
+        std::atomic<bool> bad { false };
+        const int nth = std::max(1u, std::thread::hardware_concurrency());
+        std::vector<std::thread> th;
+        for (int w = 0; w < nth; ++w)
+            th.emplace_back([&]() {
+                std::vector<float> f32((size_t) (nprow * chunk));
+                for (int64_t c; (c = next.fetch_add(1)) < nchunks;) {
+                    const int64_t r0 = c * chunk, nr = std::min(chunk, nrows - r0);
+                    src_to_f32((const char *) t->data + (size_t) r0 * rs_src, f32.data(), nr * nprow);
+                    const size_t wrote = ggml_quantize_chunk(target, f32.data(), dst.data() + (size_t) r0 * rs_dst, 0, nr, nprow,
+                                                             needs_im ? ones.data() : nullptr);
+                    if (wrote != (size_t) nr * rs_dst) bad = true;
+                }
+            });
+        for (auto & x : th) x.join();
+        if (bad) { std::fprintf(stderr, "%s: quantize wrote the wrong size\n", nm); return 1; }
         keep.push_back(std::move(dst));
         gguf_set_tensor_type(g, nm, target);
         gguf_set_tensor_data(g, nm, keep.back().data());

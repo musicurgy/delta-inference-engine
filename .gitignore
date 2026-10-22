@@ -84,3 +84,8 @@ out/
 /HANDOFF_*.md
 /RESUME_PROMPT_*.md
 /START_HERE*.md
+
+# the Windows launcher's local files
+tools/v41/serve/local/
+models/
+*.key
