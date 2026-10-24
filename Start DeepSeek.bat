@@ -55,6 +55,10 @@ rem   DSpark evict 4096 - a big prompt batch frees the drafter's 2.4 GB of VRAM 
 rem   rewind 1 - a chat turn whose history matches the cache re-reads ~nothing (was ~19 s per turn at 4K)
 rem   noisy-OR prefetch - the drafter's verify passes prefetch the expert most likely to be needed by ANY draft token
 rem            (from measured per-rank odds): ~3% faster writing, same quality within rounding
+rem   conversation cache 8 - up to 8 whole conversations kept in RAM (~20 MB per 10K tokens): an agent switching between
+rem            conversations resumes each in 1-3 s instead of re-reading its prompt (16-18 s at ~8K tokens)
+rem   snapshot stack 4 - in thinking mode, the next turn (which drops the old thinking) resumes an earlier snapshot
+rem            instead of re-reading the whole history (a 4.7K-token turn 13 s -> 7 s)
 set STRATA_SERVE_ROLLBACK=8
 set STRATA_SERVE_BATCH_MIN=256
 set STRATA_PASS_CAP_MIN=4096
@@ -64,6 +68,8 @@ set STRATA_PRESTAGE_GIB=0
 set STRATA_SERVE_DSPARK_EVICT=4096
 set STRATA_SERVE_REWIND1=1
 set STRATA_D3_PF_NOISYOR=1
+set STRATA_SERVE_CACHE_SLOTS=8
+set STRATA_SERVE_SNAP_STACK=4
 rem this PC's copy of the config: paths filled in, the RAM arena sized (tools\v41\serve\local\, not in git)
 ".venv\Scripts\python.exe" tools\v41\serve\ds41_local.py tools\v41\serve\ds41-windows.json tools\v41\serve\local\ds41-windows.json
 if errorlevel 1 (

@@ -1272,6 +1272,31 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     return gf;
 }
 
+// predict for layers il and il + 1 on the same state (hc_pre once): predict_multi2, STRATA_D3_PF_EARLY
+static ggml_cgraph * build_predict2(Ds41Dense::Impl & im, ggml_context * gc, int il, ggml_tensor ** out, ggml_tensor ** out2, int64_t n) {
+    B b { &im, gc, &im.g };
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 128, false);
+    const int64_t D = im.D, HC = im.HC;
+    ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, n), b.cols2(im.pre_state, HC, n));
+    for (int j = 0; j < 2; ++j) {
+        const int l = il + j;
+        ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(l), b.rms_w(x, im.BL(l, "ffn_norm.weight")));
+        ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
+        ggml_tensor * o = nullptr;
+        if (fuse_router(im)) {
+            o = ggml_dsv4_route(gc, rl, im.BL(l, "exp_probs_b.bias"), im.ly[(size_t) l].rbias, nullptr, 16, false, 1.0f);
+        } else {
+            ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(l, "exp_probs_b.bias")),
+                                        ggml_reshape_2d(gc, im.ly[(size_t) l].rbias, im.NE, 1));
+            o = ggml_argsort_top_k(gc, sc, 16);
+        }
+        ggml_set_output(o);
+        ggml_build_forward_expand(gf, o);
+        *(j == 0 ? out : out2) = o;
+    }
+    return gf;
+}
+
 // finish: x_state = hc_post(shexp + routed, hap, post_f, comb_f).  col0: the batch column (0 on the single-pass paths).
 static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64_t n, int64_t col0 = 0) {
     B b { &im, gc, &im.g };
@@ -2184,6 +2209,36 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
     return true;
 }
 
+bool Ds41Dense::predict_multi2(int il, int * top_ids, int * next_ids) {
+    Impl & im = *p_;
+    const int64_t n = im.n;
+    if (n < 1 || il + 1 >= (int) im.ly.size()) return false;
+    // the two outputs live in predict_out_n under keys no layer uses (-(il + 1) and -(il + 1) - 1000), so they follow
+    // that map through the world swaps and clears like predict_multi's own
+    const Impl::GKey key { il, 11, 0, (int) n };
+    const std::pair<int, int> k1 { -(il + 1), (int) n }, k2 { -(il + 1) - 1000, (int) n };
+    auto it = im.graphs.find(key);
+    if (it == im.graphs.end()) {
+        ggml_tensor * o1 = nullptr, * o2 = nullptr;
+        ggml_cgraph * gf = build_predict2(im, im.gctx, il, &o1, &o2, n);
+        it = im.graphs.emplace(key, gf).first;
+        im.predict_out_n[k1] = o1;
+        im.predict_out_n[k2] = o2;
+    }
+    if (!im.compute(it->second, true, false)) return false;
+    int * dst[2] = { top_ids, next_ids };
+    for (int j = 0; j < 2; ++j) {
+        ggml_tensor * o = im.predict_out_n[j == 0 ? k1 : k2];
+        const size_t rs = o->nb[1] / sizeof(int32_t);   // a VIEW of the full argsort (or contiguous [16, n]): see predict_multi
+        im.pred_span.resize(rs * (size_t) (n - 1) + 16);
+        dread(im, o, im.pred_span.data(), im.pred_span.size() * sizeof(int32_t));
+        for (int64_t t = 0; t < n; ++t)
+            std::copy(im.pred_span.begin() + (ptrdiff_t) (rs * (size_t) t), im.pred_span.begin() + (ptrdiff_t) (rs * (size_t) t + 16),
+                      dst[j] + 16 * t);
+    }
+    return true;
+}
+
 bool Ds41Dense::finish(int il, const float * routed_sum) {
     Impl & im = *p_;
     (void) il;
@@ -2481,29 +2536,72 @@ bool Ds41Dense::restore() {
 
 int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
 
-bool Ds41Dense::park(int64_t positions) {
-    Impl & im = *p_;
-    if (im.snap_pos < 0 || positions < 1) return false;
-    dsync_be(im.backend);
-    im.parked.clear();
+// The snapshot rings + rows [0, positions] of the position-indexed caches (and their spare rows), copied to host
+// memory: what park() and save_conv() keep; positions 0 = the rings alone (a snapshot of the SAME conversation, whose
+// rows are still in place - STRATA_SERVE_SNAP_STACK).  The caller syncs the backend first.
+static void collect_conv_rows(Ds41Dense::Impl & im, int64_t positions, std::vector<Ds41Dense::Impl::ParkedRows> & out) {
+    out.clear();
     auto put = [&](ggml_tensor * t, size_t off, size_t n) {
-        Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n) };
+        Ds41Dense::Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n) };
         dget(t, r.b.data(), off, n);
-        im.parked.push_back(std::move(r));
+        out.push_back(std::move(r));
     };
     for (auto & L : im.ly) {
         for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
             if (t) put(t, 0, ggml_nbytes(t));
         for (ggml_tensor * t : { L.comp, L.idxk }) {   // row r holds a position >= r (ratio 1 or 2): rows [0, n] cover n positions
-            if (!t) continue;
+            if (!t || positions <= 0) continue;
             const int64_t rows = t->ne[1];
             const int64_t n = std::min<int64_t>(rows - 1, positions + 1);
             put(t, 0, (size_t) n * t->nb[1]);
             put(t, (size_t) (rows - 1) * t->nb[1], t->nb[1]);   // the spare row (open compressor groups write it)
         }
     }
+}
+
+bool Ds41Dense::park(int64_t positions) {
+    Impl & im = *p_;
+    if (im.snap_pos < 0 || positions < 1) return false;
+    dsync_be(im.backend);
+    collect_conv_rows(im, positions, im.parked);
     im.parked_pos = im.snap_pos;
     return true;
+}
+
+struct Ds41Dense::SavedConv {
+    std::vector<Impl::ParkedRows> rows;
+    int snap_pos = -1;
+    size_t bytes = 0;
+};
+
+std::shared_ptr<Ds41Dense::SavedConv> Ds41Dense::save_conv(int64_t positions) {
+    Impl & im = *p_;
+    if (im.snap_pos < 0 || positions < 0) return nullptr;   // 0: the snapshot rings alone
+    dsync_be(im.backend);
+    auto s = std::make_shared<SavedConv>();
+    collect_conv_rows(im, positions, s->rows);
+    s->snap_pos = im.snap_pos;
+    for (const auto & r : s->rows) s->bytes += r.b.size();
+    return s;
+}
+
+bool Ds41Dense::load_conv(const SavedConv & s) {
+    Impl & im = *p_;
+    if (s.snap_pos < 0) return false;
+    dsync_be(im.backend);
+    for (const auto & r : s.rows) dset(r.t, r.b.data(), r.off, r.b.size());
+    dsync_be(im.backend);
+    im.snap_pos = s.snap_pos;
+    return true;
+}
+
+size_t Ds41Dense::saved_bytes(const SavedConv & s) { return s.bytes; }
+
+void Ds41Dense::set_history(const int * ids, int64_t n, int64_t pos0) {
+    Impl & im = *p_;
+    if (!im.engram.enabled() || n <= 0) return;
+    if (!engram_ready(im)) return;   // a still-pending batch first (none between requests)
+    for (int64_t i = 0; i < n; ++i) im.engram.set_token(pos0 + i, ids[i]);
 }
 
 bool Ds41Dense::unpark() {

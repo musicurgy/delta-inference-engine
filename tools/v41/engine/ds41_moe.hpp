@@ -436,6 +436,10 @@ public:
     /// VRAM-resident nor outside the arena are DMA'd into the prefetch slots on the prefetch stream; run_multi_to_dev
     /// computes a routed one from its slot (a hit).  Independent of pf_b.  A hint only: results do not depend on it.
     void prefetch_multi(int64_t layer, const int32_t* ids, int n, int max_slots);
+    /// STRATA_D3_PF_EARLY: the same for the NEXT layer, issued after this layer's tier call has queued its own demand
+    /// copies (so it never delays them): the first `max_slots` candidates go into a second staging that becomes `layer`'s
+    /// when it begins (prefetch_multi / run_multi_to_dev); prefetch_multi(layer) then appends to it.  A hint only.
+    void prefetch_next(int64_t layer, const int32_t* ids, int n, int max_slots);
     /// STRATA_D3_L3WARM: after prefetch_multi(layer), the first `k` of `ids` that are neither VRAM-resident nor in a
     /// prefetch slot but in the RAM arena are read into the CPU's last-level cache by background threads while the
     /// layer's attention runs, so the tier's pool finds them there.  Stopped by the tier before its pool runs.  A hint.

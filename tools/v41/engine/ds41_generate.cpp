@@ -667,15 +667,31 @@ int main(int argc, char ** argv) {
     std::vector<int16_t> pl_buf;
     std::vector<int> pl_pred;    // the prediction handed to this layer's prefetch (pv_pred is reused by the spec reads)
     bool pl_have = false;
-    auto plog_rec = [&](int l, int m, int pos, const int * pred, const int * act) {
+    // STRATA_PRED_LOG2=F + STRATA_PRED_AHEAD=k (default 1; measurement only): the same records, but `pred` is layer l's
+    // routing predicted k layers EARLIER (at the start of layer l-k, from the state entering it) - what a prefetch
+    // issued k layers ahead would get: its copies would have k more layers of time to land (round 114: a 2nd / 3rd copy
+    // started at layer l's own attention lands too late).  Decode steps (predict) and verify passes (predict_multi).
+    std::FILE * plog2 = std::getenv("STRATA_PRED_LOG2") ? std::fopen(std::getenv("STRATA_PRED_LOG2"), "ab") : nullptr;
+    const int pred_ahead = std::getenv("STRATA_PRED_AHEAD") ? std::max(1, std::atoi(std::getenv("STRATA_PRED_AHEAD"))) : 1;
+    std::vector<std::vector<int>> pl_ahead((size_t) n_layer);   // [layer]: its k-ahead prediction (16 per pass row)
+    auto plog_rec = [&](std::FILE * plf, int l, int m, int pos, const int * pred, const int * act) {
         auto tier_of = [&](int e) -> int16_t { return (int16_t) (e < 0 ? -1 : tier.resident(l, e) ? 0 : tier.in_arena(l, e) ? 1 : 2); };
         pl_buf.assign({ (int16_t) 'R', (int16_t) l, (int16_t) m, (int16_t) top_k, (int16_t) (pos & 0x7fff), (int16_t) (pos >> 15) });
         for (int i = 0; i < m * 16; ++i) pl_buf.push_back((int16_t) (pred ? pred[i] : -1));
         for (int i = 0; i < m * top_k; ++i) pl_buf.push_back((int16_t) act[i]);
         for (int i = 0; i < m * 16; ++i) pl_buf.push_back(pred ? tier_of(pred[i]) : (int16_t) -1);
         for (int i = 0; i < m * top_k; ++i) pl_buf.push_back(tier_of(act[i]));
-        std::fwrite(pl_buf.data(), 2, pl_buf.size(), plog);
-        if (l == n_layer - 1) std::fflush(plog);
+        std::fwrite(pl_buf.data(), 2, pl_buf.size(), plf);
+        if (l == n_layer - 1) std::fflush(plf);
+    };
+    // the k-ahead prediction for layer l + pred_ahead, made at the start of layer l (n = the pass rows; 1 = a step)
+    auto pl_ahead_make = [&](int l, int n) {
+        if (l == 0) for (auto & v : pl_ahead) v.clear();
+        if (l + pred_ahead >= n_layer) return;
+        std::vector<int> & v = pl_ahead[(size_t) (l + pred_ahead)];
+        v.resize((size_t) n * 16);
+        const bool ok = n == 1 ? dense.predict(l + pred_ahead, v.data(), 16) : dense.predict_multi(l + pred_ahead, v.data());
+        if (!ok) v.clear();
     };
     // decode: the tier sums the routed experts on the card straight into the dense half's routed tensor (same bits as
     // the host sum; no parts readback / routed upload per layer).  STRATA_DEC_HOSTSUM=1 = the host round trip
@@ -696,6 +712,7 @@ int main(int argc, char ** argv) {
         bool have_pred = false;
         bool pred_pending = false;   // STRATA_PF_OVERLAP: finish_predict_launch issued, predict_wait not yet
         for (int l = 0; l < n_layer; ++l) {
+            if (plog2) pl_ahead_make(l, 1);   // STRATA_PRED_LOG2: layer l + k's routing, predicted here
             if (file_pred) {
                 for (int k = 1; k <= kFP; ++k) {
                     int * const pk = fp_ids.data() + ((size_t) (k - 1) * n_layer + (size_t) (l + k < n_layer ? l + k : 0)) * 16;
@@ -741,7 +758,8 @@ int main(int argc, char ** argv) {
                 if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
                 if (!dense.attn_router(l, ids1.data(), w1.data(), &fn, &fn_t, true)) { ferr = dense.last_error(); return false; }
             }
-            if (plog) plog_rec(l, 1, pos, pl_have ? top16 : nullptr, ids1.data());
+            if (plog) plog_rec(plog, l, 1, pos, pl_have ? top16 : nullptr, ids1.data());
+            if (plog2 && !pl_ahead[(size_t) l].empty()) plog_rec(plog2, l, 1, pos, pl_ahead[(size_t) l].data(), ids1.data());
             pl_have = false;
             if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
             if (file_pred) {
@@ -836,6 +854,7 @@ int main(int argc, char ** argv) {
     // vlog = the pass's m rows of logits.
     std::vector<float> vh, vlog, vx, vpre;
     std::vector<int> pv_pred, pv_rank;                 // D3 prefetch: per-token predictions, the ranked union
+    std::vector<int> pv_next, pv_rank_next;            // STRATA_D3_PF_EARLY: the next layer's, made one layer early
     std::vector<std::pair<int, int>> pv_score;
     std::vector<std::pair<int, float>> pv_noq;         // STRATA_D3_PF_NOISYOR: (expert, prod over rows of 1 - p)
     double pv_ms[4] = {0, 0, 0, 0};   // pass_v split: dense (begin/attn_router/finish), tier, taps (read_state), logits
@@ -859,9 +878,17 @@ int main(int argc, char ** argv) {
         // Its row cap stays 8 (the old kMaxMulti, i.e. the passes it was measured on): since kMaxMulti 16 a 9-16-row
         // pass is ONE tier call too, but it ran without the prefetch before and still does (a separate experiment).
         static const int d3_pf = std::getenv("STRATA_D3_PF") ? std::atoi(std::getenv("STRATA_D3_PF")) : 1;
+        // STRATA_D3_PF_EARLY=K (default 0 = off; rounds 117 / 119): K experts of the NEXT layer, ranked as this layer's
+        // (noisy-OR when on) from a prediction made one layer early in the same graph (predict_multi2: no extra sync),
+        // copied into a second staging right after this layer's tier call has queued its demand copies - they have the
+        // rest of this layer and the next attention to land (round 114: a 2nd / 3rd copy started at a layer's own
+        // attention lands too late).  The next layer's own STRATA_D3_PF prefetch appends to them.
+        static const int d3_pf_early = std::getenv("STRATA_D3_PF_EARLY") ? std::max(0, std::atoi(std::getenv("STRATA_D3_PF_EARLY"))) : 0;
+        bool have_next = false;
         constexpr int kD3PfRows = 8;
         static_assert(kD3PfRows <= Ds41MoeTier::kMaxMulti, "the prefetch is consumed by ONE tier call per layer");
-        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= kD3PfRows;
+        // (STRATA_D3_PF=0 + STRATA_D3_PF_EARLY: the one prefetch copy per layer moved a layer earlier - round 120)
+        const bool pf_now = rdev1 && !no_tier_batch && (d3_pf > 0 || d3_pf_early > 0) && m <= kD3PfRows;
         // STRATA_D3_PF_ASYNC=1: the prediction's readback waits on its own event while the layer's attention is already
         // queued behind it (predict_multi_launch, attn_router_launch, predict_multi_wait, attn_router_collect), so the
         // host's ranking and the prefetch DMA overlap the attention instead of preceding it.  The same graphs and
@@ -923,16 +950,26 @@ int main(int argc, char ** argv) {
             for (const auto & p : pv_score) pv_rank.push_back(p.first);
         };
         for (int l = 0; l < n_layer; ++l) {
+            if (plog2) pl_ahead_make(l, m);   // STRATA_PRED_LOG2: layer l + k's routing, predicted here
             // STRATA_D3_L3WARM=K: the next K predicted experts (not in VRAM, not prefetched to the card) are read into the
             // CPU's cache under the attention, for the tier's pool (Ds41MoeTier::warm_multi)
             static const int d3_l3warm = std::getenv("STRATA_D3_L3WARM") ? std::atoi(std::getenv("STRATA_D3_L3WARM")) : 0;
             if (pf_now && !pf_async) {
                 pv_pred.resize((size_t) m * 16);
-                if (dense.predict_multi(l, pv_pred.data())) {
+                const bool two = d3_pf_early > 0 && l + 1 < n_layer;   // STRATA_D3_PF_EARLY: the next layer's too
+                if (two) pv_next.resize((size_t) m * 16);
+                if (two ? dense.predict_multi2(l, pv_pred.data(), pv_next.data()) : dense.predict_multi(l, pv_pred.data())) {
                     rank_union(l);
                     tier.prefetch_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_pf);
                     if (d3_l3warm > 0) tier.warm_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_l3warm);
                     if (plog) { pl_pred = pv_pred; pl_have = true; }
+                    if (two) {   // ranked the same way; sent after this layer's tier call (below)
+                        std::swap(pv_pred, pv_next);
+                        rank_union(l + 1);
+                        pv_rank_next = pv_rank;
+                        std::swap(pv_pred, pv_next);
+                        have_next = true;
+                    }
                 }
             }
             // D3 speculative NVMe reads (STRATA_D3_SPEC=n, default 0 = off; STRATA_D3_SPEC_AHEAD=k, default 2): the
@@ -965,7 +1002,8 @@ int main(int argc, char ** argv) {
                 }
             }
             if (!attn_done && !dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
-            if (plog) plog_rec(l, m, pos, pl_have ? pl_pred.data() : nullptr, mids.data());
+            if (plog) plog_rec(plog, l, m, pos, pl_have ? pl_pred.data() : nullptr, mids.data());
+            if (plog2 && !pl_ahead[(size_t) l].empty()) plog_rec(plog2, l, m, pos, pl_ahead[(size_t) l].data(), mids.data());
             pl_have = false;
             lap(0);
             if (rdev1 && !no_tier_batch) {
@@ -981,6 +1019,10 @@ int main(int argc, char ** argv) {
                     }
                 }
                 if (void * ev = tier.take_sum_event()) dense.wait_event(ev);   // STRATA_PASS_NOSYNC: order on the card
+                // STRATA_D3_PF_EARLY: the next layer's copies start now - behind this layer's demand copies, ahead of
+                // the rest of this layer and the next attention
+                if (have_next) tier.prefetch_next(l + 1, pv_rank_next.data(), (int) pv_rank_next.size(), d3_pf_early);
+                have_next = false;
             } else {
                 for (int t = 0; t < m; ++t) {
                     const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
@@ -1361,6 +1403,59 @@ int main(int argc, char ** argv) {
         std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
         std::vector<float> park_logits;
         int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
+        // STRATA_SERVE_CACHE_SLOTS=N (default 0 = the single park above; the user's agent workloads, 2026-10-24): keep up
+        // to N WHOLE conversations (Ds41Dense::save_conv: the snapshot rings + every row up to their length, ~16 KB per
+        // position) in host memory, least recently used out first, within STRATA_SERVE_CACHE_GIB (default 8).  A coding
+        // agent alternates big conversations (main task, sub-agents, side calls); park keeps only one and only for small
+        // side requests, so every switch between two big ones re-read the whole prompt (a 20K prompt ~35 s; a restore
+        // copies ~0.3 GB back in tens of ms).  Before a request runs, the saved conversation it continues best (all of
+        // it, or up to 16 positions short of its end - see below) replaces the live one, which is saved first; a request
+        // that continues nothing saves the live one before overwriting it.  Conversations under STRATA_SERVE_PARK_MIN
+        // tokens (2048) are not kept.
+        struct CachedConv { std::vector<int> toks; std::vector<float> logits; std::shared_ptr<Ds41Dense::SavedConv> st; long used = 0; };
+        std::vector<CachedConv> convs;
+        const int cache_slots = std::getenv("STRATA_SERVE_CACHE_SLOTS") ? std::max(0, std::atoi(std::getenv("STRATA_SERVE_CACHE_SLOTS"))) : 0;
+        const double cache_gib = std::getenv("STRATA_SERVE_CACHE_GIB") ? std::atof(std::getenv("STRATA_SERVE_CACHE_GIB")) : 8.0;
+        long conv_clock = 0;
+        // STRATA_SERVE_SNAP_STACK=K (default 0 = off; the speed card 2026-10-24): the last K snapshots of the LIVE
+        // conversation (their rings, ~11 MB each, in host memory).  A thinking request is two engine calls - the thinking,
+        // then the answer on the reused prefix - and the second one moves the snapshot to the thinking's end; the next user
+        // turn's history drops the thinking and diverges just before the OLD snapshot, which REWIND1 cannot reach (it
+        // rewinds the latest one): srv-sc-follow.log re-read 4,746 tokens in 13 s at lcp 4095 vs snap 5101.  A request
+        // that diverges before the latest snapshot resumes at the newest stacked one <= lcp (or lcp + 1: one token back,
+        // as REWIND1).  An entry is pushed only while every request since resumed at or past it (its position rows are
+        // in place); a resume below an entry drops it, an unrelated request or a switch of conversation drops them all.
+        struct StackSnap { int pos; std::shared_ptr<Ds41Dense::SavedConv> st; };
+        std::vector<StackSnap> snap_stack;
+        const int snap_stack_k = std::getenv("STRATA_SERVE_SNAP_STACK") ? std::max(0, std::atoi(std::getenv("STRATA_SERVE_SNAP_STACK"))) : 0;
+        auto snap_stack_pick = [&](size_t lcp_) -> int {   // the newest usable entry, or -1
+            int best = -1;
+            for (size_t i = 0; i < snap_stack.size(); ++i) {
+                const int s = snap_stack[i].pos;
+                if (s >= 256 && ((size_t) s <= lcp_ || (size_t) s == lcp_ + 1) && (best < 0 || s > snap_stack[(size_t) best].pos))
+                    best = (int) i;
+            }
+            return best;
+        };
+        auto save_live = [&]() {   // the live conversation (its snapshot) into the cache; least recently used out first
+            if (cache_slots <= 0 || snap_len < park_min || hist.size() < (size_t) snap_len) return;
+            std::vector<int> toks(hist.begin(), hist.begin() + snap_len);
+            // a saved conversation that this one continues is superseded (its rows are a subset of these)
+            convs.erase(std::remove_if(convs.begin(), convs.end(), [&](const CachedConv & c) {
+                return c.toks.size() <= toks.size() && std::equal(c.toks.begin(), c.toks.end(), toks.begin()); }), convs.end());
+            auto st = dense.save_conv(snap_len);
+            if (!st) return;
+            convs.push_back({ std::move(toks), snap_logits, st, ++conv_clock });
+            const size_t cap = (size_t) (cache_gib * 1073741824.0);
+            auto bytes = [&] { size_t b = 0; for (const auto & c : convs) b += Ds41Dense::saved_bytes(*c.st); return b; };
+            while (!convs.empty() && ((int) convs.size() > cache_slots || bytes() > cap)) {
+                auto lru = std::min_element(convs.begin(), convs.end(), [](const CachedConv & x, const CachedConv & y) { return x.used < y.used; });
+                std::fprintf(stderr, "serve: cache dropped the %zu-token conversation (least recently used)\n", lru->toks.size());
+                convs.erase(lru);
+            }
+            std::fprintf(stderr, "serve: cached the %d-token conversation (%zu saved, %.2f GiB)\n", snap_len, convs.size(),
+                         (double) bytes() / 1073741824.0);
+        };
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
 #if defined(DS41_HAVE_DSPARK)
         // STRATA_SERVE_DSPARK: DSpark's window (main_hidden of the last <= 128 positions) is seeded by running a
@@ -1472,6 +1567,7 @@ int main(int argc, char ** argv) {
                 if (vis_rows.empty()) { std::printf("ERR GENI prompt has no image tokens\n"); std::fflush(stdout); continue; }
                 // an image prompt prefills fresh: every image span is the same run of image_token, so a token-only reuse
                 // test would "continue" a different image (same ids, different embeddings).  Empty hist / no snapshot / no park.
+                if (!previous_vision) save_live();   // a text conversation it overwrites stays cached (STRATA_SERVE_CACHE_SLOTS)
                 dense.drop_park();
                 park_hist.clear();
                 hist.clear();
@@ -1486,6 +1582,54 @@ int main(int argc, char ** argv) {
             bool unparked = false;
             int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
+            if (cache_slots > 0 && !is_vision) {   // STRATA_SERVE_CACHE_SLOTS: a saved conversation it continues better?
+                int best = -1;
+                size_t best_lp = 0;
+                // a resume point inside a saved conversation is exact only within the window ring's 16 spare positions
+                // of its end, at an even position (a fresh ratio-2 compressor group) - the rules ROLLBACK / REWIND1 keep;
+                // further back the first re-fed queries would attend window rows the ring no longer holds
+                for (size_t i = 0; i < convs.size(); ++i) {
+                    const auto & t = convs[i].toks;
+                    size_t lp = 0;
+                    while (lp < t.size() && lp < ids.size() && t[lp] == ids[lp]) ++lp;
+                    if (lp < t.size()) lp &= ~(size_t) 1;
+                    const bool usable = lp == t.size() || (lp + 16 >= t.size() && lp >= (size_t) park_min);
+                    if (usable && lp > lcp && lp > best_lp) { best = (int) i; best_lp = lp; }
+                }
+                if (best >= 0) {
+                    CachedConv c = std::move(convs[(size_t) best]);
+                    convs.erase(convs.begin() + best);
+                    save_live();   // the conversation it replaces stays cached
+                    if (dense.load_conv(*c.st)) {
+                        const bool whole = best_lp == c.toks.size();
+                        hist = c.toks;
+                        dense.set_history(hist.data(), (int64_t) best_lp, 0);   // Engram's n-grams look back over these
+                        if (whole) {   // resumes through restore() at the snapshot, as a full unpark
+                            snap_len = (int) c.toks.size();
+                            snap_logits = c.logits;
+                            snap_seed_n = 0;
+                        } else {       // a partial resume (<= 16 back, even): the tail past it is re-fed - from the
+                                       // saved snapshot's rings, so copy them into the live ones (a whole resume does
+                                       // that through restore() below)
+                            dense.restore();
+                            hist.resize(best_lp);
+                            snap_len = -1;
+                            reuse_override = (int) best_lp;
+                        }
+                        lcp = best_lp;
+                        unparked = true;
+#if defined(DS41_HAVE_DSPARK)
+                        dsp_next = -1;   // DSpark's window holds the previous conversation's states
+#endif
+                        std::fprintf(stderr, "serve: cache restored the %zu-token conversation at lcp %zu%s (%zu saved)\n",
+                                     c.toks.size(), best_lp, whole ? "" : " (partial: re-feeds from there)", convs.size());
+                    } else {
+                        hist.clear();
+                        snap_len = -1;
+                        lcp = 0;
+                    }
+                }
+            }
             if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
                 size_t lp = 0;
                 while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
@@ -1567,10 +1711,21 @@ int main(int argc, char ** argv) {
                 reused = (int) lcp;
                 std::fprintf(stderr, "serve: rewound the snapshot one token (%d -> %zu)\n", snap_len, lcp);
                 snap_len = -1;
+            } else if (int si = (snap_stack_k > 0 && !unparked && lcp < ids.size()) ? snap_stack_pick(lcp) : -1;
+                       si >= 0 && dense.load_conv(*snap_stack[(size_t) si].st) && dense.restore()) {
+                // STRATA_SERVE_SNAP_STACK: an earlier snapshot of this conversation (its rings back; its rows are in place)
+                const int s = snap_stack[(size_t) si].pos;
+                const int r = (size_t) s <= lcp ? s : (int) lcp;   // s == lcp + 1: one token back, as REWIND1
+                std::fprintf(stderr, "serve: resumed the stacked snapshot %d at %d (lcp %zu; the latest was %d)\n", s, r, lcp, snap_len);
+                hist.resize((size_t) r);
+                reused = r;
+                snap_len = -1;
             } else {
-                // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
+                // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK), or with
+                // STRATA_SERVE_CACHE_SLOTS save it whole into the cache
+                if (cache_slots > 0 && !unparked) save_live();
                 const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
-                if (park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
+                if (cache_slots <= 0 && park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
                     && dense.park(rows)) {
                     park_hist.assign(hist.begin(), hist.begin() + snap_len);
                     park_logits = snap_logits;
@@ -1579,6 +1734,11 @@ int main(int argc, char ** argv) {
                 }
                 hist.clear();
                 snap_len = -1;
+            }
+            if (snap_stack_k > 0) {   // entries past the resume point are overwritten from it on; another conversation: none
+                if (unparked || reused <= 0) snap_stack.clear();
+                else snap_stack.erase(std::remove_if(snap_stack.begin(), snap_stack.end(),
+                                                     [&](const StackSnap & e) { return e.pos > reused; }), snap_stack.end());
             }
             std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
                          park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
@@ -1850,6 +2010,14 @@ int main(int argc, char ** argv) {
             }
             hist = ids;
             // no snapshot for an image prompt: a text request with the same ids (all image_token) would restore its embeddings
+            // STRATA_SERVE_SNAP_STACK: the snapshot this one replaces is kept while its rows are in place (this request
+            // resumed at or past it)
+            if (snap_stack_k > 0 && total > reused && !is_vision && snap_len > 0 && reused >= snap_len) {
+                if (auto st = dense.save_conv(0)) {
+                    snap_stack.push_back({ snap_len, st });
+                    if ((int) snap_stack.size() > snap_stack_k) snap_stack.erase(snap_stack.begin());
+                }
+            }
             if (total > reused && !is_vision && dense.snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;

@@ -154,6 +154,9 @@ public:
     /// predict() for EVERY column of the current pass (call before attn_router(il)): top_ids[t * 16 + i] = token t's
     /// i-th predicted expert of layer il (16 per token).  For the multi-token verify pass's expert prefetch; a hint only.
     bool predict_multi(int il, int * top_ids);
+    /// predict_multi for layers il AND il + 1 from the same state, in ONE graph and one sync (STRATA_D3_PF_EARLY: the
+    /// next layer's prefetch starts a layer early).  next_ids: 16 per pass column, like top_ids.
+    bool predict_multi2(int il, int * top_ids, int * next_ids);
     /// routed_sum: n * n_embd floats, the routed experts' weighted sum (host).
     bool finish(int il, const float * routed_sum);
     /// Decode (n == 1) fusion: finish(il) and predict(next_il) in ONE cached graph - the router prediction for the next
@@ -201,6 +204,19 @@ public:
     bool unpark();
     void drop_park();
     bool parked() const;
+    /// Serve, STRATA_SERVE_CACHE_SLOTS: a WHOLE conversation's state - the snapshot rings + rows [0, positions] of the
+    /// position-indexed caches - in host memory (save_conv), written back by load_conv (which re-arms the snapshot at
+    /// the saved position, so restore() resumes it).  Unlike park() (ONE conversation, only the rows the next request
+    /// would overwrite) any number can be held, each independent of what runs in between.  ~16 KB per position.
+    /// positions 0 = the snapshot rings alone (~11 MB): an earlier snapshot of the SAME conversation, whose position rows
+    /// are still in place (STRATA_SERVE_SNAP_STACK).
+    struct SavedConv;
+    std::shared_ptr<SavedConv> save_conv(int64_t positions);
+    bool load_conv(const SavedConv & s);
+    static size_t saved_bytes(const SavedConv & s);
+    /// Engram's token history for positions pos0..pos0+n-1: a restored conversation's n-grams look back over positions
+    /// that another conversation may have written since (begin() only records the tokens a pass feeds).
+    void set_history(const int * ids, int64_t n, int64_t pos0 = 0);
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns

@@ -14,14 +14,25 @@ These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 
 | | 192 GB RAM | 128 GB RAM |
 |---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on) | **36 tok/s** | **29 tok/s** |
-| Reading a 51k-token prompt | **408 tok/s** | **119 tok/s** |
+| Writing (6 chats, up to 1,500 tokens each, thinking on) | **38 tok/s** | **29 tok/s** |
+| Reading a long prompt (51-64k tokens) | **610 tok/s** | **119 tok/s** * |
+
+\* Measured with the previous version (the 192 GB figure was 408 tok/s then).
 
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
 long prompts, but the output is the same.
 
-On the 192 GB PC, a new 5k-token prompt takes about 16 s and a 20k-token prompt about 34 s. In a chat, a follow-up
-message only reads what is new: usually under a second, at most a few seconds.
+On the 192 GB PC, a new 6k-token prompt takes about 15 s and a 25k-token prompt about 41 s. Writing is fastest on
+maths and code (~46 and ~38 tok/s) and ~33 tok/s on plain prose.
+
+## Agents, chats and tools
+
+- **Conversation cache:** the server keeps up to 8 conversations in memory (about 20 MB per 10k tokens). An agent that
+  switches between conversations, or makes a side request between turns, resumes each one in a second or two instead
+  of reading its whole prompt again (measured: 16-18 s per switch before, 1-3 s now).
+- **Follow-up messages** only read what is new. In thinking mode, the next turn no longer re-reads the history.
+- **Tool calls** (OpenAI `tools`) and **JSON output** (`response_format` `json_object` / `json_schema`) work through
+  the OpenAI-compatible API. Requests sent at the same time are answered one after another.
 
 ## Quality
 

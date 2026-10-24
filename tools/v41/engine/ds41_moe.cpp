@@ -346,6 +346,8 @@ struct Gpu {
     void* d_pf = nullptr;         ///< kMaxPf staging slots, one expert blob each
     cudaStream_t s_pf = nullptr;  ///< the prefetch stream (never the main one: the DMAs run under the dense work)
     cudaEvent_t ev_pf = nullptr;
+    void* d_pf_next = nullptr;    ///< STRATA_D3_PF_EARLY: the NEXT layer's staging (prefetch_next), swapped with d_pf
+    cudaEvent_t ev_pf_next = nullptr;   ///< when that layer begins (take_early); allocated on first use
     cudaEvent_t ev_sum = nullptr;   ///< STRATA_SUM_NOSYNC: the routed sum is in out_dev (the caller's stream waits on it)
     cudaStream_t s_dc = nullptr;  ///< STRATA_DMA_OVERLAP: the demand-copy stream.  A layer's PCIe/file blob DMAs run
                                   ///< here, so they overlap that layer's resident-expert kernels on `s` instead of
@@ -446,12 +448,13 @@ struct Gpu {
         for (cudaGraphExec_t g : tier_g)
             if (g) cudaGraphExecDestroy(g);
         void* bufs[] = {d_x, d_xq, d_parts, d_grp_ptr, d_grp_start, d_ngroups, d_ent_dst, d_ent_tok, d_scratch,
-                        d_stage, d_pf, d_meta};
+                        d_stage, d_pf, d_pf_next, d_meta};
         if (h_meta) cudaFreeHost(h_meta);
         if (h_fstage) cudaFreeHost(h_fstage);
         for (void* p : bufs)
             if (p) cudaFree(p);
         if (ev_pf) cudaEventDestroy(ev_pf);
+        if (ev_pf_next) cudaEventDestroy(ev_pf_next);
         if (s_pf) cudaStreamDestroy(s_pf);
         if (ev_dc) cudaEventDestroy(ev_dc);
         if (s_dc) cudaStreamDestroy(s_dc);
@@ -778,6 +781,9 @@ struct Ds41MoeImpl {
     double bal_cpu_us_mb = 30.0, bal_cpu_fix_us = 40.0, bal_gpu_us_mb = 43.5, bal_gpu_fix_us = 25.0, bal_hit_us = 20.0;
     int32_t pf_e[Ds41MoeConfig::kMaxPf] = {};
     int pf_n = 0;                     ///< staging slots the last prefetch() filled
+    int32_t pf_next_e[Ds41MoeConfig::kMaxPf] = {};   ///< STRATA_D3_PF_EARLY: prefetch_next's experts (d_pf_next)
+    int pf_next_n = 0;
+    int64_t pf_next_layer = -1;       ///< the layer they are for (-1: none)
     std::unique_ptr<Gpu> gpu;         ///< null in a CPU-only tier
     std::unique_ptr<DeferWork> defer; ///< STRATA_DEFER: the background pool and its one batch in flight
     std::unique_ptr<L3Warm> l3warm;   ///< STRATA_D3_L3WARM: the cache-warming threads (warm_multi)
@@ -2158,14 +2164,76 @@ void Ds41MoeTier::warm_multi(int64_t layer, const int32_t* ids, int n, int k) {
 #endif
 }
 
+#if defined(DS4_MOE_CUDA)
+// STRATA_D3_PF_EARLY: the experts prefetch_next() sent ahead for `layer` become its staging - d_pf / d_pf_next and their
+// events swap, so every reader of d_pf / pf_e / pf_n / ev_pf works unchanged.  Safe to swap: the old d_pf belonged to
+// the previous layer, whose expert kernels finished before this layer's attention ran (the routing readback waited on
+// it).  A no-op unless an early prefetch is waiting for exactly this layer.
+static void take_early(Ds41MoeImpl& im, int64_t layer) {
+    if (im.pf_next_layer != layer || !im.gpu) return;
+    Gpu& gp = *im.gpu;
+    std::swap(gp.d_pf, gp.d_pf_next);
+    std::swap(gp.ev_pf, gp.ev_pf_next);
+    std::memcpy(im.pf_e, im.pf_next_e, sizeof(im.pf_e));
+    im.pf_n = im.pf_next_n;
+    im.pf_next_n = 0;
+    im.pf_next_layer = -1;
+}
+#endif
+
+void Ds41MoeTier::prefetch_next(int64_t layer, const int32_t* ids, int n, int max_slots) {
+#if defined(DS4_MOE_CUDA)
+    im_->pf_next_n = 0;
+    im_->pf_next_layer = -1;
+    if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.no_cache || !im_->gpu->cache) return;
+    if (!ids || n <= 0 || max_slots <= 0 || !im_->g.routed(layer)) return;
+    Gpu& gp = *im_->gpu;
+    if (!gp.s_pf || !gp.d_pf) return;
+    if (!gp.d_pf_next) {   // kMaxPf more blobs of VRAM (~60 MB), only once the early prefetch is used
+        if (cudaMalloc(&gp.d_pf_next, (size_t) Ds41MoeConfig::kMaxPf * (size_t) im_->blob) != cudaSuccess) {
+            gp.d_pf_next = nullptr;
+            (void) cudaGetLastError();
+            static bool said = false;
+            if (!said) { said = true; std::fprintf(stderr, "ds41_moe: STRATA_D3_PF_EARLY: no VRAM for the second staging - off\n"); }
+            return;
+        }
+        ck(cudaEventCreateWithFlags(&gp.ev_pf_next, cudaEventDisableTiming), "ev_pf_next");
+    }
+    im_->pf_next_layer = layer;
+    const int nb = std::min(max_slots, (int) Ds41MoeConfig::kMaxPf);
+    for (int i = 0; i < n && im_->pf_next_n < nb; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= im_->g.n_experts) continue;
+        if (gp.cache->slot_of(layer, e) >= 0) continue;
+        bool dup = false;
+        for (int j = 0; j < im_->pf_next_n; ++j) dup = dup || im_->pf_next_e[j] == e;
+        if (dup) continue;
+        const uint8_t* src = gp.arena.ptr(layer, e);
+        if (!src || !gp.arena.dma_ok(layer, e)) continue;   // the file tier / pageable: no early copy
+        ck(cudaMemcpyAsync((uint8_t*) gp.d_pf_next + (size_t) im_->pf_next_n * (size_t) im_->blob, src,
+                           (size_t) im_->bl[(size_t) im_->g.cls(layer, e)], cudaMemcpyHostToDevice, gp.s_pf), "early prefetch dma");
+        im_->pf_next_e[im_->pf_next_n++] = e;
+    }
+    if (im_->pf_next_n > 0) {
+        ck(cudaEventRecord(gp.ev_pf_next, gp.s_pf), "record early prefetch");
+        wddm_flush(gp.s_pf);
+    }
+    im_->st.prefetch_issued += im_->pf_next_n;
+#else
+    (void) layer; (void) ids; (void) n; (void) max_slots;
+#endif
+}
+
 void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int max_slots) {
     im_->pf_n = 0;
 #if defined(DS4_MOE_CUDA)
+    take_early(*im_, layer);   // STRATA_D3_PF_EARLY: what is already on its way for this layer; the slots below append
+    const int pf0 = im_->pf_n;
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.no_cache || !im_->gpu->cache) return;
     if (!ids || n <= 0 || max_slots <= 0 || !im_->g.routed(layer)) return;
     Gpu& gp = *im_->gpu;
     if (!gp.s_pf || !gp.d_pf) return;   // allocated with pf_b > 0 (the decode default)
-    const int nb = std::min(max_slots, (int) Ds41MoeConfig::kMaxPf);
+    const int nb = std::min(pf0 + max_slots, (int) Ds41MoeConfig::kMaxPf);
     for (int i = 0; i < n && im_->pf_n < nb; ++i) {
         const int32_t e = ids[i];
         if (e < 0 || e >= im_->g.n_experts) continue;
@@ -2180,9 +2248,9 @@ void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int m
                            (size_t) im_->bl[(size_t) im_->g.cls(layer, e)], cudaMemcpyHostToDevice, gp.s_pf), "prefetch dma");
         im_->pf_e[im_->pf_n++] = e;
     }
-    if (im_->pf_n > 0) ck(cudaEventRecord(gp.ev_pf, gp.s_pf), "record prefetch");
-    if (im_->pf_n > 0) wddm_flush(gp.s_pf);   // the prefetch DMAs start now, under the attention
-    im_->st.prefetch_issued += im_->pf_n;
+    if (im_->pf_n > pf0) ck(cudaEventRecord(gp.ev_pf, gp.s_pf), "record prefetch");   // covers the early ones too (in order)
+    if (im_->pf_n > pf0) wddm_flush(gp.s_pf);   // the prefetch DMAs start now, under the attention
+    im_->st.prefetch_issued += im_->pf_n - pf0;
 #else
     (void) layer; (void) ids; (void) n; (void) max_slots;
 #endif
@@ -4632,6 +4700,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     }
     ds41_heapcheck("chunk:ready", n);
     im.pf_n = 0;   // a chunk does not use the decode prefetch staging
+    im.pf_next_n = 0;
+    im.pf_next_layer = -1;
 
     // ---- MMQ (Ds41MoeConfig::chunk_mmq): this layer's types covered -> streamed blobs sit `SL` apart in a half (BL
     // rounded up to whole blocks of every type, so each matrix is one MMQ "expert stride" away from the next)
@@ -5359,6 +5429,7 @@ bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, co
     if (!im_->g.routed(layer)) return false;
     if (std::getenv("DS41_DBG_X")) std::fprintf(stderr, "[dbg_x] ENTER run_multi_to_dev layer=%lld nt=%d\n", (long long) layer, nt);
 #if defined(DS4_MOE_CUDA)
+    take_early(*im_, layer);   // STRATA_D3_PF_EARLY: a layer that ran no prefetch_multi still uses what was sent ahead
     if (!im_->cfg.cpu_only) {
         const int64_t K = im_->g.top_k, H = im_->g.n_embd;
         if (im_->g.per_expert()) {
@@ -5426,6 +5497,8 @@ void Ds41MoeTier::release_cache() {
     im_->gpu->cache.reset();
     im_->admitted = 0;
     im_->pf_n = 0;             // staged prefetches are keyed by expert, not slot - but they belong to the old decode
+    im_->pf_next_n = 0;
+    im_->pf_next_layer = -1;
     im_->vlast.clear();        // the LRU order restarts from the next seed (lru_seed_order)
 #endif
 }
@@ -5467,6 +5540,8 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     if (!c.shrink(c.bytes_of(keep), err)) return -1;
     im_->admitted = im_->admitted > n ? im_->admitted - n : 0;
     im_->pf_n = 0;   // staged prefetches may point at evicted experts' slots
+    im_->pf_next_n = 0;
+    im_->pf_next_layer = -1;
     im_->shrunk = std::move(gone);
     return n;
 #else
@@ -5992,6 +6067,8 @@ void Ds41MoeTier::close() {
     im_->blobs = nullptr;
     im_->inited = false;
     im_->pf_n = 0;
+    im_->pf_next_n = 0;
+    im_->pf_next_layer = -1;
 }
 
 const Ds41MoeStats& Ds41MoeTier::stats() const { return im_->st; }
