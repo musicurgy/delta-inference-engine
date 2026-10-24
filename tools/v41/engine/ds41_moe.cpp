@@ -2204,6 +2204,14 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
         nb = (int) std::lround(im_->cfg.pf_b);
     }
     nb = std::min(nb, (int) Ds41MoeConfig::kMaxPf);
+    // STRATA_PF_TOPR=R (default 0 = the pf_b budget above; rounds 111 / 114): only the prediction's first R ranks, each
+    // one that is not resident (up to R DMAs a layer, no dither).  A row routes its rank 0 / 1 prediction with p = 95% /
+    // 89%, rank 2 80% and falling: ranks 0-1 alone took single-step prefetch precision from 62% to 84% (held out).
+    static const int topr = std::getenv("STRATA_PF_TOPR") ? std::atoi(std::getenv("STRATA_PF_TOPR")) : 0;
+    if (topr > 0) {
+        n = std::min(n, topr);
+        nb = std::min(topr, (int) Ds41MoeConfig::kMaxPf);
+    }
     for (int i = 0; i < n && im_->pf_n < nb; ++i) {
         const int32_t e = top16[i];
         if (e < 0 || e >= im_->g.n_experts) continue;
@@ -4393,6 +4401,13 @@ MmqPlan mmq_plan(const strata::kernels::NativeExpertLayout& GL, int64_t BL) {
 }
 #endif
 
+// STRATA_PSTAGE_MMQ=1 (default off): the layer prestage region at the MMQ stride, and run_chunk's launches split into
+// runs whose blobs are one stride apart, so prestaged experts take MMQ too (see chunk_pstage_fill)
+bool pstage_mmq() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PSTAGE_MMQ"); return v && v[0] == '1'; }();
+    return on;
+}
+
 // The stride run_chunk gives a streamed blob in a device half (BL, or BL rounded to whole blocks of every type when
 // the layer runs on MMQ) - the same rule as in gpu_run_chunk (mmq_plan), for chunk_prestage
 int64_t chunk_stride(Ds41MoeImpl& im, int64_t layer) {
@@ -4461,6 +4476,11 @@ bool chunk_pstage_alloc(Ds41MoeImpl& im) {
             gp.p_off = true;
             return false;
         }
+        // STRATA_PSTAGE_MMQ: zero the region for MMQ's over-read - ON s_cp, the stream its DMAs run on.  A plain
+        // cudaMemset runs on the legacy default stream, which does not order against the non-blocking s_cp: it raced
+        // the first prestage DMAs and zeroed part of a layer's experts (round 103: two identical deterministic runs
+        // gave different logits, and the KL gate moved 0.0083 -> 0.0087)
+        if (pstage_mmq()) ck(cudaMemsetAsync(gp.p_buf, 0, gp.p_cap, gp.s_cp), "pstage zero");
         ck(cudaEventCreateWithFlags(&gp.p_copied, cudaEventDisableTiming), "ev");
         ck(cudaEventCreateWithFlags(&gp.p_used, cudaEventDisableTiming), "ev");
         static bool said = false;
@@ -4480,18 +4500,25 @@ int chunk_pstage_fill(Ds41MoeImpl& im, int64_t layer, const int32_t* routed) {
     gp.p_ptr.assign((size_t) NX, 0ull);
     size_t off = 0;
     int nput = 0;
+    // STRATA_PSTAGE_MMQ=1 (round 101): the region at run_chunk's MMQ stride (chunk_stride: BL rounded to whole blocks
+    // of every type) instead of 256-byte packing, so the launches out of it take MMQ like the streamed experts.  Packed
+    // at 256 B the blobs were never one MMQ stride apart, and the ~200 experts a layer the region holds ran the
+    // per-8-column MMVQ kernel: 16.3 of a 16K prompt's 29.5 kernel seconds (round 100's profile).  1 MiB stays free at
+    // the end (MMQ reads up to 4 KiB past a matrix; the region is zeroed once, so that tail decodes to finite numbers).
+    const int64_t mmq_sl = pstage_mmq() && !im.g.per_expert() ? chunk_stride(im, layer) : 0;
+    const bool at_sl = mmq_sl > 0 && mmq_sl != im.bl[(size_t) layer];
     for (int64_t e = 0; e < NX; ++e) {
         if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
         const uint8_t* src = gp.arena.ptr(layer, e);
         if (!src) continue;
         const size_t bl = (size_t) im.bl[(size_t) (im.g.per_expert() ? im.g.cls(layer, (int32_t) e) : layer)];
-        if (off + bl > gp.p_cap) break;
+        if (at_sl ? off + (size_t) mmq_sl + ((size_t) 1 << 20) > gp.p_cap : off + bl > gp.p_cap) break;
         if (!routed || routed[e]) {
             ck(cudaMemcpyAsync((uint8_t*) gp.p_buf + off, src, bl, cudaMemcpyHostToDevice, gp.s_cp), "pstage dma");
             gp.p_ptr[(size_t) e] = (unsigned long long) gp.p_buf + off;
             ++nput;
         }
-        off = (off + bl + 255) & ~(size_t) 255;
+        off = at_sl ? off + (size_t) mmq_sl : (off + bl + 255) & ~(size_t) 255;
     }
     if (std::getenv("STRATA_PSTAGE_TRACE")) {   // diagnostic: which layers fill, how many, and the region's packing
         static int said = 0;
@@ -4777,7 +4804,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         gp.m_ctx->run(p, gp.s);
     };
 #endif
-    auto launch = [&](const std::vector<int32_t>& es, const std::vector<unsigned long long>& ptrs) {
+    auto launch1 = [&](const std::vector<int32_t>& es, const std::vector<unsigned long long>& ptrs) {
         if (es.empty()) return;
 #if defined(DS4_MOE_MMQ)
         bool strided = use_mmq;
@@ -4861,6 +4888,25 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             kev_res.push_back(in_resident ? 1 : 0);
         }
         // the host vectors above are pageable: cudaMemcpyAsync has staged them before returning
+    };
+    // STRATA_PSTAGE_MMQ: a run out of the prestage region whose blobs are not all one MMQ stride apart (the region
+    // keeps a slot for every arena expert of the layer, so one this call does not route leaves a gap) goes out as its
+    // strided pieces, each on MMQ, instead of whole on MMVQ.  Resident (VRAM cache) runs are left as they were.
+    auto launch = [&](const std::vector<int32_t>& es, const std::vector<unsigned long long>& ptrs) {
+#if defined(DS4_MOE_MMQ)
+        if (use_mmq && pstage_mmq() && !in_resident && ptrs.size() > 1) {
+            size_t a = 0;
+            for (size_t q = 1; q <= ptrs.size(); ++q) {
+                if (q < ptrs.size() && ptrs[q] == ptrs[q - 1] + (unsigned long long) SL) continue;
+                if (a == 0 && q == ptrs.size()) break;   // one strided run already
+                launch1(std::vector<int32_t>(es.begin() + (std::ptrdiff_t) a, es.begin() + (std::ptrdiff_t) q),
+                        std::vector<unsigned long long>(ptrs.begin() + (std::ptrdiff_t) a, ptrs.begin() + (std::ptrdiff_t) q));
+                a = q;
+            }
+            if (a == ptrs.size()) return;
+        }
+#endif
+        launch1(es, ptrs);
     };
     // ---- resident experts: adjacent in the entry order -> one launch
     std::vector<int32_t> run_e;

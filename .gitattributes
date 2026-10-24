@@ -5,6 +5,10 @@ bench/prompts/** -text
 *.sh text eol=lf
 *.bat text eol=crlf
 
+# build-ds41.bat applies the ggml patch to llama.cpp's LF sources with git apply: a CRLF checkout (Git for Windows'
+# default core.autocrlf=true) makes every hunk fail, so patches always check out with LF
+*.patch text eol=lf
+
 # copies of real packs' native_experts.txt, parsed byte for byte by tests/core/expert_layout_test.cpp
 tests/data/native_experts/** -text
 

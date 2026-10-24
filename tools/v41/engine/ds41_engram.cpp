@@ -494,6 +494,14 @@ struct Ds41Engram::Batch {
     std::shared_ptr<Task> read_task;
     std::atomic<int> bad { 0 };
     std::atomic<uint64_t> bytes { 0 };
+    // per-table work left (read groups + in-RAM rows): wait_table(e) returns once table e's rows are all in `out`,
+    // while the other table's reads go on (STRATA_ENGRAM_SPLIT: layer 14's rows read under layers 1-13)
+    std::atomic<int64_t> left[4] {};
+    std::mutex left_mu;
+    std::condition_variable left_cv;
+    void one_done(int e) {
+        if (left[e].fetch_sub(1) == 1) { std::lock_guard<std::mutex> lk(left_mu); left_cv.notify_all(); }
+    }
 };
 
 void Ds41Engram::drop_cache() {
@@ -598,6 +606,8 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
         constexpr int64_t HIT_CHUNK = 64;            // hits per work item
         t->n = ng + ((int64_t) b->hits.size() + HIT_CHUNK - 1) / HIT_CHUNK;
         Batch * bp = b.get();
+        for (const ReadGroup & G : b->groups) b->left[G.e].fetch_add(1);
+        for (const Batch::Hit & H : b->hits) b->left[H.e].fetch_add(1);
         t->fn = [this, bp, dim, srsz, ng](int64_t a, int64_t c) {
             uint8_t bw[4096 + 512], bs[1024];
             auto & outv = *bp->out;
@@ -617,6 +627,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                         }
                         for (uint32_t p = rb[H.k] + 1; p < rb[H.k + 1]; ++p)
                             std::memcpy(oe + (size_t) (uint32_t) pk[p] * (size_t) dim, o0, (size_t) dim * sizeof(float));
+                        bp->one_done(H.e);
                     }
                     continue;
                 }
@@ -624,7 +635,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                 const Table & T = tables_[(size_t) G.e];
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
                     tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w, T.dfd_w) != (ssize_t) G.len_w ||
-                    tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s, T.dfd_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); continue; }
+                    tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s, T.dfd_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); bp->one_done(G.e); continue; }
                 bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
                 const auto & uq = bp->uniq[(size_t) G.e];
                 const auto & pk = bp->packed[(size_t) G.e];
@@ -654,6 +665,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                     for (uint32_t p = p0 + 1; p < rb[uu + 1]; ++p)               // ... and share it with the row's other slots
                         std::memcpy(oe + (size_t) (uint32_t) pk[p] * (size_t) dim, o0, (size_t) dim * sizeof(float));
                 }
+                bp->one_done(G.e);
             }
         };
         b->read_task = t;
@@ -680,6 +692,20 @@ bool Ds41Engram::wait(const std::shared_ptr<Batch> & b, std::string & err) {
     }
     reads_ += (uint64_t) b->groups.size();
     bytes_ += b->bytes.load();
+    if (b->bad.load()) { err = "engram: " + std::to_string(b->bad.load()) + " row reads failed"; return false; }
+    return true;
+}
+
+bool Ds41Engram::wait_table(const std::shared_ptr<Batch> & b, int e, std::string & err) {
+    if (!b) { err = "engram: null batch"; return false; }
+    if (e < 0 || e >= 4) { err = "engram: bad table"; return false; }
+    if (b->read_task && b->left[e].load() > 0) {   // only this table's rows; the other table's reads go on
+        const auto t0 = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lk(b->left_mu);
+        b->left_cv.wait(lk, [&] { return b->left[e].load() <= 0; });
+        wait_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++waits_;
+    }
     if (b->bad.load()) { err = "engram: " + std::to_string(b->bad.load()) + " row reads failed"; return false; }
     return true;
 }

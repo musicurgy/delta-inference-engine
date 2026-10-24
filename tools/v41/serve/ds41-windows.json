@@ -24,7 +24,7 @@
     "--vram-margin",
     "0.6",
     "--prompt-batch",
-    "12288",
+    "16384",
     "--rank",
     "${XO_ROOT}/data/ds41/rank-1017-share.bin",
     "--pf-b",

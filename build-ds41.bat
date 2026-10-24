@@ -22,8 +22,9 @@ set "LLAMA=%ROOT%third_party\llama.cpp"
 rem llama.cpp at Xolotl's pinned commit + tools\xolotl\ggml\xolotl-ggml.patch (as tools/xolotl/fetch-llama.sh does)
 set "PIN=3cf03257f219afbe7334045ff7c6a06ac68c627d"
 if not exist "%LLAMA%\ggml\CMakeLists.txt" (
-  git clone -q -c core.autocrlf=false https://github.com/ggml-org/llama.cpp.git "%LLAMA%" || exit /b 1
-  git -C "%LLAMA%" -c core.autocrlf=false checkout -q %PIN% || exit /b 1
+  rem core.longpaths: llama.cpp has ~150-character paths (tools\ui), past Windows' 260 under a deep folder
+  git clone -q -c core.autocrlf=false -c core.longpaths=true https://github.com/ggml-org/llama.cpp.git "%LLAMA%" || exit /b 1
+  git -C "%LLAMA%" -c core.autocrlf=false -c core.longpaths=true checkout -q %PIN% || exit /b 1
   git -C "%LLAMA%" apply "%ROOT%tools\xolotl\ggml\xolotl-ggml.patch" || exit /b 1
   echo llama.cpp %PIN% + xolotl-ggml.patch in third_party\llama.cpp
 )

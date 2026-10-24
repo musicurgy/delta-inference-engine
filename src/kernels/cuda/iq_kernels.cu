@@ -2915,6 +2915,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 21: return (size_t) (n / 256) * sizeof(block_iq3_s);
         case 22: return (size_t) (n / 256) * sizeof(block_iq2_s);
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
+        case 19: return (size_t) (n / 256) * sizeof(block_iq1_s);   // fork: IQ1_S (GSQ-RCO IQ1_M build)
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 10: return (size_t) (n / 256) * sizeof(block_q2_K);

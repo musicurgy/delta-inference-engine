@@ -63,6 +63,9 @@ public:
     struct Batch;
     std::shared_ptr<Batch> start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err);
     bool wait(const std::shared_ptr<Batch> & b, std::string & err);
+    /// Wait for table `e`'s rows of the batch only (its slot of `out` is complete on return; the other tables may still
+    /// be reading).  wait() is still due before the batch is dropped.
+    bool wait_table(const std::shared_ptr<Batch> & b, int e, std::string & err);
     /// Drop this module's tables from the page cache (posix_fadvise DONTNEED on our own fds; not a global drop).
     void drop_cache();
     /// bytes read so far (stats)

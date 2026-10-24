@@ -102,7 +102,13 @@ struct Allo {
         }
         const size_t before = ggml_gallocr_get_buffer_size(a, 0);
         if (!ggml_gallocr_alloc_graph(a, g)) return false;
-        if (ggml_gallocr_get_buffer_size(a, 0) != before && before != 0) ++epoch;
+        if (ggml_gallocr_get_buffer_size(a, 0) != before && before != 0) {
+            ++epoch;
+            static const bool log = env_on("STRATA_ALLO_LOG", false);
+            if (log) std::fprintf(stderr, "ds41_dense: graph buffer %.1f -> %.1f MiB (epoch %llu, %zu graphs re-allocate)\n",
+                                  before / 1048576.0, ggml_gallocr_get_buffer_size(a, 0) / 1048576.0,
+                                  (unsigned long long) epoch, graph_epoch.size());
+        }
         auto note = [&](const ggml_tensor * t) {
             if (!t || !t->buffer) return;
             if (ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) compute_bufs.insert(t->buffer);
@@ -119,6 +125,24 @@ struct Allo {
         return true;
     }
 };
+
+// STRATA_GRAPH_RESERVE_MIB=N: the decode allocator starts with an N MiB buffer instead of growing to the largest graph
+// seen so far.  Every growth frees the buffer all cached graphs live in, so each of them is re-allocated on its next
+// use - a host wait, then ggml-cuda runs it kernel by kernel, then re-captures and re-instantiates its CUDA graph
+// (round 90: ~590 such re-captures in one 400-token answer as the attention's pass_cap doubled).  Same graphs, same
+// kernels: exact.  The N MiB come out of the expert slots (reserved before the tier sizes them).
+static void allo_reserve(Allo & al) {
+    static const long long mib = std::getenv("STRATA_GRAPH_RESERVE_MIB") ? std::atoll(std::getenv("STRATA_GRAPH_RESERVE_MIB")) : 0;
+    if (mib <= 0 || !al.a) return;
+    ggml_init_params p = { ggml_tensor_overhead() * 4 + ggml_graph_overhead_custom(4, false), nullptr, true };
+    ggml_context * c = ggml_init(p);
+    ggml_tensor * x = ggml_new_tensor_1d(c, GGML_TYPE_F32, (int64_t) mib << 18);
+    ggml_set_input(x);
+    ggml_cgraph * g = ggml_new_graph_custom(c, 4, false);
+    ggml_build_forward_expand(g, ggml_sum(c, x));
+    if (!ggml_gallocr_reserve(al.a, g)) std::fprintf(stderr, "ds41_dense: STRATA_GRAPH_RESERVE_MIB=%lld did not fit\n", mib);
+    ggml_free(c);
+}
 
 struct WStore {
     ggml_context * ctx = nullptr;
@@ -277,6 +301,7 @@ struct Ds41Dense::Impl {
     // attn_router: the whole pass's rows are read from disk while the embeddings, the init graph and the layers below
     // the first Engram layer (1) run.  Null once uploaded (or when Engram is off) - see engram_ready().
     std::shared_ptr<Ds41Engram::Batch> eng_batch;
+    bool eng_up[2] = { false, false };   // STRATA_ENGRAM_SPLIT: this Engram slot's rows already in i_eng
 
     // ---- graphs
     ggml_context * gctx = nullptr;        // node structs of the cached (n = 1) graphs
@@ -311,9 +336,110 @@ struct Ds41Dense::Impl {
     ggml_backend_event_t pm_ev = nullptr;
     int64_t pm_rows = 0, pm_rs = 0;
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
+    // STRATA_KEEP_DEC_GRAPHS=1 (--serve, elastic columns): the decode-width columns and every graph built on them,
+    // parked by set_columns() while a prompt batch runs on its own wider columns, and brought back after it
+    struct World {
+        bool valid = false;
+        ggml_context * nctx = nullptr;
+        ggml_backend_buffer_t nbuf = nullptr;
+        int64_t NC = 0;
+        ggml_tensor * x_state = nullptr, * pre_state = nullptr, * hap = nullptr, * post_f = nullptr, * comb_f = nullptr;
+        ggml_tensor * shexp = nullptr, * o_fn = nullptr, * o_ids = nullptr, * o_wts = nullptr, * o_xids = nullptr;
+        ggml_tensor * o_xwts = nullptr, * routed = nullptr, * cand = nullptr;
+        ggml_tensor * i_emb = nullptr, * i_pos = nullptr, * i_img = nullptr, * i_widx = nullptr, * i_wmask = nullptr;
+        ggml_tensor * i_wslot = nullptr, * i_sidx = nullptr, * i_sslot = nullptr, * i_lastblk = nullptr;
+        ggml_tensor * i_nvis[3] = {}, * i_cslot[3] = {}, * i_cpos[3] = {}, * i_eng[2] = {};
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> sel;   // per layer: sel, selm
+        ggml_context * gctx = nullptr;
+        Allo allo_dec, allo_pass;
+        std::map<GKey, ggml_cgraph *> graphs;
+        std::map<GKey, MGraph> mgraphs;
+        std::map<int, ggml_tensor *> logits_out, predict_out, fpredict_out;
+        std::map<std::pair<int, int>, ggml_tensor *> predict_out_n;
+        std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead;
+    } parked_dec;
+    void free_world(World & o) {   // the graphs / columns a World holds (its allocators go with it)
+        for (auto & kv : o.mgraphs) ggml_free(kv.second.ctx);
+        o.mgraphs.clear();
+        o.graphs.clear();
+        o.logits_out.clear();
+        o.predict_out.clear();
+        o.fpredict_out.clear();
+        o.predict_out_n.clear();
+        o.fpredict_ahead.clear();
+        for (Allo * al : { &o.allo_dec, &o.allo_pass }) {
+            if (al->a) ggml_gallocr_free(al->a);
+            al->a = nullptr;
+            al->graph_epoch.clear();
+            al->compute_bufs.clear();
+        }
+        if (o.gctx) ggml_free(o.gctx);
+        o.gctx = nullptr;
+        if (o.nbuf) ggml_backend_buffer_free(o.nbuf);
+        o.nbuf = nullptr;
+        if (o.nctx) ggml_free(o.nctx);
+        o.nctx = nullptr;
+        o.valid = false;
+    }
+    void swap_world(World & o) {   // this Impl's columns + graphs <-> o's
+        std::swap(nctx, o.nctx);
+        std::swap(nbuf, o.nbuf);
+        std::swap(NC, o.NC);
+        std::swap(x_state, o.x_state);
+        std::swap(pre_state, o.pre_state);
+        std::swap(hap, o.hap);
+        std::swap(post_f, o.post_f);
+        std::swap(comb_f, o.comb_f);
+        std::swap(shexp, o.shexp);
+        std::swap(o_fn, o.o_fn);
+        std::swap(o_ids, o.o_ids);
+        std::swap(o_wts, o.o_wts);
+        std::swap(o_xids, o.o_xids);
+        std::swap(o_xwts, o.o_xwts);
+        std::swap(routed, o.routed);
+        std::swap(cand, o.cand);
+        std::swap(i_emb, o.i_emb);
+        std::swap(i_pos, o.i_pos);
+        std::swap(i_img, o.i_img);
+        std::swap(i_widx, o.i_widx);
+        std::swap(i_wmask, o.i_wmask);
+        std::swap(i_wslot, o.i_wslot);
+        std::swap(i_sidx, o.i_sidx);
+        std::swap(i_sslot, o.i_sslot);
+        std::swap(i_lastblk, o.i_lastblk);
+        for (int r = 0; r < 3; ++r) {
+            std::swap(i_nvis[r], o.i_nvis[r]);
+            std::swap(i_cslot[r], o.i_cslot[r]);
+            std::swap(i_cpos[r], o.i_cpos[r]);
+        }
+        for (int e = 0; e < 2; ++e) std::swap(i_eng[e], o.i_eng[e]);
+        o.sel.resize(ly.size());
+        for (size_t i = 0; i < ly.size(); ++i) {
+            std::swap(ly[i].sel, o.sel[i].first);
+            std::swap(ly[i].selm, o.sel[i].second);
+        }
+        std::swap(gctx, o.gctx);
+        for (auto pr : { std::make_pair(&allo_dec, &o.allo_dec), std::make_pair(&allo_pass, &o.allo_pass) }) {
+            std::swap(pr.first->a, pr.second->a);
+            std::swap(pr.first->epoch, pr.second->epoch);
+            pr.first->graph_epoch.swap(pr.second->graph_epoch);
+            pr.first->compute_bufs.swap(pr.second->compute_bufs);
+        }
+        graphs.swap(o.graphs);
+        mgraphs.swap(o.mgraphs);
+        logits_out.swap(o.logits_out);
+        predict_out.swap(o.predict_out);
+        fpredict_out.swap(o.fpredict_out);
+        predict_out_n.swap(o.predict_out_n);
+        fpredict_ahead.swap(o.fpredict_ahead);
+        span_memo_pos0 = -1;   // the index tensors now in place hold another pass's spans
+        span_memo_col0 = -1;
+        span_memo_n = -1;
+    }
 
     ~Impl() {
         dsync();   // STRATA_DENSE_ASYNC: nothing may still run in the buffers freed here
+        if (parked_dec.valid) free_world(parked_dec);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -612,6 +738,16 @@ static bool pass_graphs_on(int64_t n) {
     return on && n >= 1 && n <= mx;
 }
 
+// STRATA_FUSE_ROUTER=1 (default off): the router's tail - sqrt(softplus), the two bias adds, top-k, the weight gather,
+// sum, div and scale, ~11 kernels per layer-pass - and the prefetch prediction's top-16 (~5) as ONE ggml_dsv4_route
+// each, the router's weights written straight into o_wts.  The same float steps (ggml-cuda/dsv4-hc.cu): bit-identical
+// ids and weights.  Kernel listing 2026-10-24: each kernel removed also saves ~1.7 us of WDDM graph launch.  CUDA only;
+// the plain router only (no smart router / margin / vision bias).
+static bool fuse_router(const Ds41Dense::Impl & im) {
+    static const bool on = env_on("STRATA_FUSE_ROUTER", false);
+    return on && !im.cpu;
+}
+
 template <class F>
 static Ds41Dense::Impl::MGraph & pass_graph(Ds41Dense::Impl & im, const Ds41Dense::Impl::GKey & key, F build) {
     auto it = im.mgraphs.find(key);
@@ -764,6 +900,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
 
     // ---- compressed KV (kv sources write it; every ratio > 0 layer reads its source's)
     ggml_tensor * Kc = nullptr, * Mc = nullptr;
+    ggml_tensor * g_sel = nullptr, * g_comp = nullptr;      // STRATA_KGATHER: the selection and its source, for one gather
     ggml_tensor * comp_w = nullptr, * idxk_w = nullptr;   // this pass's writes (later reads depend on them)
     if (r) {
         if (L.kv_src) {
@@ -861,6 +998,8 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 sel = ggml_view_2d(gc, IS.sel, K, n, IS.sel->nb[1], (size_t) col0 * IS.sel->nb[1]);
                 selm = ggml_view_2d(gc, IS.selm, K, n, IS.selm->nb[1], (size_t) col0 * IS.selm->nb[1]);
             }
+            g_sel = sel;
+            g_comp = comp;
             Kc = ggml_reshape_3d(gc, rows_as(gc, comp, ggml_cont(gc, ggml_reshape_1d(gc, ggml_cont(gc, sel), K * n)), f16), DH, K, n);
             Mc = ggml_cont(gc, selm);
             // the source's rows must be read AFTER this pass wrote its own (a kv source attends to its new row)
@@ -871,6 +1010,32 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * Kall = Kc ? ggml_concat(gc, Kw, Kc, 1) : Kw;                                 // [DH, M, n]
     ggml_tensor * Mall = Mc ? ggml_concat(gc, Mw, Mc, 0) : Mw;                                 // [M, n]
     int64_t M = Kall->ne[1];
+    // STRATA_KGATHER=1 (default off): the key sets in ONE gather from [window source | compressed rows 0..cap | a zero
+    // row] instead of two gathers, a concat and the padding concat - every query's [DH, M] keys were written three
+    // times (round 100: concat_cont 3.25 s of a 16K prompt).  The same F16 values: the window rows round F32 -> F16
+    // as rows_as does, the compressed rows dequantize the same way, the padding is the same zeros.  Only where the
+    // whole-cap dequant is cheaper than the key sets it saves copying (cap <= n * M / 2: prompt passes, not decode).
+    static const bool kgather = std::getenv("STRATA_KGATHER") && std::getenv("STRATA_KGATHER")[0] == '1';
+    if (kgather && f16 && !im.cpu && g_sel && Kc) {
+        const int64_t K = g_sel->ne[0], M0 = SWA + K, MP = (M0 + 255) / 256 * 256, nsrc = wsrc->ne[1];
+        if (cap * 2 <= n * MP) {
+            ggml_tensor * iota = ggml_cast(gc, ggml_scale(gc, ggml_view_1d(gc, im.neg_ramp, cap, 0), -1.0f), GGML_TYPE_I32);
+            ggml_tensor * c16 = rows_as(gc, g_comp, iota, true);                                         // [DH, cap]
+            ggml_tensor * src = ggml_concat(gc, ggml_concat(gc, ggml_cast(gc, wsrc, GGML_TYPE_F16), c16, 1), im.zpad16, 1);
+            ggml_tensor * wi = ggml_reshape_2d(gc, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4), SWA, n);
+            ggml_tensor * si = ggml_cast(gc, ggml_scale_bias(gc, ggml_cast(gc, ggml_cont(gc, g_sel), GGML_TYPE_F32), 1.0f, (float) nsrc),
+                                         GGML_TYPE_I32);                                                // [K, n]
+            ggml_tensor * idx = ggml_concat(gc, wi, si, 0);                                              // [M0, n]
+            if (MP > M0) {
+                ggml_tensor * zi = ggml_cast(gc, ggml_scale_bias(gc, ggml_cast(gc, ggml_view_1d(gc, im.zidx, (MP - M0) * n, 0),
+                                                                                GGML_TYPE_F32), 1.0f, (float) (nsrc + cap)), GGML_TYPE_I32);
+                idx = ggml_concat(gc, idx, ggml_reshape_2d(gc, zi, MP - M0, n), 0);                      // [MP, n]
+                Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, MP - M0, n), NEG_INF), 0);
+            }
+            Kall = ggml_reshape_3d(gc, rows_as(gc, src, ggml_reshape_1d(gc, ggml_cont(gc, idx), MP * n), true), DH, MP, n);
+            M = MP;
+        }
+    }
     if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
         const int64_t pad = 256 - M % 256;
         // F16 has no CUDA pad: concat zeros gathered from the one zero row (F16 -> F16, exact) - the same zeros
@@ -966,10 +1131,16 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     } else {
         sel = ggml_add(gc, s0, rb);
     }
-    ggml_tensor * ids = ggml_argsort_top_k(gc, sel, (int) im.NU);   // [NU, n]
-    ggml_tensor * wts = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), ids), im.NU, n);
-    if (G.norm_topk) wts = ggml_div(gc, wts, ggml_scale_bias(gc, ggml_sum_rows(gc, wts), 1.0f, 1e-20f));
-    wts = ggml_scale(gc, wts, (float) G.weights_scale);
+    ggml_tensor * ids = nullptr, * wts = nullptr;   // wts stays null when the fused op writes o_wts itself
+    if (fuse_router(im) && !smart_router() && rb_margin < 0.0f && bias_sel == im.BL(il, "exp_probs_b.bias")) {
+        ids = ggml_dsv4_route(gc, rl, bias_sel, im.ly[(size_t) il].rbias, b.cols2(im.o_wts, im.NU, n, col0), (int) im.NU,
+                              G.norm_topk, (float) G.weights_scale);
+    } else {
+        ids = ggml_argsort_top_k(gc, sel, (int) im.NU);   // [NU, n]
+        wts = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), ids), im.NU, n);
+        if (G.norm_topk) wts = ggml_div(gc, wts, ggml_scale_bias(gc, ggml_sum_rows(gc, wts), 1.0f, 1e-20f));
+        wts = ggml_scale(gc, wts, (float) G.weights_scale);
+    }
 
     // ---- shared expert (model.py Expert, clamped SwiGLU) - in its own graph under STRATA_SHEXP_SPLIT (n == 1)
     ggml_tensor * se = no_shexp ? nullptr : build_shexp_ops(im, gc, il, fn);   // no_shexp: shexp_launch computes it
@@ -980,7 +1151,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     if (se) outs.push_back(ggml_cpy(gc, se, b.cols2(im.shexp, D, n, col0)));
     outs.push_back(ggml_cpy(gc, fn, b.cols2(im.o_fn, D, n, col0)));
     outs.push_back(ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n, col0)));
-    outs.push_back(ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n, col0)));
+    if (wts) outs.push_back(ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n, col0)));
     if (xids) {   // route meter: the exact top-NU and their normalized weights
         ggml_tensor * xw = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), xids), im.NU, n);
         xw = ggml_div(gc, xw, ggml_scale_bias(gc, ggml_sum_rows(gc, xw), 1.0f, 1e-20f));
@@ -1094,7 +1265,8 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias")),
                                 ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
-    *out = ggml_argsort_top_k(gc, sc, 16);
+    *out = fuse_router(im) ? ggml_dsv4_route(gc, rl, im.BL(il, "exp_probs_b.bias"), im.ly[(size_t) il].rbias, nullptr, 16, false, 1.0f)
+                           : ggml_argsort_top_k(gc, sc, 16);
     ggml_set_output(*out);
     ggml_build_forward_expand(gf, *out);
     return gf;
@@ -1130,6 +1302,7 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
                                 ggml_reshape_2d(gc, im.ly[(size_t) next_il].rbias, im.NE, 1));
     // the layers after next_il on the same state (speculative reads): their scores are stacked under next_il's so ONE
     // argsort gives all the rows and ONE readback fetches them ([16, 1 + ahead] I32)
+    bool stacked = false;   // rows of other layers under next_il's: their biases differ, so no fused route
     for (int a = 1; a <= ahead && aout; ++a) {
         const int il = next_il + a;
         if (il >= (int) im.ly.size()) break;
@@ -1139,8 +1312,11 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
                                     ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
         sc = ggml_concat(gc, sc, sa, 1);
         aout->push_back(nullptr);   // a row of *pout
+        stacked = true;
     }
-    *pout = ggml_argsort_top_k(gc, sc, 16);
+    *pout = fuse_router(im) && !stacked
+        ? ggml_dsv4_route(gc, rl, im.BL(next_il, "exp_probs_b.bias"), im.ly[(size_t) next_il].rbias, nullptr, 16, false, 1.0f)
+        : ggml_argsort_top_k(gc, sc, 16);
     ggml_set_output(*pout);
     ggml_build_forward_expand(gf, *pout);
     return gf;
@@ -1264,6 +1440,22 @@ bool Ds41Dense::set_columns(int nc) {
     const int64_t want = std::max<int64_t>(im.S, std::min<int64_t>(nc, im.NCmax));
     if (want == im.NC) return true;
     dsync_be(im.backend);
+    // STRATA_KEEP_DEC_GRAPHS=1: a prompt batch parks the decode-width world (its columns, allocators and every cached
+    // graph - ggml-cuda keeps their captured CUDA graphs by node address) and gets an empty one of its own; on the way
+    // back down the parked world returns as it was, so the next answer does not rebuild ~1,000 graphs, run each kernel
+    // by kernel once and re-capture it (round 90).  The same graphs on the same tensors: exact.
+    static const bool keep = env_on("STRATA_KEEP_DEC_GRAPHS", false);
+    if (keep && im.parked_dec.valid && want == im.parked_dec.NC) {
+        dsync();   // STRATA_DENSE_ASYNC: nothing may still run in the batch world freed here
+        im.swap_world(im.parked_dec);
+        im.free_world(im.parked_dec);
+        return true;
+    }
+    if (keep && !im.parked_dec.valid && im.NC == im.S && want > im.S) {
+        dsync();
+        im.swap_world(im.parked_dec);   // this Impl is left with an empty world: nothing below frees the parked one
+        im.parked_dec.valid = true;
+    }
     // every cached graph holds views of the old columns (their addresses are fixed at the first allocation), and the
     // allocators remember graphs by address - all of it goes, and is rebuilt lazily for the new tensors
     im.graphs.clear();
@@ -1281,6 +1473,7 @@ bool Ds41Dense::set_columns(int nc) {
         al->compute_bufs.clear();
         ++al->epoch;
     }
+    if (want == im.S) allo_reserve(im.allo_dec);   // the decode width (a prompt batch's graphs need no head room)
     if (im.gctx) ggml_free(im.gctx);
     ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
     im.gctx = ggml_init(gp);
@@ -1431,6 +1624,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.gctx = ggml_init(gp);
     im.allo_dec.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
+    allo_reserve(im.allo_dec);
     if (!alloc_cols(im, im.NC, err)) return false;
     // the host mirrors are sized for the largest batch once (pinned registrations must not move)
     im.host_fn.resize((size_t) (D * NCM));
@@ -1502,11 +1696,16 @@ void Ds41Dense::release_pass() {
 }
 
 // pass_cap (per ratio) of a pass of n tokens ending at pos0+n: the visible compressed rows it ranks over.
+// STRATA_PASS_CAP_MIN=N (default 0): never below N.  The attention / indexer graphs are cached per pass_cap, so each
+// doubling of the context builds, runs directly once and captures ~360 new graphs (round 93: ~0.5 ms/token in the
+// steady state); with a floor a chat stays on one set until the context passes N.  The extra rows are masked (as the
+// rows between nvis and pass_cap always are), so only the flash-attn work split changes: equal to rounding.
 static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t out[3]) {
+    static const int64_t cap_min = std::getenv("STRATA_PASS_CAP_MIN") ? std::atoll(std::getenv("STRATA_PASS_CAP_MIN")) : 0;
     out[0] = 0;
     for (int r = 1; r <= 2; ++r) {
         const int64_t nvis_last = (pos0 + n) / r;
-        out[r] = nvis_last == 0 ? 0 : std::min<int64_t>(next_pow2(std::max<int64_t>(nvis_last, im.CBS)), im.cmax[r]);
+        out[r] = nvis_last == 0 ? 0 : std::min<int64_t>(next_pow2(std::max<int64_t>(nvis_last, std::max<int64_t>(im.CBS, cap_min))), im.cmax[r]);
     }
 }
 
@@ -1514,12 +1713,27 @@ static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t 
 // no-op once done (eng_batch is null), so it is safe to call at every layer - but the caller gates it on L.eslot >= 0
 // so the layers BELOW the first Engram layer run while the disk is still reading.  The whole pass's rows (both Engram
 // slots, all n columns) go up in one shot, so the second Engram layer (14) is a plain read of the same tensor.
-static bool engram_ready(Ds41Dense::Impl & im) {
+// STRATA_ENGRAM_SPLIT=1 (default off): a layer waits for ITS slot's rows only (Ds41Engram::wait_table) - layer 1 no
+// longer waits for layer 14's half of a long prompt's reads, which go on under layers 1-13 (round 104's profile: a
+// 2.4 s idle gap before layer 1 of a 16K prompt).  The same rows, uploaded per slot: exact.
+static bool engram_ready(Ds41Dense::Impl & im, int slot = -1) {
     if (!im.eng_batch) return true;
+    static const bool split = std::getenv("STRATA_ENGRAM_SPLIT") && std::getenv("STRATA_ENGRAM_SPLIT")[0] == '1';
+    if (split && slot >= 0 && slot < 2 && (size_t) slot < im.eng_rows.size()) {
+        if (!im.eng_up[slot]) {
+            if (!im.engram.wait_table(im.eng_batch, slot, im.err)) { im.eng_batch.reset(); return false; }
+            dset(im.i_eng[slot], im.eng_rows[(size_t) slot].data(), 0, im.eng_rows[(size_t) slot].size() * 4);
+            im.eng_up[slot] = true;
+        }
+        bool all = true;
+        for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e) all &= im.eng_up[e];
+        if (!all) return true;   // the other slot's reads are still going
+    }
     if (!im.engram.wait(im.eng_batch, im.err)) { im.eng_batch.reset(); return false; }
     im.eng_batch.reset();
     for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
-        dset(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
+        if (!im.eng_up[e]) dset(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
+    im.eng_up[0] = im.eng_up[1] = false;
     return true;
 }
 
@@ -1637,6 +1851,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
                 dset(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
         } else {
             im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
+            im.eng_up[0] = im.eng_up[1] = false;
             if (!im.eng_batch) return false;
         }
     }
@@ -1756,7 +1971,7 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
 bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
     Impl & im = *p_;
     if (!upload_span(im, col0, n)) return false;
-    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;   // the Engram add feeds this layer's K/V
+    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im, (int) im.ly[(size_t) il].eslot)) return false;   // the Engram add feeds this layer's K/V
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     ggml_init_params pk = { im.pf_meta.size(), im.pf_meta.data(), true };
     ggml_context * gck = ggml_init(pk);
@@ -1789,7 +2004,7 @@ bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     if (!upload_span(im, col0, n)) return false;
     if (g_dprof_on && dprof_now() - tp > 50) std::fprintf(stderr, "dense prof: slow upload_span layer %d col0 %d n %d: %.0f ms\n", il, col0, n, dprof_now() - tp);
     lap(6);
-    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;   // wait the pass's Engram reads here
+    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im, (int) im.ly[(size_t) il].eslot)) return false;   // wait the pass's Engram reads here
     lap(3);
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
@@ -1883,7 +2098,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     im.shexp_pending = false;
     // Engram layer: wait the pass's reads (started in upload_inputs) before the graph that reads i_eng runs.  For the
     // chunk path this is the first Engram layer too, so the layers below it ran while the disk was reading.
-    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;
+    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im, (int) im.ly[(size_t) il].eslot)) return false;
     const int64_t r = im.ly[(size_t) il].ratio;
     const int64_t cap = r ? im.pass_cap[r] : 0;
     ggml_cgraph * gf = nullptr;
@@ -2075,7 +2290,7 @@ bool Ds41Dense::attn_router_launch(int il) {
     const int64_t n = im.n;
     if (n != 1 && !pass_graphs_on(n)) { im.err = "attn_router_launch: a multi-row pass needs STRATA_PASS_GRAPHS"; return false; }
     im.shexp_pending = false;
-    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;
+    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im, (int) im.ly[(size_t) il].eslot)) return false;
     const int64_t r = im.ly[(size_t) il].ratio;
     const int64_t cap = r ? im.pass_cap[r] : 0;
     if (n > 1)   // the same cached pass graph attn_router uses

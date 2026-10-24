@@ -14,11 +14,14 @@ These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 
 | | 192 GB RAM | 128 GB RAM |
 |---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on) | **36 tok/s** | **24 tok/s** |
+| Writing (6 chats, up to 1,500 tokens each, thinking on) | **36 tok/s** | **29 tok/s** |
 | Reading a 51k-token prompt | **408 tok/s** | **119 tok/s** |
 
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
 long prompts, but the output is the same.
+
+On the 192 GB PC, a new 5k-token prompt takes about 16 s and a 20k-token prompt about 34 s. In a chat, a follow-up
+message only reads what is new: usually under a second, at most a few seconds.
 
 ## Quality
 
@@ -31,6 +34,10 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 
 - Route bias prefers experts that are already on the GPU. It is roughly 20% faster.
 - For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`.
+- We also tested ISTA-DASLab's GSQ-RCO quants
+  ([DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF))
+  in this engine. IQ2_XS answered our test questions as well as the default Q2 build, and IQ2_XXS got fewer of the
+  knowledge questions right. Neither was faster here, so the default stays.
 
 ## What you need
 

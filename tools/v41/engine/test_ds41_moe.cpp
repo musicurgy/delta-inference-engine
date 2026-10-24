@@ -156,7 +156,7 @@ int main(int argc, char ** argv) {
     }
     // ---- prompt path: N tokens per layer through run_chunk (random picks over all experts: every class, mixed)
     for (int l : (nchunk > 0 ? layers : std::vector<int>{})) {
-        std::vector<float> X((size_t) nchunk * D), W((size_t) nchunk * K), OUT((size_t) nchunk * D);
+        std::vector<float> X((size_t) nchunk * D), W((size_t) nchunk * K), OUTV((size_t) nchunk * D);
         std::vector<int32_t> IDS((size_t) nchunk * K);
         for (auto & v : X) v = nd(rng) * 0.3f;
         for (int t = 0; t < nchunk; ++t)
@@ -167,11 +167,11 @@ int main(int argc, char ** argv) {
                 IDS[(size_t) t * K + k] = e;
                 W[(size_t) t * K + k] = 0.1f + 0.4f * (float) (rng() % 1000) / 1000.0f;
             }
-        if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
+        if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUTV.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
         int cf = 0, nan_rows = 0;
         double cw = 0;
         for (int t = 0; t < nchunk; ++t) {
-            std::vector<float> got(OUT.begin() + (size_t) t * D, OUT.begin() + (size_t) (t + 1) * D), want((size_t) D, 0.0f), one((size_t) D);
+            std::vector<float> got(OUTV.begin() + (size_t) t * D, OUTV.begin() + (size_t) (t + 1) * D), want((size_t) D, 0.0f), one((size_t) D);
             bool fin = true;
             for (float v : got) fin &= std::isfinite(v);
             nan_rows += !fin;

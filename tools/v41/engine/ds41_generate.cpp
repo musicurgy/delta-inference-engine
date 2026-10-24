@@ -369,10 +369,20 @@ int main(int argc, char ** argv) {
                         : _stricmp(pr, "abovenormal") == 0 ? ABOVE_NORMAL_PRIORITY_CLASS : 0;
         if (cls && SetPriorityClass(GetCurrentProcess(), cls)) std::fprintf(stderr, "ds41_generate: priority class %s\n", pr);
     }
+    // STRATA_TIMER_MS=N (Maya #358): the system timer at N ms while the engine runs.  Since Windows 10 2004 the
+    // resolution is per process, so another program's 1 ms does not reach us: a sleep_for / timed wait rounds up to the
+    // 15.6 ms default tick.  timeBeginPeriod lives in winmm, taken at run time (no import library to link).
+    if (const char * tm = std::getenv("STRATA_TIMER_MS")) {
+        const UINT ms = (UINT) std::max(1, std::atoi(tm));
+        using Tbp = UINT (WINAPI *)(UINT);
+        if (HMODULE wm = LoadLibraryA("winmm.dll"))
+            if (Tbp tbp = (Tbp) (void *) GetProcAddress(wm, "timeBeginPeriod"))
+                std::fprintf(stderr, "ds41_generate: timer %u ms (%s)\n", ms, tbp(ms) == 0 ? "ok" : "refused");
+    }
     // DS41_QOS=high: opt out of Windows power throttling (EcoQoS) for the whole process.  A windowless engine counts as
     // background work while the user is busy in another program, and on a hybrid CPU that can mean low-importance
     // scheduling (E-cores) whatever the priority class (round 53: one-shots at half speed - CPU pool, drafter and
-    // Engram all 2x slower - from the moment a browser was in use, at above-normal priority).
+    // Engram all 2x slower - from the moment Firefox was in use, at above-normal priority).
     if (const char * q = std::getenv("DS41_QOS"); q && _stricmp(q, "high") == 0) {
         PROCESS_POWER_THROTTLING_STATE st {};
         st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
@@ -648,6 +658,25 @@ int main(int argc, char ** argv) {
     constexpr int kFP = 4;
     std::vector<int> fp_ids(file_pred ? (size_t) kFP * (size_t) n_layer * 16 : 0, -1);
     long long fp_miss[kFP + 1] = {0}, fp_hit[kFP + 1][3] = {{0}}, fp_cand[kFP + 1][3] = {{0}};
+    // STRATA_PRED_LOG=F (measurement only): per layer of every decode step / verify pass, the routing the prefetch was
+    // given (16 ranked ids per pass row, predicted before the attention; -1 = no prediction that layer) next to the
+    // routing the layer then chose, each id with its tier at that moment (0 VRAM-resident, 1 RAM arena, 2 file).
+    // int16 records: 'R', layer, m, K, pos & 0x7fff, pos >> 15, pred[m*16], act[m*K], tier(pred), tier(act).  Appends;
+    // scored offline by bench/win3090/pred_score.py (per-layer precision, budgets, temporal / draft-row ensembles).
+    std::FILE * plog = std::getenv("STRATA_PRED_LOG") ? std::fopen(std::getenv("STRATA_PRED_LOG"), "ab") : nullptr;
+    std::vector<int16_t> pl_buf;
+    std::vector<int> pl_pred;    // the prediction handed to this layer's prefetch (pv_pred is reused by the spec reads)
+    bool pl_have = false;
+    auto plog_rec = [&](int l, int m, int pos, const int * pred, const int * act) {
+        auto tier_of = [&](int e) -> int16_t { return (int16_t) (e < 0 ? -1 : tier.resident(l, e) ? 0 : tier.in_arena(l, e) ? 1 : 2); };
+        pl_buf.assign({ (int16_t) 'R', (int16_t) l, (int16_t) m, (int16_t) top_k, (int16_t) (pos & 0x7fff), (int16_t) (pos >> 15) });
+        for (int i = 0; i < m * 16; ++i) pl_buf.push_back((int16_t) (pred ? pred[i] : -1));
+        for (int i = 0; i < m * top_k; ++i) pl_buf.push_back((int16_t) act[i]);
+        for (int i = 0; i < m * 16; ++i) pl_buf.push_back(pred ? tier_of(pred[i]) : (int16_t) -1);
+        for (int i = 0; i < m * top_k; ++i) pl_buf.push_back(tier_of(act[i]));
+        std::fwrite(pl_buf.data(), 2, pl_buf.size(), plog);
+        if (l == n_layer - 1) std::fflush(plog);
+    };
     // decode: the tier sums the routed experts on the card straight into the dense half's routed tensor (same bits as
     // the host sum; no parts readback / routed upload per layer).  STRATA_DEC_HOSTSUM=1 = the host round trip
     // the routed tensor's device address: re-read after every dense.set_columns (elastic columns reallocate it)
@@ -690,6 +719,7 @@ int main(int argc, char ** argv) {
                 if (pf_spin) strata::v41::ds41_cuda_event_spin(dense.predict_event());
                 if (!(pf_spin ? dense.predict_take(top16, 16) : dense.predict_wait(top16, 16))) { ferr = dense.last_error(); return false; }
                 tier.prefetch(l, top16, 16);   // its DMAs overlap the attention already on the card
+                pl_have = true;
                 pred_pending = false;
                 have_pred = false;
                 if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
@@ -699,9 +729,11 @@ int main(int argc, char ** argv) {
                 int t16[16];
                 if (have_pred) {                  // predicted by the previous layer's finish_predict (same state)
                     tier.prefetch(l, top16, 16);
+                    pl_have = true;
                 } else if (dense.predict(l, t16, 16)) {
                     for (int i = 0; i < 16; ++i) top16[i] = t16[i];
                     tier.prefetch(l, top16, 16);
+                    pl_have = true;
                 }
                 have_pred = false;
             }
@@ -709,6 +741,8 @@ int main(int argc, char ** argv) {
                 if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
                 if (!dense.attn_router(l, ids1.data(), w1.data(), &fn, &fn_t, true)) { ferr = dense.last_error(); return false; }
             }
+            if (plog) plog_rec(l, 1, pos, pl_have ? top16 : nullptr, ids1.data());
+            pl_have = false;
             if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
             if (file_pred) {
                 for (int j = 0; j < top_k; ++j) {
@@ -803,6 +837,7 @@ int main(int argc, char ** argv) {
     std::vector<float> vh, vlog, vx, vpre;
     std::vector<int> pv_pred, pv_rank;                 // D3 prefetch: per-token predictions, the ranked union
     std::vector<std::pair<int, int>> pv_score;
+    std::vector<std::pair<int, float>> pv_noq;         // STRATA_D3_PF_NOISYOR: (expert, prod over rows of 1 - p)
     double pv_ms[4] = {0, 0, 0, 0};   // pass_v split: dense (begin/attn_router/finish), tier, taps (read_state), logits
     long pv_n = 0, pv_tok = 0;
     auto pass_v = [&](const int * toks, int m, int pos) -> bool {
@@ -832,7 +867,49 @@ int main(int argc, char ** argv) {
         // host's ranking and the prefetch DMA overlap the attention instead of preceding it.  The same graphs and
         // predictions; only the DMA starts a little later.
         static const bool pf_async = std::getenv("STRATA_D3_PF_ASYNC") && std::getenv("STRATA_D3_PF_ASYNC")[0] == '1';
-        auto rank_union = [&]() {   // pv_pred (16 per pass token) -> pv_rank: the union, by summed 16 - rank
+        // STRATA_D3_PF_NOISYOR=1 (default off; rounds 111 / 114): rank the union by P(at least one pass row routes it) =
+        // 1 - prod over the rows of (1 - p(its rank in that row)), p = how often a row routes its rank-r prediction
+        // (round 111, the launcher's own log: 95 89 80 69 57 44 32 23 17 13 10 8 7 5 5 4 %), instead of the summed
+        // 16 - rank, which puts rank 5 in four rows (~44% each) ahead of rank 0 in one (95%).  Held out: prefetch
+        // precision 61% -> 77% at the same one slot.  STRATA_D3_PF_P=x: only candidates with P >= x go to the prefetch
+        // (then STRATA_D3_PF can be raised: P >= 0.8 x 2 slots = 82%).  STRATA_D3_PF_PTAB=F: per-layer p rows, 16 per
+        // line, '#' comments (bench/win3090/pred_noisyor.py --write-table) instead of the pooled ones.
+        static const bool pf_noisyor = std::getenv("STRATA_D3_PF_NOISYOR") && std::getenv("STRATA_D3_PF_NOISYOR")[0] == '1';
+        static const float pf_pmin = std::getenv("STRATA_D3_PF_P") ? (float) std::atof(std::getenv("STRATA_D3_PF_P")) : 0.0f;
+        static const std::vector<std::vector<float>> pf_ptab = [] {
+            std::vector<std::vector<float>> t;
+            const char * fn = std::getenv("STRATA_D3_PF_PTAB");
+            std::FILE * f = fn ? std::fopen(fn, "r") : nullptr;
+            if (fn && !f) std::fprintf(stderr, "STRATA_D3_PF_PTAB: cannot open %s - the pooled table\n", fn);
+            char line[1024];
+            while (f && std::fgets(line, sizeof(line), f)) {
+                if (line[0] == '#') continue;
+                std::vector<float> row;
+                char * s = line, * end = nullptr;
+                for (float v = std::strtof(s, &end); end != s && row.size() < 16; v = std::strtof(s = end, &end)) row.push_back(v);
+                if (row.size() == 16) t.push_back(row);
+            }
+            if (f) { std::fclose(f); std::fprintf(stderr, "STRATA_D3_PF_PTAB: %zu layer rows from %s\n", t.size(), fn); }
+            return t;
+        }();
+        auto rank_union = [&](int layer) {   // pv_pred (16 per pass token) -> pv_rank: the union, by summed 16 - rank
+            if (pf_noisyor) {
+                static const float pooled[16] = { 0.950f, 0.886f, 0.798f, 0.690f, 0.564f, 0.433f, 0.313f, 0.228f,
+                                                  0.170f, 0.132f, 0.102f, 0.083f, 0.066f, 0.053f, 0.046f, 0.038f };
+                const float * p = layer >= 0 && (size_t) layer < pf_ptab.size() ? pf_ptab[(size_t) layer].data() : pooled;
+                pv_noq.clear();
+                for (int t = 0; t < m; ++t)
+                    for (int i = 0; i < 16; ++i) {
+                        const int e = pv_pred[(size_t) t * 16 + i];
+                        if (e < 0) continue;
+                        auto it = std::find_if(pv_noq.begin(), pv_noq.end(), [&](const std::pair<int, float> & q) { return q.first == e; });
+                        if (it == pv_noq.end()) pv_noq.push_back({ e, 1.0f - p[i] }); else it->second *= 1.0f - p[i];
+                    }
+                std::stable_sort(pv_noq.begin(), pv_noq.end(), [](const std::pair<int, float> & a, const std::pair<int, float> & b) { return a.second < b.second; });
+                pv_rank.clear();
+                for (const auto & q : pv_noq) if (1.0f - q.second >= pf_pmin) pv_rank.push_back(q.first);
+                return;
+            }
             pv_score.clear();
             for (int t = 0; t < m; ++t)
                 for (int i = 0; i < 16; ++i) {
@@ -852,9 +929,10 @@ int main(int argc, char ** argv) {
             if (pf_now && !pf_async) {
                 pv_pred.resize((size_t) m * 16);
                 if (dense.predict_multi(l, pv_pred.data())) {
-                    rank_union();
+                    rank_union(l);
                     tier.prefetch_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_pf);
                     if (d3_l3warm > 0) tier.warm_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_l3warm);
+                    if (plog) { pl_pred = pv_pred; pl_have = true; }
                 }
             }
             // D3 speculative NVMe reads (STRATA_D3_SPEC=n, default 0 = off; STRATA_D3_SPEC_AHEAD=k, default 2): the
@@ -867,7 +945,7 @@ int main(int argc, char ** argv) {
             if (rdev1 && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + d3_spec_ahead < n_layer) {
                 pv_pred.resize((size_t) m * 16);
                 if (dense.predict_multi(l + d3_spec_ahead, pv_pred.data())) {
-                    rank_union();
+                    rank_union(l + d3_spec_ahead);
                     tier.spec_read(l + d3_spec_ahead, pv_rank.data(), std::min(d3_spec, (int) pv_rank.size()), true);
                 }
             }
@@ -877,8 +955,9 @@ int main(int argc, char ** argv) {
                 pv_pred.resize((size_t) m * 16);
                 const bool launched = dense.attn_router_launch(l);   // false: no cached pass graph - attn_router below
                 if (dense.predict_multi_wait(pv_pred.data())) {
-                    rank_union();
+                    rank_union(l);
                     tier.prefetch_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_pf);
+                    if (plog) { pl_pred = pv_pred; pl_have = true; }
                 }
                 if (launched) {
                     if (!dense.attn_router_collect(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
@@ -886,6 +965,8 @@ int main(int argc, char ** argv) {
                 }
             }
             if (!attn_done && !dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
+            if (plog) plog_rec(l, m, pos, pl_have ? pl_pred.data() : nullptr, mids.data());
+            pl_have = false;
             lap(0);
             if (rdev1 && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
@@ -1448,9 +1529,26 @@ int main(int argc, char ** argv) {
             }
             int reused = 0;
             bool regen = false;   // the snapshot's own prompt again: nothing new to feed
+            // STRATA_SERVE_ROLLBACK=K (default 0 = off): a prompt that continues all but the last <= K fed tokens of the
+            // live history resumes from the live state at the even position <= lcp, re-feeding the rest, instead of
+            // falling back to the prompt's snapshot.  The client re-tokenizes the model's own output: the forced answer
+            // after the thinking budget re-renders the thinking + "</think>", and its last 1-2 tokens come back merged
+            // differently (round 92: lcp 1168 of 1169 fed -> 1,005 tokens re-read in 9.4 s; at 32k thinking ~85 s).
+            // Safe as after a rejected DSpark draft: every cache is position-indexed, the window ring has 16 spare
+            // slots (<= 6 of them holding rejected-draft rows), and an even position starts a fresh ratio-2 compressor
+            // group.  K is capped at 8.  The resumed rows are the decode's own (decode routing), as on a plain resume.
+            static const size_t rollback_k = (size_t) std::min(8, std::max(0, std::getenv("STRATA_SERVE_ROLLBACK") ?
+                                                                              std::atoi(std::getenv("STRATA_SERVE_ROLLBACK")) : 0));
+            static const bool rewind1 = std::getenv("STRATA_SERVE_REWIND1") && std::getenv("STRATA_SERVE_REWIND1")[0] == '1';
             if (reuse_override >= 0) reused = reuse_override;   // a partial unpark: positions [0, lp) are the parked one's
             else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
-            else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
+            else if (!unparked && rollback_k > 0 && lcp < hist.size() && hist.size() - lcp <= rollback_k && lcp >= 2 &&
+                     lcp < ids.size() && (snap_len <= 0 || (lcp & ~(size_t) 1) >= (size_t) snap_len)) {
+                reused = (int) (lcp & ~(size_t) 1);
+                std::fprintf(stderr, "serve: rolled back %zu of %zu fed tokens (live resume at %d)\n", hist.size() - (size_t) reused,
+                             hist.size(), reused);
+                hist.resize((size_t) reused);
+            } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
                 reused = snap_len;
                 last_logits = snap_logits;
@@ -1458,6 +1556,17 @@ int main(int argc, char ** argv) {
             } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+            } else if (rewind1 && !unparked && snap_len > 1 && lcp + 1 == (size_t) snap_len && lcp < ids.size() && dense.restore()) {
+                // STRATA_SERVE_REWIND1=1 (upstream 0a8f28f, opt-in): the request matches the snapshot's prompt except its
+                // LAST token - DeepSeek's template, in thinking mode, re-renders the previous turn's "<think>" generation
+                // prompt as "</think>" once a new user message follows, so every new user message re-read the whole
+                // conversation.  Restore the snapshot and re-feed from that token: one token back is exact (the window
+                // ring keeps RAW = SWA + 16 positions and the ratio-2 compressor state the last 2; KV / compressed /
+                // indexer rows and Engram's history are positional and are overwritten).
+                hist.resize(lcp);
+                reused = (int) lcp;
+                std::fprintf(stderr, "serve: rewound the snapshot one token (%d -> %zu)\n", snap_len, lcp);
+                snap_len = -1;
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
                 const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
@@ -1836,6 +1945,15 @@ int main(int argc, char ** argv) {
                         while (kk < k && 1.0f / (1.0f + std::exp(-sp_conf[kk])) >= conf_tau_s) ++kk;
                         k = kk;
                     }
+                    // STRATA_DSPARK_CUM=<c> (Maya's MAYA_DS4_DSPARK_CUM): also stop once the PRODUCT of the confidences -
+                    // the chance that this draft and every one before it are kept - falls below c (the same tokens)
+                    static const float cum_s = std::getenv("STRATA_DSPARK_CUM") ? (float) std::atof(std::getenv("STRATA_DSPARK_CUM")) : 0.0f;
+                    if (cum_s > 0) {
+                        int kk = 0;
+                        float pr = 1.0f;
+                        while (kk < k && (pr *= 1.0f / (1.0f + std::exp(-sp_conf[kk]))) >= cum_s) ++kk;
+                        k = kk;
+                    }
                     const bool refeed = dirty && ((P + 1) & 1);
                     for (int i = 0; i < k; ++i) dr[i] = sp_ids[i];
                     bool is_lk = false;
@@ -2053,9 +2171,13 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "ds41_generate: --ppl-step: not with STRATA_DSPARK / STRATA_DUMP_MAIN\n");
         return 2;
     }
+    // STRATA_PROFILE_PREFILL=1: nsys --capture-range=cudaProfilerApi captures exactly the one-shot prompt's batch feed
+    static const bool prof_prefill = std::getenv("STRATA_PROFILE_PREFILL") != nullptr;
+    if (prof_prefill) Ds41MoeTier::profiler(true);
     const bool ok = feed(prompt.data(), (int) prompt.size() - dm_tail - sp_tail - ppl_tail, 0, [&](int done) {
         if (!a.quiet) std::fprintf(stderr, "\rprompt %d/%zu", done, prompt.size());
     }, a.ppl || !a.dump_logits.empty() ? &all : nullptr);
+    if (prof_prefill) Ds41MoeTier::profiler(false);
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
     if (dm_tail > 0 && defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
     for (int i = (int) prompt.size() - dm_tail; i < (int) prompt.size(); ++i)
@@ -2207,7 +2329,10 @@ int main(int argc, char ** argv) {
     tier.reset_stats();
     // STRATA_PROFILE_DECODE=1: nsys --capture-range=cudaProfilerApi captures exactly the decode
     static const bool prof_decode = std::getenv("STRATA_PROFILE_DECODE") != nullptr;
-    if (prof_decode) Ds41MoeTier::profiler(true);
+    // STRATA_PROFILE_FROM=K (DSpark decode): the capture starts at the K-th generated token instead, past the first
+    // passes' graph building, so the profile shows the steady state
+    static const int prof_from = std::getenv("STRATA_PROFILE_FROM") ? std::atoi(std::getenv("STRATA_PROFILE_FROM")) : 0;
+    if (prof_decode && prof_from <= 0) Ds41MoeTier::profiler(true);
     const double td0 = now_ms();
     std::vector<float> lg = last_logits;
     int pos = (int) prompt.size(), gen = 0;
@@ -2246,6 +2371,7 @@ int main(int argc, char ** argv) {
             std::printf("%d\n", tok);
             std::fflush(stdout);
             ++gen;
+            if (prof_decode && prof_from > 0 && gen == prof_from) Ds41MoeTier::profiler(true);
             return !(std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos || gen >= a.n_predict);
         };
         // STRATA_DSPARK_CONF=<tau>: verify only the leading drafts whose confidence-head probability (sigmoid of
@@ -2278,6 +2404,14 @@ int main(int argc, char ** argv) {
             } else if (conf_tau >= 0) {
                 int kk = 0;
                 while (kk < k && sig(sp_conf[kk]) >= conf_tau) ++kk;
+                k = kk;
+            }
+            // STRATA_DSPARK_CUM=<c>: as the serve loop - stop once the product of the confidences falls below c
+            static const float cum = std::getenv("STRATA_DSPARK_CUM") ? (float) std::atof(std::getenv("STRATA_DSPARK_CUM")) : 0.0f;
+            if (cum > 0) {
+                int kk = 0;
+                float pr = 1.0f;
+                while (kk < k && (pr *= sig(sp_conf[kk])) >= cum) ++kk;
                 k = kk;
             }
             const bool refeed = dirty && ((P + 1) & 1);
