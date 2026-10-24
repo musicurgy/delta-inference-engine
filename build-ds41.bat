@@ -32,8 +32,10 @@ rem the GPU's architecture from nvidia-smi (8.6 -> 86).  RTX 50 = 120a, not 120:
 rem block-scaled MMA, which exists only on the "a" target (ggml switches its own targets; Strata's copy of them does not)
 call "%ROOT%ds41-paths.bat"
 set "ARCH=native"
-for /f "tokens=1" %%c in ('nvidia-smi --query-gpu^=compute_cap --format^=csv^,noheader -i %DS41_GPU% 2^>nul') do set "CC=%%c"
-if defined CC set "ARCH=%CC:.=%"
+rem GPU_CC, never CC: CMake reads %CC% as the C compiler ("Could not find the compiler specified in ... CC: 8.6")
+for /f "tokens=1" %%c in ('nvidia-smi --query-gpu^=compute_cap --format^=csv^,noheader -i %DS41_GPU% 2^>nul') do set "GPU_CC=%%c"
+if defined GPU_CC set "ARCH=%GPU_CC:.=%"
+set "GPU_CC="
 if "%ARCH%"=="120" set "ARCH=120a"
 set "PORTABLE=OFF"
 set "OUT=build-ds41"
