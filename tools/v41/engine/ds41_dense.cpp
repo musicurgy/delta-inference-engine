@@ -23,6 +23,7 @@
 #include <set>
 #include <sstream>
 #include <thread>
+#include <tuple>
 
 #ifdef _WIN32
 #include <string.h>
@@ -330,6 +331,12 @@ struct Ds41Dense::Impl {
     int32_t * pred_host = nullptr;
     ggml_backend_event_t pred_ev = nullptr;
     int pred_n = 0;
+    // STRATA_ZC_PRED: the prediction graphs' ids land in pinned host memory written by a kernel (zc_pred_tensor):
+    // F32 [16, n] tensors at fixed addresses, one per (layer, width, which), kept across graph rebuilds
+    ggml_context * zc_ctx = nullptr;
+    ggml_backend_buffer_t zc_buf = nullptr;
+    size_t zc_off = 0;
+    std::map<std::tuple<int, int, int>, ggml_tensor *> zc_map;
     // STRATA_D3_PF_ASYNC: predict_multi_launch's readback (pinned, behind pm_ev); pm_rows rows pending, pm_rs ids apart
     ggml_backend_buffer_t pm_host_buf = nullptr;
     int32_t * pm_host = nullptr;
@@ -448,6 +455,8 @@ struct Ds41Dense::Impl {
         if (ictx) ggml_free(ictx);
         for (auto & kv : mgraphs) ggml_free(kv.second.ctx);
         if (gctx) ggml_free(gctx);
+        if (zc_buf) ggml_backend_buffer_free(zc_buf);
+        if (zc_ctx) ggml_free(zc_ctx);
         if (own_backend && backend) ggml_backend_free(backend);
     }
     ggml_tensor * W(const std::string & n) const { return w.get(n); }
@@ -746,6 +755,63 @@ static bool pass_graphs_on(int64_t n) {
 static bool fuse_router(const Ds41Dense::Impl & im) {
     static const bool on = env_on("STRATA_FUSE_ROUTER", false);
     return on && !im.cpu;
+}
+
+// STRATA_ZC_PRED=1 (default off; round 122): the prefetch predictions come back without the copy engine.  Round 121: a
+// prediction's small device-to-host readback queued behind a 10 MB prefetch DMA still crossing the bus (161 us per layer
+// under WDDM).  Here the graph ends in an I32 -> F32 ggml_cpy into pinned host memory - a different type, so ggml-cuda
+// runs it as a KERNEL writing over the bus (zero-copy), not as a copy-engine memcpy - and the host reads the floats after
+// a stream sync.  The host tensors (F32 [16, n], ids < 2^24 are exact) sit at fixed addresses per (layer, width, which):
+// cached CUDA graphs keep their pointers across rebuilds and world swaps.
+static bool zc_pred_on(const Ds41Dense::Impl & im) {
+    static const bool on = env_on("STRATA_ZC_PRED", false);
+    return on && !im.cpu;
+}
+static ggml_tensor * zc_pred_tensor(Ds41Dense::Impl & im, int il, int64_t n, int which) {
+#ifdef DS41_HAVE_CUDA
+    const auto key = std::make_tuple(il, (int) n, which);
+    auto it = im.zc_map.find(key);
+    if (it != im.zc_map.end()) return it->second;
+    constexpr size_t kBuf = (size_t) 8 << 20;
+    if (!im.zc_buf) {
+        ggml_init_params p = { ggml_tensor_overhead() * 8192, nullptr, true };
+        im.zc_ctx = ggml_init(p);
+        im.zc_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), kBuf);
+        if (!im.zc_buf) return nullptr;
+    }
+    ggml_tensor * t = ggml_new_tensor_2d(im.zc_ctx, GGML_TYPE_F32, 16, n);
+    const size_t sz = (ggml_nbytes(t) + 255) & ~(size_t) 255;
+    if (im.zc_off + sz > kBuf) return nullptr;
+    if (ggml_backend_tensor_alloc(im.zc_buf, t, (char *) ggml_backend_buffer_get_base(im.zc_buf) + im.zc_off) != GGML_STATUS_SUCCESS)
+        return nullptr;
+    im.zc_off += sz;
+    im.zc_map[key] = t;
+    return t;
+#else
+    (void) im; (void) il; (void) n; (void) which;
+    return nullptr;
+#endif
+}
+// the graph's ids (an I32 [16, n] view) into its zero-copy host tensor; the original when zero-copy is off / failed
+static ggml_tensor * zc_pred_out(Ds41Dense::Impl & im, ggml_context * gc, ggml_tensor * ids, int il, int64_t n, int which) {
+    if (!zc_pred_on(im)) return ids;
+    ggml_tensor * h = zc_pred_tensor(im, il, n, which);
+    return h ? ggml_cpy(gc, ids, h) : ids;
+}
+// rows of 16 ids from a prediction output: the zero-copy F32 host tensor, or the device I32 view (rows nb[1] apart)
+static void read_pred_rows(Ds41Dense::Impl & im, ggml_tensor * o, int64_t n, int * dst) {
+    if (o->type == GGML_TYPE_F32) {   // zero-copy: on the host already; wait for the kernel that writes it
+        dsync_be(im.backend);
+        const float * f = (const float *) o->data;
+        for (int64_t i = 0; i < 16 * n; ++i) dst[i] = (int) f[i];
+        return;
+    }
+    const size_t rs = o->nb[1] / sizeof(int32_t);
+    im.pred_span.resize(rs * (size_t) (n - 1) + 16);
+    dread(im, o, im.pred_span.data(), im.pred_span.size() * sizeof(int32_t));
+    for (int64_t t = 0; t < n; ++t)
+        std::copy(im.pred_span.begin() + (ptrdiff_t) (rs * (size_t) t), im.pred_span.begin() + (ptrdiff_t) (rs * (size_t) t + 16),
+                  dst + 16 * t);
 }
 
 template <class F>
@@ -1267,6 +1333,7 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
                                 ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
     *out = fuse_router(im) ? ggml_dsv4_route(gc, rl, im.BL(il, "exp_probs_b.bias"), im.ly[(size_t) il].rbias, nullptr, 16, false, 1.0f)
                            : ggml_argsort_top_k(gc, sc, 16);
+    *out = zc_pred_out(im, gc, *out, il, n, 0);   // STRATA_ZC_PRED: straight into pinned host memory
     ggml_set_output(*out);
     ggml_build_forward_expand(gf, *out);
     return gf;
@@ -1290,6 +1357,7 @@ static ggml_cgraph * build_predict2(Ds41Dense::Impl & im, ggml_context * gc, int
                                         ggml_reshape_2d(gc, im.ly[(size_t) l].rbias, im.NE, 1));
             o = ggml_argsort_top_k(gc, sc, 16);
         }
+        o = zc_pred_out(im, gc, o, il, n, 1 + j);   // STRATA_ZC_PRED
         ggml_set_output(o);
         ggml_build_forward_expand(gf, o);
         *(j == 0 ? out : out2) = o;
@@ -2176,8 +2244,8 @@ bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
         im.predict_out[il] = o;
     }
     if (!im.compute(it->second, true, false)) return false;
-    int32_t buf[16];
-    dread(im, im.predict_out[il], buf, sizeof(buf));
+    int buf[16];
+    read_pred_rows(im, im.predict_out[il], 1, buf);   // the device view, or STRATA_ZC_PRED's host floats
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
     return true;
 }
@@ -2197,15 +2265,10 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
     }
     o = im.predict_out_n[{ il, (int) n }];
     if (!im.compute(it->second, true, false)) return false;
-    // argsort_top_k is a VIEW of the full argsort: row t starts at t * nb[1] (NE ids apart).  One read of the span that
-    // covers every row's first 16, then each row's 16.  (Until 2026-10-21 this read 16 * n contiguous ids: rows 1.. were
-    // row 0's ranks 16.., which the top-k kernel never writes - stale ids, so the verify pass prefetched on row 0 alone.)
-    const size_t rs = o->nb[1] / sizeof(int32_t);
-    im.pred_span.resize(rs * (size_t) (n - 1) + 16);
-    dread(im, o, im.pred_span.data(), im.pred_span.size() * sizeof(int32_t));
-    for (int64_t t = 0; t < n; ++t)
-        std::copy(im.pred_span.begin() + (ptrdiff_t) (rs * (size_t) t), im.pred_span.begin() + (ptrdiff_t) (rs * (size_t) t + 16),
-                  top_ids + 16 * t);
+    // argsort_top_k is a VIEW of the full argsort: row t starts at t * nb[1] (NE ids apart) - read_pred_rows reads the
+    // span that covers every row's first 16.  (Until 2026-10-21 this read 16 * n contiguous ids: rows 1.. were row 0's
+    // ranks 16.., which the top-k kernel never writes - stale ids, so the verify pass prefetched on row 0 alone.)
+    read_pred_rows(im, o, n, top_ids);
     return true;
 }
 
@@ -2226,16 +2289,8 @@ bool Ds41Dense::predict_multi2(int il, int * top_ids, int * next_ids) {
         im.predict_out_n[k2] = o2;
     }
     if (!im.compute(it->second, true, false)) return false;
-    int * dst[2] = { top_ids, next_ids };
-    for (int j = 0; j < 2; ++j) {
-        ggml_tensor * o = im.predict_out_n[j == 0 ? k1 : k2];
-        const size_t rs = o->nb[1] / sizeof(int32_t);   // a VIEW of the full argsort (or contiguous [16, n]): see predict_multi
-        im.pred_span.resize(rs * (size_t) (n - 1) + 16);
-        dread(im, o, im.pred_span.data(), im.pred_span.size() * sizeof(int32_t));
-        for (int64_t t = 0; t < n; ++t)
-            std::copy(im.pred_span.begin() + (ptrdiff_t) (rs * (size_t) t), im.pred_span.begin() + (ptrdiff_t) (rs * (size_t) t + 16),
-                      dst[j] + 16 * t);
-    }
+    read_pred_rows(im, im.predict_out_n[k1], n, top_ids);
+    read_pred_rows(im, im.predict_out_n[k2], n, next_ids);
     return true;
 }
 

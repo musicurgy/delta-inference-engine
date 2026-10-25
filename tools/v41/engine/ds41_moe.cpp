@@ -4640,8 +4640,12 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         ck(cudaMalloc(&gp.c_xq, (size_t) n * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq");   // its ncols <= 8
         ck(cudaMalloc(&gp.c_parts, (size_t) ne * (size_t) H * 4), "c_parts");
         ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(ne, im.g.n_ff)), "c_scratch");
-        ck(cudaMalloc(&gp.c_dst, sizeof(int32_t) * (size_t) ne), "c_dst");
-        ck(cudaMalloc(&gp.c_tokv, sizeof(int32_t) * (size_t) ne), "c_tok");
+        // MMQ (moe_mmq.cu Context::run) reads up to J_best - 1 (<= 127) ids past a product's last one: a run ending at
+        // the buffer's end read past the allocation - "chunk sync: an illegal memory access" when it ended on a 2 MiB
+        // page (upstream f4f17c0).  Every buffer passed as MMQ ids gets this slack.
+        const int64_t ids_slack = 128;
+        ck(cudaMalloc(&gp.c_dst, sizeof(int32_t) * (size_t) (ne + ids_slack)), "c_dst");
+        ck(cudaMalloc(&gp.c_tokv, sizeof(int32_t) * (size_t) (ne + ids_slack)), "c_tok");
         ck(cudaMalloc(&gp.c_w, sizeof(float) * (size_t) ne), "c_w");
         ck(cudaMalloc(&gp.c_out, (size_t) n * (size_t) H * 4), "c_out");
     }
@@ -4735,8 +4739,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             ck(cudaMalloc(&gp.m_xu, mmq::q8_bytes(cap, H)), "m_xu");
             ck(cudaMalloc(&gp.m_xd, mmq::q8_bytes(cap, FF)), "m_xd");
             ck(cudaMalloc(&gp.m_bnd, sizeof(int32_t) * (size_t) (im.g.n_experts + 1)), "m_bnd");
-            ck(cudaMalloc(&gp.m_iota, sizeof(int32_t) * (size_t) cap), "m_iota");
-            mmq::iota((int32_t*) gp.m_iota, cap, gp.s);
+            ck(cudaMalloc(&gp.m_iota, sizeof(int32_t) * (size_t) (cap + 128)), "m_iota");   // + MMQ's id over-read (see c_dst)
+            mmq::iota((int32_t*) gp.m_iota, cap + 128, gp.s);
             ds41_heapcheck("chunk:mmq-bufs", n);
             if (!gp.m_ctx) gp.m_ctx = new mmq::Context();   // never deleted (see Gpu::m_ctx)
         }

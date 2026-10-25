@@ -1079,6 +1079,8 @@ int main(int argc, char ** argv) {
     // drafter loads here, before the VRAM expert cache measures the free memory, so the cache sizes around it.
     // --serve: STRATA_SERVE_DSPARK=<sidecar> (opt-in) - speculative SAMPLING (spec_accept), same output distribution
     const char * dsp_path = a.serve ? std::getenv("STRATA_SERVE_DSPARK") : std::getenv("STRATA_DSPARK");
+    // an empty value means off - the fork's launcher sets it empty when the drafter file is missing (upstream #53)
+    if (dsp_path && !*dsp_path) dsp_path = nullptr;
     if (a.serve && dsp_path && (!defer_vram || S < 17)) {
         std::fprintf(stderr, "serve: STRATA_SERVE_DSPARK needs the GPU layer-major prompt path - DSpark off\n");
         dsp_path = nullptr;
@@ -1098,9 +1100,18 @@ int main(int argc, char ** argv) {
             if (!std::getenv("STRATA_DSPARK_OWN_HEAD")) sc.shared_head = dense.weight("output.weight");   // -0.7 GB
             dsp = std::make_unique<Ds41DSpark>();
             const double ti = now_ms();
-            if (!dsp->init(sc, err)) { err = "DSpark init: " + err; return false; }
-            std::fprintf(stderr, "\nDSpark: %s, %.2f GB of weights on the card (%.1f s)", dsp_path, dsp->weight_bytes() / 1e9,
-                         (now_ms() - ti) / 1000.0);
+            if (!dsp->init(sc, err)) {
+                if (!a.serve) { err = "DSpark init: " + err; return false; }
+                // serve: a drafter that will not load must not fail every request (each one re-ran this and returned
+                // "ERR VRAM seed failed"): decode without drafts for the run (upstream #53)
+                std::fprintf(stderr, "serve: DSpark disabled (%s) - decoding without drafts\n", err.c_str());
+                dsp.reset();
+                dsp_path = nullptr;
+                err.clear();
+            } else {
+                std::fprintf(stderr, "\nDSpark: %s, %.2f GB of weights on the card (%.1f s)", dsp_path, dsp->weight_bytes() / 1e9,
+                             (now_ms() - ti) / 1000.0);
+            }
         }
 #endif
         size_t fr = 0, tot = 0;
@@ -1178,6 +1189,9 @@ int main(int argc, char ** argv) {
             if (PB > 1 && n - c0 >= 2) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
                 int B = std::min(pb_cap, n - c0);
+                // a DSpark batch seed is read off the final layer-major batch; a 1-token remainder would run on the
+                // chunk path and capture nothing (prompt = batch + 1: "DSpark batch seed captured nothing", upstream #53)
+                if (bcap_n > 0 && n - c0 - B == 1 && B > 2) --B;
                 // The batch must FIT: its state columns (~0.31 MiB a column) and its graph (~0.17 MiB a column,
                 // 8192 -> 1424 MiB) come out of whatever is left after everything else sharing the card (a
                 // desktop's STT server, DSpark's 2.9 GB, the dense half).  A batch that does not fit is retried at
@@ -1936,12 +1950,13 @@ int main(int argc, char ** argv) {
                         std::copy_n(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, (size_t) m * 3 * n_embd,
                                     cur_seed.data() + (size_t) cur_seed_n * 3 * n_embd);
                         cur_seed_n += m;
-                        if (!dsp->step(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
-                                       last ? sp_ids : sp_tmp, sp_conf)) {
+                        // dsp null: the drafter failed to load at this cache open (off for the run, see open_cache)
+                        if (dsp && !dsp->step(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
+                                              last ? sp_ids : sp_tmp, sp_conf)) {
                             ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
                         }
                     }
-                    if (bcap_got < 1) { ferr = "DSpark batch seed captured nothing"; ok = false; }
+                    if (dsp && bcap_got < 1) { ferr = "DSpark batch seed captured nothing"; ok = false; }
                 }
                 for (int i0 = total - sp_tail; ok && bcap == 0 && i0 < total; i0 += 16) {
                     const int m = std::min(16, total - i0);
@@ -1957,7 +1972,7 @@ int main(int argc, char ** argv) {
                     cur_seed.resize((size_t) (cur_seed_n + m) * 3 * n_embd);
                     std::copy_n(vh.data(), (size_t) m * 3 * n_embd, cur_seed.data() + (size_t) cur_seed_n * 3 * n_embd);
                     cur_seed_n += m;
-                    if (!dsp->step(vh.data(), spos.data(), m, last ? sp_t : -1, last ? sp_ids : sp_tmp, sp_conf)) {
+                    if (dsp && !dsp->step(vh.data(), spos.data(), m, last ? sp_t : -1, last ? sp_ids : sp_tmp, sp_conf)) {
                         ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
                     }
                 }
@@ -2067,6 +2082,7 @@ int main(int argc, char ** argv) {
             // ---- DSpark speculative sampling (as the one-shot loop: P = last fed position, t = the token for P+1,
             // sp_ids = drafts for P+2..; each verify row's distribution is sample_p's, spec_accept keeps it exact)
             long rq_pass = 0, rq_acc = 0;
+            if (!dsp) sp_t = -1;   // the drafter failed to load during this request: the plain decode below (from lg)
             if (sp_t >= 0) {
                 int P = total - 1, t = sp_t, prev = ids.back();
                 bool dirty = false;
