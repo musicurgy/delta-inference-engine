@@ -397,6 +397,35 @@ F.OutputParser.feed = _op_feed_ds41
 F.OutputParser.finish = _op_finish_ds41
 S.OutputParser = F.OutputParser
 
+# ---- tool_choice (forced calls, as upstream 34ac0f1): the server writes the call's opening itself and the model goes
+# on from it, so the opening must be DSML the way DeepSeek's encoder writes an assistant call - the frontend's is Qwen's
+# `<function=X>`, which this model would continue as plain text.  "required" stops after ` name="` (the model picks
+# the tool); a named tool is opened whole.  With thinking the server puts the blank line before it (after </think>);
+# without, the prompt ends with </think>, so prepare() adds it there.
+_forced_call = F.forced_call
+
+
+def ds41_forced_call(tool_choice, tools):
+    qwen = _forced_call(tool_choice, tools)   # the same decisions, and the same log line for a choice it cannot honour
+    if qwen is None:
+        return None
+    m = re.search(r"<function=([^>\n]+)>", qwen)
+    head = CALLS_OPEN + "\n" + INVOKE_OPEN + ' name="'
+    return head + m.group(1) + '">\n' if m else head
+
+
+S.forced_call = ds41_forced_call
+_svc_prepare = S.Service.prepare
+
+
+def _prepare_ds41(self, messages, tools, kwargs, max_new=None, force=None, **kw):
+    if force and kwargs.get("enable_thinking", True) is False:
+        force = "\n\n" + force
+    return _svc_prepare(self, messages, tools, kwargs, max_new, force=force, **kw)
+
+
+S.Service.prepare = _prepare_ds41
+
 # ---- full text log (llama.cpp-style): every request's thinking / answer / tool calls as they are generated, so a run
 # can be watched (`tail -f`) and checked afterwards (loops, what it was thinking).  STRATA_TEXT_LOG=<path> (default
 # /tmp/strata-ds41-text.log), STRATA_TEXT_LOG=0 = off.

@@ -14,10 +14,10 @@ These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 
 | | 192 GB RAM | 128 GB RAM |
 |---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on) | **38 tok/s** | **29 tok/s** |
+| Writing (6 chats, up to 1,500 tokens each, thinking on) | **42 tok/s** | **29 tok/s** * |
 | Reading a long prompt (51-64k tokens) | **610 tok/s** | **119 tok/s** * |
 
-\* Measured with the previous version (the 192 GB figure was 408 tok/s then).
+\* Measured with an earlier version (the 192 GB figures were 36 and 408 tok/s then).
 
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
 long prompts, but the output is the same.
@@ -30,9 +30,12 @@ maths and code (~46 and ~38 tok/s) and ~33 tok/s on plain prose.
 - **Conversation cache:** the server keeps up to 8 conversations in memory (about 20 MB per 10k tokens). An agent that
   switches between conversations, or makes a side request between turns, resumes each one in a second or two instead
   of reading its whole prompt again (measured: 16-18 s per switch before, 1-3 s now).
-- **Follow-up messages** only read what is new. In thinking mode, the next turn no longer re-reads the history.
-- **Tool calls** (OpenAI `tools`) and **JSON output** (`response_format` `json_object` / `json_schema`) work through
-  the OpenAI-compatible API. Requests sent at the same time are answered one after another.
+- **Follow-up messages** only read what is new. In thinking mode, the next turn no longer re-reads the history. A
+  follow-up of a few hundred to 2,000 new tokens (a tool result, a pasted file) keeps most of the GPU's expert cache
+  instead of emptying and refilling it, which saves 0.6-0.9 s per turn.
+- **Tool calls** (OpenAI `tools`, including a forced `tool_choice`: `"required"` or a named function) and **JSON
+  output** (`response_format` `json_object` / `json_schema`) work through the OpenAI-compatible API. Requests sent at
+  the same time are answered one after another.
 
 ## Quality
 
@@ -41,9 +44,11 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 | | General | Code + maths |
 |---|---|---|
 | Exact routing | 91.4% | 92.1% |
-| Route bias 0.3 (the default) | 89.5% | 92.4% |
+| Route bias 0.3 (the default) | 89.8% | 92.9% |
 
-- Route bias prefers experts that are already on the GPU. It is roughly 20% faster.
+- Route bias prefers experts that are already on the GPU. It is roughly 20% faster. It follows the GPU's experts as
+  they change during an answer (`STRATA_BIAS_REFRESH=1` in the launcher), which made it both faster and closer to
+  DeepSeek's own model (it was 89.3% / 92.7% with the bias fixed at the start of each answer).
 - For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`.
 - We also tested ISTA-DASLab's GSQ-RCO quants
   ([DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF))

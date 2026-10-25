@@ -595,7 +595,10 @@ int main(int argc, char ** argv) {
     // applies, unless --bias-prompt measures them (the prompt's file tier is prefetched; a penalty there buys nothing)
     bool bias_now = a.bias_prompt > 0 || !defer_vram;
     bool bias_set = false;   // a nonzero bias is in the dense half now (--serve turns it off again for the next prompt)
-    auto apply_bias = [&]() {
+    std::vector<std::vector<float>> rb_up((size_t) TG.n_layers);   // the bias each layer has on the card (changed_only)
+    // changed_only (STRATA_BIAS_REFRESH): upload just the layers whose bias differs from what the card has - between two
+    // verify passes only a few experts change residency, and every set_route_bias is a synchronous upload
+    auto apply_bias = [&](bool changed_only = false) {
         const bool want = n_pruned > 0 || (bias_now && (a.route_bias != 0.0f || a.route_bias_file != 0.0f));
         if (!want && !bias_set) return;
         bias_set = want;
@@ -605,7 +608,9 @@ int main(int argc, char ** argv) {
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
                                : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
                                : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+            if (changed_only && rb_up[(size_t) l] == rb) continue;
             dense.set_route_bias((int) l, rb.data());
+            rb_up[(size_t) l] = rb;
         }
     };
     apply_bias();   // the prune part now (the prompt routes with it); route_bias again once the VRAM cache is seeded
@@ -2171,6 +2176,13 @@ int main(int argc, char ** argv) {
                     vt.push_back(t);
                     for (int i = 0; i < k; ++i) vt.push_back(dr[i]);
                     const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
+                    // STRATA_BIAS_REFRESH=N (default 0 = off; upstream 078896c, on there by default): the route bias /
+                    // file penalty rebuilt from the VRAM set as it is NOW every N verify passes.  The set keeps changing
+                    // during a decode (vram_lru admissions, arena rebalancing), so the request-start snapshot favours
+                    // evicted experts and penalises admitted ones.  Upstream (Q8, Linux): 17-19.5 -> 21-22 tok/s, API
+                    // top-1 85.1 -> 86.7%.  Changes outputs, as any residency change does.
+                    static const int bias_refresh = std::getenv("STRATA_BIAS_REFRESH") ? std::max(0, std::atoi(std::getenv("STRATA_BIAS_REFRESH"))) : 0;
+                    if (bias_refresh > 0 && bias_now && bias_set && rq_pass > 0 && rq_pass % bias_refresh == 0) apply_bias(true);
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
                     int acc = 0, tn = -1;
                     for (; acc < k; ++acc) {
@@ -2216,6 +2228,9 @@ int main(int argc, char ** argv) {
                 ++gen;
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
+                // STRATA_BIAS_REFRESH without a drafter: every N single steps (the verify loop above counts passes)
+                static const int step_refresh = std::getenv("STRATA_BIAS_REFRESH") ? std::max(0, std::atoi(std::getenv("STRATA_BIAS_REFRESH"))) : 0;
+                if (step_refresh > 0 && bias_now && bias_set && gen % step_refresh == 0) apply_bias(true);
                 if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok);
                 ++pos;
@@ -2291,6 +2306,13 @@ int main(int argc, char ** argv) {
         double nll = 0;
         long ntok = 0;
         const double ts0 = now_ms();
+        // STRATA_BIAS_REFRESH=N here: the route bias rebuilt from the live VRAM set every N decode steps - the scored
+        // path is the decode the serve refresh applies to, so the quality gate measures what decoding gets
+        static const int score_refresh = std::getenv("STRATA_BIAS_REFRESH") ? std::max(0, std::atoi(std::getenv("STRATA_BIAS_REFRESH"))) : 0;
+        long score_steps = 0;
+        auto refresh_bias = [&]() {
+            if (score_refresh > 0 && bias_now && bias_set && ++score_steps % score_refresh == 0) apply_bias(true);
+        };
         while (std::getline(cf, line)) {
             const size_t tab = line.find('\t');
             if (tab == std::string::npos) continue;
@@ -2300,6 +2322,7 @@ int main(int argc, char ** argv) {
             if ((int64_t) (pr.size() + tg.size()) + 1 >= ctx) { std::fprintf(stderr, "case %d exceeds the context\n", ci); ++ci; continue; }
             int pos = 0;
             for (int t : pr) {   // the prompt, token by token (its last step's logits predict the first continuation token)
+                refresh_bias();
                 if (!step(t, pos++)) { std::fprintf(stderr, "case %d: %s\n", ci, ferr.c_str()); return 1; }
             }
             for (size_t i = 0; i < tg.size(); ++i) {
@@ -2317,6 +2340,7 @@ int main(int argc, char ** argv) {
                 of << ci << '\t' << i << '\t' << tok << '\t' << lp << '\t' << idx[0] << '\t' << ((double) lg[(size_t) idx[0]] - lse) << '\t';
                 for (int k = 0; k < 20; ++k) of << (k ? "," : "") << idx[(size_t) k] << ':' << ((double) lg[(size_t) idx[(size_t) k]] - lse);
                 of << '\n';
+                if (i + 1 < tg.size()) refresh_bias();
                 if (i + 1 < tg.size() && !step(tok, pos++)) { std::fprintf(stderr, "case %d: %s\n", ci, ferr.c_str()); return 1; }
             }
             ++ci;

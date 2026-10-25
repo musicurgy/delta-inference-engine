@@ -809,6 +809,7 @@ struct Ds41MoeImpl {
 };
 
 void rebal_count(Ds41MoeImpl& im, int64_t layer, const int32_t* ids, int64_t n);   // defined with rebalance_*
+std::vector<std::pair<int32_t, int32_t>> rebal_ranked(const Ds41MoeImpl& im);       // defined with rebalance_*
 
 
 // ---- the one place a blob's address is decided: the arena first, the blob source second ----------------
@@ -1864,25 +1865,38 @@ std::vector<std::pair<int32_t, int32_t>> drop_excluded(const Ds41MoeImpl& im, co
 /// `want` slots go to the experts released with a slot, most recently used first - those are the ones this
 /// conversation routes to.  The rest, and everything when there is nothing warm, come from the global rank.
 /// Consumes `im.warm` (a release always writes a fresh list).
+/// STRATA_VRAM_CONV=N (per mille, upstream 35f0f36; 0 = off) goes before both: the first N per mille of the slots
+/// go to the experts this conversation routes most (rebal_ranked: the new prompt's routing included), so the decode
+/// after a batch turn starts from the conversation's hot set rather than the calibration set's.
 std::vector<std::pair<int32_t, int32_t>> warm_first(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t want) {
-    if (im.warm.empty() || want <= 0) return ranked;
+    static const int64_t conv = std::getenv("STRATA_VRAM_CONV") ? std::max(0, std::min(1000, std::atoi(std::getenv("STRATA_VRAM_CONV")))) : 0;
+    const std::vector<std::pair<int32_t, int32_t>> cv = conv > 0 && want > 0 ? rebal_ranked(im) : std::vector<std::pair<int32_t, int32_t>>();
+    if ((im.warm.empty() && cv.empty()) || want <= 0) { im.warm.clear(); return ranked; }
     const char* ws = std::getenv("STRATA_WARM_SHARE");
     const int64_t share = ws ? std::max(0, std::min(1000, std::atoi(ws))) : 500;
-    if (share <= 0) { im.warm.clear(); return ranked; }
-    const int64_t take = std::max<int64_t>(1, (want * share) / 1000);
+    if (share <= 0 && cv.empty()) { im.warm.clear(); return ranked; }
     std::vector<char> seen((size_t) (im.g.n_layers * im.g.n_experts), 0);
     std::vector<std::pair<int32_t, int32_t>> out;
-    out.reserve(ranked.size() + im.warm.size());
-    int64_t n = 0;
-    for (const auto& le : im.warm) {
-        if (n >= take) break;
-        if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
-        char& sn = seen[(size_t) (le.first * im.g.n_experts + le.second)];
-        if (sn) continue;
-        sn = 1;
-        out.push_back(le);
-        ++n;
+    out.reserve(ranked.size() + im.warm.size() + cv.size());
+    auto take_from = [&](const std::vector<std::pair<int32_t, int32_t>>& src, int64_t take) {
+        int64_t n = 0;
+        for (const auto& le : src) {
+            if (n >= take) break;
+            if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
+            char& sn = seen[(size_t) (le.first * im.g.n_experts + le.second)];
+            if (sn) continue;
+            sn = 1;
+            out.push_back(le);
+            ++n;
+        }
+        return n;
+    };
+    if (!cv.empty()) {
+        const int64_t n = take_from(cv, std::max<int64_t>(1, (want * conv) / 1000));
+        std::fprintf(stderr, "vram seed: %lld of %lld slots from the conversation's routing (%zu experts routed)\n",
+                     (long long) n, (long long) want, cv.size());
     }
+    if (share > 0 && !im.warm.empty()) take_from(im.warm, std::max<int64_t>(1, (want * share) / 1000));
     im.warm.clear();
     for (const auto& le : ranked) {
         if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
@@ -5517,7 +5531,13 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     // every refusal says why (s6: the first A/B never kept the cache and logged nothing)
     if (!im_->gpu || !im_->gpu->cache) { err = "no VRAM cache"; return -1; }
     if (!im_->gpu->cache->segmented()) { err = "the cache is not segmented"; return -1; }
-    if (im_->cfg.vram_lru) { err = "--vram-lru"; return -1; }
+    // STRATA_SERVE_KEEP_LRU=1 (upstream 1f656a5's idea): keep the cache with --vram-lru too.  The LRU moves experts
+    // between slots, so the tail is not the coldest set - but the batch path never admits (gpu_run_chunk), the tail
+    // is restored slot for slot (regrow_cache), and an expert re-admitted meanwhile leaves its old slot empty
+    // (admit_at).  An evicted expert without an arena copy (an LRU demotion) is read from the file for the batch and
+    // the regrow; batches read ~50-100 file-tier experts, so few are.
+    static const bool keep_lru = std::getenv("STRATA_SERVE_KEEP_LRU") && std::getenv("STRATA_SERVE_KEEP_LRU")[0] == '1';
+    if (im_->cfg.vram_lru && !keep_lru) { err = "--vram-lru (STRATA_SERVE_KEEP_LRU=1 allows it)"; return -1; }
     if (!im_->shrunk.empty()) { err = "still shrunk from the last batch (regrow_cache did not run)"; return -1; }
     strata::core::ExpertCache& c = *im_->gpu->cache;
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "shrink_cache_for: device failed"; return -1; }
@@ -5574,17 +5594,39 @@ int64_t Ds41MoeTier::regrow_cache(std::string& err) {
         }
         ++added;
     }
-    uint8_t* buf = nullptr;
-    if (!fjobs.empty() && cudaMallocHost((void**) &buf, (size_t) im_->blob) != cudaSuccess) {
-        err = "regrow_cache: pinned buffer"; im_->shrunk.clear(); return -1;
+    // the file-tier part read by up to 8 threads (upstream 1f656a5: one blob at a time was 1.3 s for 57 experts), each
+    // with its own pinned buffer; the fills are serialised (the cache's counters), the reads overlap - as the seed does
+    {
+        std::atomic<size_t> nx{0};
+        std::atomic<bool> bad{false};
+        std::mutex mu;
+        std::string terr;
+        std::vector<std::thread> th;
+        const int nth = (int) std::min<size_t>(8, fjobs.size());
+        for (int k = 0; k < nth; ++k)
+            th.emplace_back([&]() {
+                uint8_t* buf = nullptr;
+                if (cudaMallocHost((void**) &buf, (size_t) im_->blob) != cudaSuccess) {
+                    std::lock_guard<std::mutex> lk(mu);
+                    terr = "regrow_cache: pinned buffer";
+                    bad = true;
+                    return;
+                }
+                for (size_t q; !bad && (q = nx.fetch_add(1)) < fjobs.size();) {
+                    const auto& j = fjobs[q];
+                    im_->blobs->read(j[1], j[2], buf);
+                    std::lock_guard<std::mutex> lk(mu);
+                    std::string e;
+                    if (!c.fill_slot_blocking((int32_t) j[0], buf, e, im_->bl[(size_t) im_->g.cls(j[1], j[2])])) {
+                        terr = e;
+                        bad = true;
+                    }
+                }
+                cudaFreeHost(buf);
+            });
+        for (auto& t : th) t.join();
+        if (bad) { err = terr; im_->shrunk.clear(); return -1; }
     }
-    for (const auto& j : fjobs) {   // few: the evicted tail is mostly arena-resident (arena_skip_resident aside)
-        im_->blobs->read(j[1], j[2], buf);
-        if (!c.fill_slot_blocking((int32_t) j[0], buf, err, im_->bl[(size_t) im_->g.cls(j[1], j[2])])) {
-            cudaFreeHost(buf); im_->shrunk.clear(); return -1;
-        }
-    }
-    if (buf) cudaFreeHost(buf);
     if (cudaStreamSynchronize((cudaStream_t) 0) != cudaSuccess) { err = "regrow_cache: queued fills failed"; im_->shrunk.clear(); return -1; }
     static const bool check = std::getenv("DS41_CHECK_ARENA") != nullptr;
     if (check) {   // every refilled slot against the file, byte for byte
@@ -5798,6 +5840,22 @@ void rebal_count(Ds41MoeImpl& im, int64_t layer, const int32_t* ids, int64_t n) 
     float* sc = im.rebal->score.data() + (size_t) (layer * NX);
     for (int64_t i = 0; i < n; ++i)
         if (ids[i] >= 0 && ids[i] < NX) sc[ids[i]] += 1.0f;
+}
+
+/// the experts this conversation routes to (the decayed prompt + decode counts above, >= 1 routed token), most-used
+/// first; empty without the rebalance
+std::vector<std::pair<int32_t, int32_t>> rebal_ranked(const Ds41MoeImpl& im) {
+    std::vector<std::pair<int32_t, int32_t>> out;
+    if (!im.rebal) return out;
+    const std::vector<float>& sc = im.rebal->score;
+    const int64_t NX = im.g.n_experts;
+    std::vector<int64_t> idx;
+    for (int64_t i = 0; i < (int64_t) sc.size(); ++i)
+        if (sc[(size_t) i] >= 1.0f && im.g.routed(i / NX)) idx.push_back(i);
+    std::stable_sort(idx.begin(), idx.end(), [&](int64_t a, int64_t b) { return sc[(size_t) a] > sc[(size_t) b]; });
+    out.reserve(idx.size());
+    for (int64_t i : idx) out.emplace_back((int32_t) (i / NX), (int32_t) (i % NX));
+    return out;
 }
 
 #if defined(DS4_MOE_CUDA)

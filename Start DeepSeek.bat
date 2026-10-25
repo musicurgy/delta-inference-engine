@@ -59,6 +59,10 @@ rem   conversation cache 8 - up to 8 whole conversations kept in RAM (~20 MB per
 rem            conversations resumes each in 1-3 s instead of re-reading its prompt (16-18 s at ~8K tokens)
 rem   snapshot stack 4 - in thinking mode, the next turn (which drops the old thinking) resumes an earlier snapshot
 rem            instead of re-reading the whole history (a 4.7K-token turn 13 s -> 7 s)
+rem   bias refresh 1 - the route bias follows the experts in VRAM as the cache changes during an answer (it was fixed at
+rem            the answer's start): 40% fewer expert misses, ~12% faster writing, and closer to DeepSeek's own model
+rem   keep cache - a follow-up of up to 2048 new tokens borrows only part of the GPU's expert cache and gets exactly
+rem            those experts back after, instead of emptying and refilling it: such turns 0.6-0.9 s faster
 set STRATA_SERVE_ROLLBACK=8
 set STRATA_SERVE_BATCH_MIN=256
 set STRATA_PASS_CAP_MIN=4096
@@ -70,6 +74,10 @@ set STRATA_SERVE_REWIND1=1
 set STRATA_D3_PF_NOISYOR=1
 set STRATA_SERVE_CACHE_SLOTS=8
 set STRATA_SERVE_SNAP_STACK=4
+set STRATA_BIAS_REFRESH=1
+set STRATA_SERVE_KEEP_CACHE=1
+set STRATA_SERVE_KEEP_LRU=1
+set STRATA_SERVE_KEEP_MAX=2048
 rem this PC's copy of the config: paths filled in, the RAM arena sized (tools\v41\serve\local\, not in git)
 ".venv\Scripts\python.exe" tools\v41\serve\ds41_local.py tools\v41\serve\ds41-windows.json tools\v41\serve\local\ds41-windows.json
 if errorlevel 1 (
