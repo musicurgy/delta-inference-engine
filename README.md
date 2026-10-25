@@ -23,13 +23,15 @@ With less RAM, more of the model's experts are read from the SSD as they are nee
 long prompts, but the output is the same.
 
 On the 192 GB PC, a new 6k-token prompt takes about 15 s and a 25k-token prompt about 41 s. Writing is fastest on
-maths and code (~46 and ~38 tok/s) and ~33 tok/s on plain prose.
+maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the prompt and the thinking, a client sees
+~39 tok/s.
 
 ## Agents, chats and tools
 
 - **Conversation cache:** the server keeps up to 8 conversations in memory (about 20 MB per 10k tokens). An agent that
   switches between conversations, or makes a side request between turns, resumes each one in a second or two instead
-  of reading its whole prompt again (measured: 16-18 s per switch before, 1-3 s now).
+  of reading its whole prompt again (measured: 16-18 s per switch before, 1-3 s now; a 9-turn session alternating two
+  ~8k-token conversations: 95 s before, 49 s now).
 - **Follow-up messages** only read what is new. In thinking mode, the next turn no longer re-reads the history. A
   follow-up of a few hundred to 2,000 new tokens (a tool result, a pasted file) keeps most of the GPU's expert cache
   instead of emptying and refilling it, which saves 0.6-0.9 s per turn.
@@ -44,11 +46,12 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 | | General | Code + maths |
 |---|---|---|
 | Exact routing | 91.4% | 92.1% |
-| Route bias 0.3 (the default) | 89.8% | 92.9% |
+| Route bias 0.28 (the default) | 90.2% | 92.4% |
 
 - Route bias prefers experts that are already on the GPU. It is roughly 20% faster. It follows the GPU's experts as
   they change during an answer (`STRATA_BIAS_REFRESH=1` in the launcher), which made it both faster and closer to
-  DeepSeek's own model (it was 89.3% / 92.7% with the bias fixed at the start of each answer).
+  DeepSeek's own model (at 0.3: 89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with
+  the refresh).  The test moves by about 0.2 points between identical runs.
 - For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`.
 - We also tested ISTA-DASLab's GSQ-RCO quants
   ([DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF))

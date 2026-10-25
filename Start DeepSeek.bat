@@ -4,7 +4,7 @@ rem The settings below are the measured best on an RTX 3090 (README.md, "Setting
 rem   exact:   DSpark speculative decoding (IQ2_XXS drafter), cached verify graphs, shared-expert split, copy stream,
 rem            Q8_0 prediction router, Engram hot set (if present), the five scheduling switches, VRAM margin 0.6
 rem   lossy, measured: Q6_K dense (re-quantized at load from Q8_0: +2.5-8% speed, top-1 agreement within noise) and
-rem            route bias 0.3 (prefers experts already on the GPU: roughly +20% speed for ~2 points of top-1 agreement
+rem            route bias 0.28 (prefers experts already on the GPU: roughly +20% speed for ~1 point of top-1 agreement
 rem            with DeepSeek's own API on general text, none on code/maths).  For exact routing set "--route-bias" and "--route-bias-file" to 0
 rem            in tools\v41\serve\ds41-windows.json.
 cd /d "%~dp0"

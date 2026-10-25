@@ -16,7 +16,7 @@
     "--arena-adapt",
     "--kv-fp4",
     "--route-bias",
-    "0.3",
+    "0.28",
     "--route-bias-file",
     "0.3",
     "--arena-gib",
