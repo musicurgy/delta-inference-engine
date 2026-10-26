@@ -35,15 +35,14 @@ These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 | | 192 GB RAM | 128 GB RAM |
 |---|---|---|
 | Writing (6 chats, up to 1,500 tokens each, thinking on) | **41 tok/s** | **33 tok/s** |
-| Reading a long prompt (51-64k tokens) | **610 tok/s** | **119 tok/s** * |
+| Reading a long prompt (25-64k tokens) | **610 tok/s** | **410 tok/s** |
 
-The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  \* Measured with an earlier version (the
-192 GB figure was 408 tok/s then).
+The 128 GB column is the same PC with the expert memory a 128 GB PC gets.
 
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
 long prompts, but the output is the same.
 
-On the 192 GB PC, a new 6k-token prompt takes about 15 s and a 25k-token prompt about 41 s. Writing is fastest on
+On the 192 GB PC, a new 6k-token prompt takes about 18 s and a 25k-token prompt about 42 s. Writing is fastest on
 maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the prompt and the thinking, a client sees
 ~39 tok/s.
 
