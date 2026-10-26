@@ -4,6 +4,11 @@ rem   build-ds41.bat             for THIS PC: its CPU's instruction set and its 
 rem   build-ds41.bat portable    for OTHER PCs: any x86-64 CPU with AVX2 (Intel 2013+ Haswell, every AMD Ryzen; the
 rem                              AVX-512 / AVX-VNNI kernels are picked at run time), RTX 30 / 40 / 50 (sm_86;89;120),
 rem                              static MSVC runtime                                              -> build-ds41-portable\
+rem   build-ds41.bat compat      for OLDER CPUs without AVX2 (e.g. Sandy / Ivy Bridge and Westmere Xeons): any x86-64
+rem                              CPU with SSE4.2 (the AVX kernels are picked at run time where the CPU has AVX), slower
+rem                              on the CPU side; RTX 30 / 40 / 50, static MSVC runtime            -> build-ds41-compat\
+rem   On a PC without AVX2 the plain build-ds41.bat builds for that CPU by itself.  Each build folder gets cpu-level.txt
+rem   (the CPU level it needs); the launcher picks a build this CPU can run (tools\v41\serve\cpu_level.py).
 rem Needs: Visual Studio 2019 or 2022 with "Desktop development with C++", the CUDA Toolkit (13.0 tested; it sets
 rem CUDA_PATH), Git, and .venv (README.md, step 2: it brings cmake and ninja).  Re-run to rebuild only what changed.
 setlocal
@@ -44,17 +49,35 @@ set "GPU_CC="
 if "%ARCH%"=="120" set "ARCH=120a"
 set "PORTABLE=OFF"
 set "OUT=build-ds41"
+rem this CPU's level (avx512 / avx2 / avx / sse); without AVX2 this PC's own build is an older-CPU build (STRATA_ISA_FLOOR)
+set "LEVEL="
+for /f "usebackq tokens=*" %%l in (`""%ROOT%.venv\Scripts\python.exe" "%ROOT%tools\v41\serve\cpu_level.py""`) do set "LEVEL=%%l"
+if not defined LEVEL set "LEVEL=avx2"
+set "FLOOR="
+if "%LEVEL%"=="avx" set "FLOOR=avx"
+if "%LEVEL%"=="sse" set "FLOOR=none"
+set "RTL="
 if /i "%~1"=="portable" (
   set "ARCH=86;89;120a"
   set "PORTABLE=ON"
   set "OUT=build-ds41-portable"
+  set "FLOOR="
+  set "LEVEL=avx2"
 )
-echo Building %OUT% for GPU architecture %ARCH%
+if /i "%~1"=="compat" (
+  set "ARCH=86;89;120a"
+  set "OUT=build-ds41-compat"
+  set "FLOOR=none"
+  set "LEVEL=sse"
+  set "RTL=-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
+)
+echo Building %OUT% for GPU architecture %ARCH% and CPU level %LEVEL%
+if defined FLOOR echo   ^(no AVX2: the CPU side runs ggml's %FLOOR% kernels and the engine's AVX ones where the CPU has AVX - slower^)
 set "NVCC=%CUDA_PATH%\bin\nvcc.exe"
 cmake -G Ninja -S "%ROOT%." -B "%ROOT%%OUT%" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER="%NVCC:\=/%" ^
   -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON -DSTRATA_MMQ_KQUANTS=ON "-DCMAKE_CUDA_ARCHITECTURES=%ARCH%" ^
-  -DSTRATA_PORTABLE=%PORTABLE% -DSTRATA_GGML_DIR="%LLAMA:\=/%" -DSTRATA_DSV41_FQ_OP=ON -DSTRATA_DSV41_HC_MIX=ON ^
-  -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_STANDARD=17 || exit /b 1
+  -DSTRATA_PORTABLE=%PORTABLE% "-DSTRATA_ISA_FLOOR=%FLOOR%" %RTL% -DSTRATA_GGML_DIR="%LLAMA:\=/%" ^
+  -DSTRATA_DSV41_FQ_OP=ON -DSTRATA_DSV41_HC_MIX=ON -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_STANDARD=17 || exit /b 1
 cmake --build "%ROOT%%OUT%" --target ds41_generate v41_sidecar_requant ds41_engram_hot && goto built
 echo   (the build stopped - trying it once more)
 cmake --build "%ROOT%%OUT%" --target ds41_generate v41_sidecar_requant ds41_engram_hot || exit /b 1
@@ -66,7 +89,9 @@ for %%b in ("%CUDA_PATH%\bin\x64" "%CUDA_PATH%\bin") do (
     if not exist "%ROOT%%OUT%\%%~nxf" copy /y "%%~f" "%ROOT%%OUT%\" >nul
   )
 )
-rem the launcher takes build-ds41 when it exists, else build-ds41-portable (tools\v41\serve\ds41_local.py)
+rem the CPU level this build needs: the launcher takes the first of build-ds41, build-ds41-portable, build-ds41-compat
+rem that this CPU can run (tools\v41\serve\cpu_level.py)
+>"%ROOT%%OUT%\cpu-level.txt" echo %LEVEL%
 echo Built: %OUT%\ds41_generate.exe
 exit /b 0
 :novs

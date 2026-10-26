@@ -16,7 +16,10 @@ import json
 import os
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cpu_level  # noqa: E402  (same folder)
+
+ROOT =os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 ARENA_CAP_GIB = 140
 
 
@@ -61,9 +64,13 @@ def expand(cfg):
     """The config with this machine's paths and arena size (a new dict; IN is not changed)."""
     os.environ.setdefault("XO_ROOT", ROOT.replace("\\", "/"))
     os.environ.setdefault("DS41_MODELS", os.path.join(ROOT, "models").replace("\\", "/"))
-    # ${DS41_BUILD}: this PC's own build (build-ds41.bat) if there is one, else the portable one (build-ds41.bat portable)
-    native = os.path.exists(os.path.join(ROOT, "build-ds41", "ds41_generate.exe"))
-    os.environ.setdefault("DS41_BUILD", "build-ds41" if native else "build-ds41-portable")
+    # ${DS41_BUILD}: the first build this CPU can run - this PC's own (build-ds41.bat), the portable one (AVX2), the one
+    # for older CPUs (cpu_level.py)
+    if "DS41_BUILD" not in os.environ:
+        folder, why = cpu_level.pick_build()
+        if folder is None:
+            sys.exit(f"ds41_local: {why}")
+        os.environ["DS41_BUILD"] = folder
 
     def walk(v):
         if isinstance(v, str):

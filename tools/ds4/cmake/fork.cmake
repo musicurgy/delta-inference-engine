@@ -11,7 +11,9 @@ if(STRATA_NATIVE_EXPERTS AND TARGET strata_kernels_cpu)
   # STRATA_MSVC_KERNEL_AVX2=OFF keeps the portable (any-x64) build.  native_expert.cpp: the CPU tier's row loops and
   # SwiGLU around those kernels.
   option(STRATA_MSVC_KERNEL_AVX2 "MSVC: compile ptq1_0.cpp and native_expert.cpp with /arch:AVX2" ON)
-  if(MSVC AND STRATA_MSVC_KERNEL_AVX2)
+  # not for the older-CPU builds (STRATA_ISA_FLOOR): native_expert.cpp runs on every CPU expert row, so /arch:AVX2 there
+  # would put AVX2 instructions in front of a CPU without them
+  if(MSVC AND STRATA_MSVC_KERNEL_AVX2 AND STRATA_ISA_FLOOR STREQUAL "")
     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu/ptq1_0.cpp
                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu/native_expert.cpp
                                 PROPERTIES COMPILE_OPTIONS "/arch:AVX2")

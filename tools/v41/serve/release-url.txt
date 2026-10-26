@@ -1,0 +1,6 @@
+# Where first-start.bat downloads the prebuilt engine (tools/v41/serve/get_engine.py): this project's GitHub Releases.
+# A git clone finds it from its 'origin' remote by itself; this line is for a "Download ZIP" copy (no git remote).
+# Replace OWNER/REPO with the project's GitHub path when publishing.  The release needs two files:
+#   build-ds41-portable.zip   (build-ds41.bat portable: CPUs with AVX2)
+#   build-ds41-compat.zip     (build-ds41.bat compat: older CPUs)
+https://github.com/OWNER/REPO/releases/latest/download/

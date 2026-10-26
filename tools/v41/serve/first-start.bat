@@ -26,11 +26,22 @@ for %%v in (3.11 3.12 3.10) do if not defined PYEXE (
 if not defined PYEXE (
   python -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] <= (3, 12) else 1)" >nul 2>&1 && set "PYEXE=python"
 )
-if not defined PYEXE (
-  echo Python 3.10, 3.11 or 3.12 is needed ^(3.11 recommended^). Install it, ticking "Add python.exe to PATH", then
-  echo start again:  https://www.python.org/downloads/windows/
-  exit /b 1
-)
+if defined PYEXE goto havepy
+rem no Python: Windows' own package manager (winget, part of Windows 11 and of recent Windows 10) installs python.org's
+rem Python 3.11 for this Windows user only - no administrator rights, nothing else on the PC changes
+echo Python 3.10, 3.11 or 3.12 is needed and none was found.
+where winget >nul 2>&1
+if errorlevel 1 goto nopy
+choice /c YN /m "Install Python 3.11 now (winget: python.org's installer, for this Windows user only)"
+if errorlevel 2 goto nopy
+winget install -e --id Python.Python.3.11 --scope user --accept-package-agreements --accept-source-agreements
+if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" set PYEXE="%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
+if defined PYEXE goto havepy
+:nopy
+echo Install Python 3.11 from https://www.python.org/downloads/windows/ ^(tick "Add python.exe to PATH"^), then
+echo start again.
+exit /b 1
+:havepy
 if not exist ".venv\Scripts\python.exe" (
   %PYEXE% -m venv .venv || exit /b 1
 )
@@ -40,12 +51,26 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem ---- 3. the engine
+rem ---- 3. the engine: a build this CPU can run (cpu_level.py: this PC's own, the portable AVX2 one, the older-CPU one)
 :build
-if exist "build-ds41\ds41_generate.exe" goto models
-if exist "build-ds41-portable\ds41_generate.exe" goto models
+".venv\Scripts\python.exe" tools\v41\serve\cpu_level.py --check && goto models
 echo.
-echo The engine is not built yet.  Building it needs, once:
+rem the prebuilt engine from the project's Releases page (get_engine.py): no compiler, CUDA Toolkit or Git needed
+".venv\Scripts\python.exe" tools\v41\serve\get_engine.py --url >nul 2>&1
+if errorlevel 1 goto build_here
+set "ZIP="
+for /f "usebackq tokens=*" %%z in (`".venv\Scripts\python.exe" tools\v41\serve\cpu_level.py --release-zip`) do set "ZIP=%%z"
+echo The prebuilt engine for this PC ^(%ZIP%, under 1 GB^) is on the project's Releases page.
+choice /c YN /m "Download it now (no compiler needed)"
+if errorlevel 2 goto build_here
+".venv\Scripts\python.exe" tools\v41\serve\get_engine.py
+if errorlevel 1 goto dl_failed
+".venv\Scripts\python.exe" tools\v41\serve\cpu_level.py --check && goto models
+:dl_failed
+echo.
+echo The download did not work ^(above^).  Start again to retry, or build the engine here:
+:build_here
+echo To build the engine on this PC, it needs, once:
 set "MISSING="
 if not exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
   set "MISSING=1"
@@ -63,7 +88,8 @@ if errorlevel 1 (
 )
 if defined MISSING (
   echo Install what is MISSING ^(then open a NEW window, so Windows sees it^) and start again.
-  echo Or skip the build: put the prebuilt "build-ds41-portable" folder from the project's Releases page here.
+  echo Or skip the build: put the prebuilt engine folder from the project's Releases page here ^(build-ds41-portable,
+  echo or build-ds41-compat for a CPU without AVX2^).
   exit /b 1
 )
 echo   Visual Studio, CUDA and Git are installed.
