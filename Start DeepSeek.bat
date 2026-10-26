@@ -43,10 +43,9 @@ set STRATA_ENGRAM_DIRECT=1
 set STRATA_DENSE_ASYNC=1
 set STRATA_PASS_NOSYNC=1
 set "STRATA_SERVE_DSPARK=%DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf"
-if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" (
-  echo No DSpark drafter at %DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf - running without it, slower. See README.md.
-  set STRATA_SERVE_DSPARK=
-)
+rem (no ( ... ) block around a line that prints a path: a ")" in the folder's name, "...-main (1)", would end the block)
+if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" set STRATA_SERVE_DSPARK=
+if not defined STRATA_SERVE_DSPARK echo No DSpark drafter at %DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf - running without it, slower. See README.md.
 rem the card's VRAM (README.md, "What you need"):
 rem   under 20 GB: at most 48 GiB of the RAM arena pinned - a 12 GB RTX 3060 ran out of memory at its first request with
 rem            ~91 GiB pinned; on a 16 GB budget the cap costs ~2% (31.1 vs 31.8 tok/s)
