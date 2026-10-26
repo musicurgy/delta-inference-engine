@@ -14,6 +14,8 @@ set CUDA_VISIBLE_DEVICES=%DS41_GPU%
 rem pin as much of the arena as Windows allows for the GPU (half the RAM) minus 4 GiB; the rest is locked large pages
 set STRATA_ARENA_PIN_GIB=auto
 set GGML_NO_BACKTRACE=1
+rem no plain-text copy of every prompt and answer in %TEMP% (the server's watch log); set it to a file path to get one
+set STRATA_TEXT_LOG=0
 rem above-normal priority: other programs cannot pause the engine's CPU pool
 set DS41_PRIORITY=abovenormal
 set STRATA_SERVE_STEP_MAX=96

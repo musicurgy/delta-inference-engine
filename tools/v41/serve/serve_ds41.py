@@ -427,12 +427,15 @@ def _prepare_ds41(self, messages, tools, kwargs, max_new=None, force=None, **kw)
 S.Service.prepare = _prepare_ds41
 
 # ---- full text log (llama.cpp-style): every request's thinking / answer / tool calls as they are generated, so a run
-# can be watched (`tail -f`) and checked afterwards (loops, what it was thinking).  STRATA_TEXT_LOG=<path> (default
-# /tmp/strata-ds41-text.log), STRATA_TEXT_LOG=0 = off.
+# can be watched (`tail -f`) and checked afterwards (loops, what it was thinking).  OFF by default (2026-10-25, the
+# user: nothing from a prompt is written to the machine unless a flag asks for it - prompts and answers live in memory
+# only and are gone when the server stops).  STRATA_TEXT_LOG=<path> turns it on; "0" / unset = off.
 import threading as _th
 import time as _time
 
-_TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", os.path.join(__import__("tempfile").gettempdir(), "strata-ds41-text.log"))
+_TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", "")
+if _TEXT_LOG in ("0", "1"):   # "1" is not a path: on needs a file name
+    _TEXT_LOG = ""
 _text_lock = _th.Lock()
 _text_state = {"kind": None}
 _KIND_LABEL = {"reasoning": "thinking", "content": "answer", "tool_start": "tool call", "tool_call": "tool call"}

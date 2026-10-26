@@ -39,6 +39,16 @@ maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the pr
   output** (`response_format` `json_object` / `json_schema`) work through the OpenAI-compatible API. Requests sent at
   the same time are answered one after another.
 
+## Privacy
+
+- The server listens on this PC only (`127.0.0.1:8080`). To reach it from other devices, add `"host": "0.0.0.0"`
+  AND `"api_key": "<a long secret>"` to `tools/v41/serve/ds41-windows.json` (clients send the key as their API key;
+  without one, anyone on your network could use the model, and the server warns about it).
+- Nothing from your prompts or answers is written to disk unless you turn it on: conversations live in memory and
+  are gone when the server stops. Opt-in only: the plain-text watch log (`STRATA_TEXT_LOG=<a file path>`), the
+  request monitor page (`"api_monitor": true` in `tools/v41/serve/ds41-windows.json`; memory only) and, in the
+  built-in chat page, "Keep chats in this browser" (Settings; off = the chat lives in the tab only).
+
 ## Quality
 
 How often the top choice matches DeepSeek's own API, on the same prompts:
@@ -77,7 +87,7 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 1. **Python environment**, in this folder:
    ```bat
    py -3.11 -m venv .venv
-   .venv\Scripts\pip install -r requirements.txt tokenizers "huggingface_hub[cli]"
+   .venv\Scripts\pip install -r requirements.txt tokenizers==0.23.3 "huggingface_hub[cli]==2.2.0"
    ```
 2. **Build** with `build-ds41.bat`.
    - It builds for this PC's CPU and GPU.

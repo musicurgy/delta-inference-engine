@@ -33,10 +33,27 @@ def total_ram_gib():
     return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
 
 
+def env_gib(name, default):
+    """A GiB setting from the environment: a finite number >= 0, else a clear message (not a traceback)."""
+    v = os.environ.get(name, "")
+    if not v:
+        return default
+    try:
+        f = float(v)
+    except ValueError:
+        f = float("nan")
+    if not (f >= 0 and f != float("inf")):
+        sys.exit(f"ds41_local: {name}={v!r} is not a number of GiB (ds41-paths.bat)")
+    return f
+
+
 def arena_gib():
-    if os.environ.get("DS41_ARENA_GIB"):
-        return float(os.environ["DS41_ARENA_GIB"])
-    reserve = float(os.environ.get("DS41_RAM_RESERVE_GIB", "38"))
+    fixed = env_gib("DS41_ARENA_GIB", None)
+    if fixed is not None:
+        if fixed < 1:
+            sys.exit(f"ds41_local: DS41_ARENA_GIB={fixed:g} - the expert arena needs at least 1 GiB")
+        return fixed
+    reserve = env_gib("DS41_RAM_RESERVE_GIB", 38.0)
     return max(16.0, min(ARENA_CAP_GIB, int(total_ram_gib() - reserve)))
 
 
@@ -70,13 +87,21 @@ def expand(cfg):
 def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
-    cfg = expand(json.load(open(sys.argv[1], encoding="utf-8")))
+    try:
+        with open(sys.argv[1], encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.exit(f"ds41_local: cannot read {sys.argv[1]}: {e}")
+    cfg = expand(raw)
     os.makedirs(os.path.dirname(os.path.abspath(sys.argv[2])), exist_ok=True)
-    json.dump(cfg, open(sys.argv[2], "w", encoding="utf-8"), indent=2)
+    with open(sys.argv[2], "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
     a = cfg.get("args", [])
     gib = a[a.index("--arena-gib") + 1] if "--arena-gib" in a else "?"
-    missing = [p for p in [cfg.get("exe")] + [a[i + 1] for i, x in enumerate(a[:-1]) if x in ("-m", "--rank")]
-               if p and not os.path.exists(p)]
+    # every file / folder the engine and server open at start (a missing one failed later, with a vaguer message)
+    paths = [cfg.get("exe"), cfg.get("tokenizer")] + [a[i + 1] for i, x in enumerate(a[:-1]) if x in ("-m", "--rank")]
+    paths += [d for i, x in enumerate(a[:-1]) if x == "--engram" for d in a[i + 1].split(";")]   # a list of folders
+    missing = [p for p in paths if p and not os.path.exists(p)]
     print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB; models in {os.environ['DS41_MODELS']}")
     for p in missing:
         print(f"ds41_local: MISSING {p}  (see README.md, 'Setup')")

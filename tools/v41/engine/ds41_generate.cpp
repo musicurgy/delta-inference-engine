@@ -871,6 +871,22 @@ int main(int argc, char ** argv) {
         double tq = now_ms();
         auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
         ++pv_n; pv_tok += m;
+        // STRATA_PASS_LOG=<file>: one line per pass (rows, wall / dense / tier ms, the tier's hits / cpu / pcie / file
+        // for the pass) - the cost model behind batched decoding: what a pass costs per pass, per row and per miss
+        static std::FILE * pass_log = std::getenv("STRATA_PASS_LOG") ? std::fopen(std::getenv("STRATA_PASS_LOG"), "w") : nullptr;
+        const double pl_t0 = tq, pl_d0 = pv_ms[0], pl_t1 = pv_ms[1];
+        const Ds41MoeStats pl_s0 = pass_log ? tier.stats() : Ds41MoeStats{};
+        struct PassLogLine {
+            std::FILE * f; int m; double t0, d0, k0; const double * ms; const Ds41MoeStats * s0; Ds41MoeTier * tr;
+            ~PassLogLine() {
+                if (!f) return;
+                const Ds41MoeStats s = tr->stats();
+                std::fprintf(f, "%d %.3f %.3f %.3f %lld %lld %lld %lld\n", m, now_ms() - t0, ms[0] - d0, ms[1] - k0,
+                             (long long) (s.hits - s0->hits), (long long) (s.cpu - s0->cpu), (long long) (s.pcie - s0->pcie),
+                             (long long) (s.file_tier - s0->file_tier));
+                std::fflush(f);
+            }
+        } pass_log_line { pass_log, m, pl_t0, pl_d0, pl_t1, pv_ms, &pl_s0, &tier };
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
         vh.assign((size_t) m * 3 * n_embd, 0.0f);
@@ -1188,9 +1204,23 @@ int main(int argc, char ** argv) {
         ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
         std::fprintf(stderr, "vram trace: %s %d free %.2f GiB\n", where, a, tf / 1073741824.0);
     };
+    // The serve stdin reader can receive STOP while a long layer-major prompt is running (upstream 6e5ba8d: a client
+    // that hung up kept the engine reading for minutes).  Poll only between completed graph / tier operations; a
+    // one-shot run has no callback and keeps the existing path.
+    std::function<bool()> prefill_stop;
+    bool prefill_cancelled = false;
+    auto stop_prefill = [&]() -> bool {
+        if (prefill_cancelled || (prefill_stop && prefill_stop())) {
+            prefill_cancelled = true;
+            ferr = "cancelled";
+            return true;
+        }
+        return false;
+    };
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
         for (int c0 = 0; c0 < n; ) {
+            if (stop_prefill()) return false;
             if (PB > 1 && n - c0 >= 2) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
                 int B = std::min(pb_cap, n - c0);
@@ -1237,6 +1267,7 @@ int main(int argc, char ** argv) {
                 }
                 double t0 = now_ms();
                 for (int l = 0; l < n_layer; ++l) {
+                    if (stop_prefill()) return false;
                     if (l < 4) vram_log("batch layer", l);
                     // layer 20 is the last kv source: for phase A only its persistent KV writes run; layers 21-39 run
                     // nothing at all for phase A (their output columns are never read, and no later layer reads state
@@ -1311,6 +1342,12 @@ int main(int argc, char ** argv) {
                 for (int s = 0; tail_keep > 0 && s < B; s += SB)   // one sub-batch at a time, as above
                     if (!capture_tail(n, c0 + s, std::min(SB, B - s), s)) return false;
                 fd_logits += now_ms() - tl;
+                if (vram_trace) {   // the batch's peak is its last layers' (the pass graph only grows within a prompt)
+                    size_t tf = 0, tt = 0;
+                    ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+                    std::fprintf(stderr, "vram trace: batch at %d (B %d) done: free %.2f GiB; %s\n", pos0 + c0, B,
+                                 tf / 1073741824.0, dense.vram_ledger().c_str());
+                }
                 c0 += B;
             } else {
                 // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
@@ -1318,6 +1355,7 @@ int main(int argc, char ** argv) {
                 double t0 = now_ms();
                 if (!dense.begin(ids + c0, m, pos0 + c0)) { ferr = dense.last_error(); return false; }
                 for (int l = 0; l < n_layer; ++l) {
+                    if (stop_prefill()) return false;
                     const float * fn = nullptr;
                     if (!dense.attn_router(l, cids.data(), cw.data(), &fn)) { ferr = dense.last_error(); return false; }
                     if (dump_dir) {
@@ -1398,6 +1436,7 @@ int main(int argc, char ** argv) {
                 if (*it == "STOP") { q.erase(it); return true; }
             return false;
         };
+        prefill_stop = stop_pending;
         auto is_stop = [&](int t) { return std::find(a.stop.begin(), a.stop.end(), t) != a.stop.end() || t == (int) G.eos; };
         const int ctxv = (int) ctx;
         std::vector<int> hist;
@@ -1536,15 +1575,20 @@ int main(int argc, char ** argv) {
                     continue;
                 }
                 const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
-                if (k == "temperature") temp = (float) std::atof(v.c_str());
-                else if (k == "top_p") top_p = (float) std::atof(v.c_str());
+                // the server range-checks these (sampling_keys); the engine does again: a non-finite temperature would
+                // turn every probability into NaN (std::uniform_real_distribution(0, NaN) is undefined), an infinite
+                // route bias would leave only resident experts selectable
+                const float fv = (float) std::atof(v.c_str());
+                const bool fin = std::isfinite(fv);
+                if (k == "temperature") temp = fin ? std::max(0.0f, fv) : 0.0f;
+                else if (k == "top_p") top_p = fin ? fv : 1.0f;
                 else if (k == "top_k") tk = std::atoi(v.c_str());
-                else if (k == "min_p") min_p = (float) std::atof(v.c_str());
+                else if (k == "min_p") min_p = fin ? fv : 0.0f;
                 else if (k == "seed") rng.seed((uint64_t) std::atoll(v.c_str()));
-                else if (k == "route_bias") req_rb = std::max(0.0f, (float) std::atof(v.c_str()));
-                else if (k == "route_bias_file") req_rbf = std::max(0.0f, (float) std::atof(v.c_str()));
-                else if (k == "route_protect") req_rprot = std::max(0, std::atoi(v.c_str()));
-                else if (k == "route_pool") req_rpool = std::max(0, std::atoi(v.c_str()));
+                else if (k == "route_bias") req_rb = fin ? std::min(8.0f, std::max(0.0f, fv)) : 0.0f;
+                else if (k == "route_bias_file") req_rbf = fin ? std::min(8.0f, std::max(0.0f, fv)) : 0.0f;
+                else if (k == "route_protect") req_rprot = std::min(32, std::max(0, std::atoi(v.c_str())));
+                else if (k == "route_pool") req_rpool = std::min(32, std::max(0, std::atoi(v.c_str())));
             }
             // a changed bias is applied again just before the decode: a repeated prompt (regenerate) runs no prompt pass,
             // and the passes are what turn the decode bias on - without this it decoded with the previous request's
@@ -1862,9 +1906,11 @@ int main(int argc, char ** argv) {
                 std::printf("PP %d %d %.0f %.1f\n", reused + done, total, ms, 1000.0 * done / std::max(ms, 1e-9));
                 std::fflush(stdout);
             };
+            prefill_cancelled = false;
             auto feed_steps = [&]() -> bool {   // the short-turn path: passes of up to pass_max tokens (a lone token: a step)
                 int last_rows = 1;
                 for (int i = 0; i < dh; ) {
+                    if (stop_prefill()) return false;
                     const int m = std::min(pass_max, dh - i);
                     if (!(m == 1 ? step(ids[(size_t) (reused + i)], reused + i) : pass_m(ids.data() + reused + i, m, reused + i))) return false;
                     if (!capture_tail(delta, i, m, 0)) return false;   // this pass's rows, before the next pass replaces them
@@ -1901,18 +1947,42 @@ int main(int argc, char ** argv) {
                 // a column" is a mis-derivation (1424/8192) and the decomposition is really ~5.7 GiB fixed + 0.78 a
                 // column.  Same line, same fit - but it matters: a wide batch's per-column STATE is what starves the
                 // fixed graph buffer (16384 = 5.14 GiB of state, 1.03 GiB short), not the graph itself.
+                // 2026-10-20: the GRAPH also grows with the CONTEXT.  The indexer's score / mask tensors are
+                // [visible compressed rows x queries] (build_attn), and the visible rows are a power of two: a
+                // ratio-1 layer past 2^19 rows builds a 9.06 GiB span graph untiled (5.56 with build_attn's indexer
+                // tile) instead of ~1.2, and it is built first by
+                // the prompt's LAST batch (under enc-skip the only one that runs layers 21-39) - long after this width
+                // took the columns.  The line above budgets the graph as its own decomposition says, 2.19 GiB + 0.17
+                // MiB a column (4.2 GiB at 12288 columns): room for some growth over the 1.16 GiB a short context
+                // builds, none for 9 GiB.  So the width must also fit the batch's memory WITHOUT that allowance plus
+                // the graph this prompt's last sub-batch will really build, as the allocator plans it:
+                //     need(B) = max(4.3 GiB + 0.95 MiB * B,  2.5 GiB + 0.78 MiB * B + graph)
+                // The second term is a 5090 trace (2026-10-20, 12288 columns, 18.74 GiB free at the cap): a 512K
+                // prompt's batches took 13.01 GiB with a 1.16 GiB graph - 11.85 GiB besides it = 2.5 GiB + run20's
+                // 0.78 MiB a column - and its last batch's 4.56 GiB graph left 2.33 GiB free, as the term says.  Up to
+                // the allowance (here every context up to 512K at the full width) the cap is the one it was.
+                // STRATA_PB_GRAPH=0: the line alone (diagnostics).
+                static const bool pb_graph = !(std::getenv("STRATA_PB_GRAPH") && std::atoi(std::getenv("STRATA_PB_GRAPH")) == 0);
+                const double g_need = pb_graph ? (double) dense.span_graph_bytes(total, SB) : 0.0;   // memoized per row count
                 const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
-                const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
+                const double room_g = (double) frb - a.vram_margin_gib * 1073741824.0 - 2.5 * 1073741824.0 - g_need;
+                const int fit_line = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
+                const int fit_g = pb_graph ? (int) std::max<int64_t>(2, (int64_t) (room_g / (0.78 * 1048576.0))) : fit_line;
+                const int fit = std::min(fit_line, fit_g);
                 pb_cap = std::min(PB, std::max(SB, fit));
-                if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d -> pb_cap %d\n",
-                                             frb / 1073741824.0, room / 1073741824.0, fit, pb_cap);
-                if (pb_cap < PB) std::fprintf(stderr, "serve: VRAM %.2f GiB free -> prompt batch %d (of %d)\n",
-                                              frb / 1073741824.0, pb_cap, PB);
+                if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d, graph %.2f GiB fit %d -> pb_cap %d\n",
+                                             frb / 1073741824.0, room / 1073741824.0, fit_line, g_need / 1073741824.0, fit_g, pb_cap);
+                if (fit_g < fit_line && fit_g < PB)
+                    std::fprintf(stderr, "serve: a %d-token context's pass graph needs %.2f GiB -> prompt batch %d (of %d)\n",
+                                 total, g_need / 1073741824.0, pb_cap, PB);
+                else if (pb_cap < PB) std::fprintf(stderr, "serve: VRAM %.2f GiB free -> prompt batch %d (of %d)\n",
+                                                   frb / 1073741824.0, pb_cap, PB);
             }
             const double tph0 = now_ms();
             const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)
             bcap_n = bcap; bcap_got = 0;
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
+            dense.reset_span_width();   // a sub-batch narrowed by the last prompt's tight card starts wide again
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
             bcap_n = 0;
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
@@ -1945,6 +2015,7 @@ int main(int argc, char ** argv) {
                 if (bcap > 0) {   // the seed rows came off the batch (bcap_vh, its last bcap_got tokens): DSpark steps only
                     const int c0s = total - bcap_got;
                     for (int i0 = c0s; ok && i0 < total; i0 += 16) {
+                        if (stop_prefill()) { ok = false; break; }
                         const int m = std::min(16, total - i0);
                         spos.resize((size_t) m);
                         for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
@@ -1964,6 +2035,7 @@ int main(int argc, char ** argv) {
                     if (dsp && bcap_got < 1) { ferr = "DSpark batch seed captured nothing"; ok = false; }
                 }
                 for (int i0 = total - sp_tail; ok && bcap == 0 && i0 < total; i0 += 16) {
+                        if (stop_prefill()) { ok = false; break; }
                     const int m = std::min(16, total - i0);
                     if (!pass_v(ids.data() + i0, m, i0)) { ok = false; break; }
                     spos.resize((size_t) m);
@@ -2022,7 +2094,19 @@ int main(int argc, char ** argv) {
             }
             tail_keep = 0;
             if (!ok) {
-                std::printf("ERR prefill failed: %s\n", ferr.c_str());
+                if (prefill_cancelled) {
+                    // No partial prompt can be reused as a valid conversation.
+                    snap_seed_n = cur_seed_n = 0;
+                    // feed returned before its ordinary elastic-column/chunk cleanup.
+                    dense.release_pass();
+                    const bool cleaned = !dc.elastic_cols || dense.set_columns(0);
+                    if (rdev1) rdev1 = dense.routed_dev();
+                    tier.release_chunk();
+                    tier.rebalance_tick(true);
+                    if (cleaned) std::printf("DONE 0 %d %.1f 0.0 cancel 0 0 %d 0 0 0 0 0 0\n",
+                                             total, now_ms() - tp0, reused);
+                    else std::printf("ERR cancelled prefill cleanup: %s\n", dense.last_error().c_str());
+                } else std::printf("ERR prefill failed: %s\n", ferr.c_str());
                 std::fflush(stdout);
                 hist.clear();
                 snap_len = -1;

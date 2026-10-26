@@ -574,13 +574,24 @@ function markdown(text) {
 }
 
 // ------------------------------------------------------------------ Chat
-const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
-let settings = {...DEFAULTS, ...store.get("sampling", {})};
-let messages = store.get("chat", []);
+// keep: the chat history in this browser's storage (on disk).  Off by default: the chat lives in the tab's memory and is
+// gone when the tab closes.  A browser that already holds a saved chat from before this switch keeps it (keep on) until
+// the switch is turned off - nothing is deleted behind the user's back.
+const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true,
+                  keep: false};
+let settings = (() => {
+  const saved = store.get("sampling", {});
+  const s = {...DEFAULTS, ...saved};
+  if (!("keep" in saved) && store.get("chat", null) !== null) s.keep = true;
+  return s;
+})();
+let messages = settings.keep ? store.get("chat", []) : [];
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg}
 
+function forgetChat() { try { localStorage.removeItem("strata.chat"); } catch (e) { /* ignore */ } }
 function saveChat() {
+  if (!settings.keep) return;
   store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
                                            files: (m.files || []).map((f) => ({name: f.name}))})));
 }
@@ -1009,6 +1020,7 @@ function loadDrawer(s = settings) {
   $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
   $("s-max").value = s.max; $("s-seed").value = s.seed;
   $("s-show").setAttribute("aria-checked", String(!!s.show));
+  $("s-keep").setAttribute("aria-checked", String(!!s.keep));
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
@@ -1059,6 +1071,7 @@ function outputs() {
 for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
 $("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
+$("s-keep").onclick = () => $("s-keep").setAttribute("aria-checked", String($("s-keep").getAttribute("aria-checked") !== "true"));
 $("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
 $("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
 $("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($("s-share").getAttribute("aria-checked") !== "true"));
@@ -1068,9 +1081,11 @@ $("s-apply").onclick = async () => {
   settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               show: $("s-show").getAttribute("aria-checked") === "true",
+              keep: $("s-keep").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
   store.set("sampling", settings);
+  if (settings.keep) saveChat(); else forgetChat();   // switched off: the saved copy goes now, the tab keeps its chat
   const share = $("s-share").getAttribute("aria-checked") === "true";
   openDrawer(false);
   if (share || sharedOn) {
