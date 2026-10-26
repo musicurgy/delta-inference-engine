@@ -37,6 +37,15 @@ def main():
     # an install from before 2026-10-27 (the slim copy + DeepSeek's Engram shards) needs no main model
     old = os.path.exists(os.path.join(m, "ds4-q2-slim.gguf")) and \
         os.path.exists(os.path.join(m, "engram", "model-00048-of-00048.safetensors"))
+    # nor does a model Choose Model.bat picked that is there (model-choice.txt: an Unsloth GGUF carries its own Engram)
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    try:
+        with open(os.path.join(root, "model-choice.txt"), encoding="utf-8") as f:
+            pick = f.readline().strip().strip('"')
+    except OSError:
+        pick = ""
+    if pick and os.path.exists(pick if os.path.isabs(pick) else os.path.join(m, pick)):
+        old = True
     if not old and not os.path.exists(os.path.join(m, Q2_NAME + ".ok")):
         n = max(0.0, Q2 - size(os.path.join(m, Q2_NAME)) - partial(m))
         steps.append(("main model (366 GB download)", n, n))

@@ -127,8 +127,10 @@ if exist "%ROOT%\model-choice.txt" set /p PICK=<"%ROOT%\model-choice.txt"
 if defined PICK set "PICK=%PICK:/=\%"
 if defined PICK if exist "%M%\%PICK%" set "OLD=1"
 if defined PICK if exist "%PICK%" set "OLD=1"
+set "NEEDMAIN="
 if not defined OLD if not exist "%M%\DeepSeek-V4.1-Flash-1017-Q2.gguf.ok" (
   set "NEED=1"
+  set "NEEDMAIN=1"
   echo   missing: the main model, DeepSeek-V4.1-Flash-1017-Q2.gguf ^(366 GB, with its Engram tables^)
 )
 if not exist "%M%\tokenizer\vocab.json" (
@@ -142,9 +144,14 @@ if not exist "%M%\V41-1017-MTP-iq2xxs.gguf" (
 if not defined NEED exit /b 0
 echo The model files above go to %M%
 echo   ^(DS41_MODELS in ds41-paths.bat - put it on your fastest NVMe drive^).  They come from Hugging Face: DeepSeek's
-echo   official repository and a Q2 GGUF of it; every large file is checked against its published SHA-256.  The first
-echo   setup downloads ~375 GB, needs ~385 GB free while it runs and keeps ~371 GB.  It can take hours; if it stops,
-echo   start again and it goes on where it was.
+echo   official repository and a Q2 GGUF of it; every large file is checked against its published SHA-256.
+if defined NEEDMAIN (
+  echo   The first setup downloads ~375 GB, needs ~385 GB free while it runs and keeps ~371 GB.  It can take hours; if
+  echo   it stops, start again and it goes on where it was.  ^(For an Unsloth quant instead of this model: answer N,
+  echo   run Choose Model.bat, then start again.^)
+) else (
+  echo   Only the small parts are missing ^(at most ~8 GB to download^).
+)
 choice /c YN /m "Download and prepare them now"
 if errorlevel 2 exit /b 1
 call "%ROOT%\setup-ds41-models.bat"
