@@ -12,14 +12,16 @@ This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whi
 
 ## Quick start
 
-1. Get this folder (**Code > Download ZIP**, or `git clone -c core.longpaths=true <URL> C:\AI\DeepSeek`) somewhere with
+1. Get this folder (**Code > Download ZIP**, or
+   `git clone -c core.longpaths=true https://github.com/musicurgy/delta-inference-engine C:\AI\Delta`) somewhere with
    a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 128 GB+ of RAM,
    ~560 GB free on an NVMe drive.
 2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
    asks before anything big:
    - Python and its packages (no Python 3.10-3.12 on the PC: it offers to install python.org's Python 3.11 with
      Windows' own winget, for your Windows user only),
-   - the engine: the prebuilt one for your CPU from the Releases page (under 1 GB, no compiler needed) - or it builds
+   - the engine: the prebuilt one for your CPU from the
+     [Releases page](https://github.com/musicurgy/delta-inference-engine/releases) (under 1 GB, no compiler needed) - or it builds
      it, if you have Visual Studio Build Tools, the CUDA Toolkit and Git,
    - the model files from Hugging Face (~565 GB of downloads, checked against their published SHA-256; it checks the
      free space first; resumable - just start it again if it stops).
