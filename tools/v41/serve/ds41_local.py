@@ -88,6 +88,13 @@ def expand(cfg):
     for i, x in enumerate(a[:-1]):
         if x == "--arena-gib" and a[i + 1] == "auto":
             a[i + 1] = f"{arena_gib():g}"
+    # DS41_VRAM_MARGIN=GiB (Start DeepSeek.bat sets it for small cards): the VRAM kept free beside the expert cache
+    margin = env_gib("DS41_VRAM_MARGIN", None)
+    if margin is not None:
+        if "--vram-margin" in a[:-1]:
+            a[a.index("--vram-margin") + 1] = f"{margin:g}"
+        else:
+            a += ["--vram-margin", f"{margin:g}"]
     return out
 
 

@@ -11,7 +11,7 @@ This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whi
 ## Quick start
 
 1. Get this folder (**Code > Download ZIP**, or `git clone -c core.longpaths=true <URL> C:\AI\DeepSeek`) somewhere with
-   a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 128 GB+ of RAM,
+   a short path, and check "What you need" below: an NVIDIA RTX card with 16 GB+ (24 GB is fastest), 128 GB+ of RAM,
    ~560 GB free on an NVMe drive.
 2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
    asks before anything big:
@@ -134,11 +134,12 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
 ## What you need
 
 - Windows 10 or 11, 64-bit.
-- An NVIDIA RTX card with 12 GB of VRAM or more, and driver 580 or newer.  24 GB (RTX 3090 / 4090, or a 32 GB 5090)
+- An NVIDIA RTX card with 16 GB of VRAM or more, and driver 580 or newer.  24 GB (RTX 3090 / 4090, or a 32 GB 5090)
   is the fast path; with less, fewer experts fit on the card.  Measured on the 3090 with the expert budget of a smaller
-  card (the default model, 192 GB RAM): 24 GB 41 tok/s, 23 GB (a monitor on the card) 39, 16 GB 32, 12 GB 23 - under
-  14 GB the launcher runs without the drafter, which is faster there.  RTX 20 (Titan RTX, Quadro RTX): the engine is
-  built for it, not tested here.  Below 12 GB it probably does not fit (~9 GB is fixed: dense weights, KV, buffers).
+  card (the default model, 192 GB RAM): 24 GB 41 tok/s, 23 GB (a monitor on the card) 39, 16 GB 32.  12 GB is not
+  supported yet: on our 12 GB test card (an RTX 3060) the model loaded but ran out of memory at the first request
+  (~9 GB is fixed: dense weights, KV, buffers).  RTX 20 (Titan RTX, Quadro RTX): the engine is built for it, not
+  tested here.
 - 128 GB of RAM or more.
 - An x86-64 CPU.  AVX2 (Intel from 2013 / Haswell on, any AMD Ryzen, Threadripper or EPYC) is the fast path; newer
   instructions (AVX-512, AVX-VNNI) are used where the CPU has them.  A CPU without AVX2 (e.g. Sandy / Ivy Bridge or

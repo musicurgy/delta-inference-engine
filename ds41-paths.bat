@@ -20,4 +20,6 @@ if %2 GTR %DS41_GPU_MIB% (
 exit /b 0
 :gpu_done
 rem Optional: DS41_ARENA_GIB=N fixes the RAM arena (default: sized from your installed RAM, see
-rem   tools\v41\serve\ds41_local.py); DS41_RAM_RESERVE_GIB=N leaves N GiB for Windows and other programs (default 38).
+rem   tools\v41\serve\ds41_local.py); DS41_RAM_RESERVE_GIB=N leaves N GiB for Windows and other programs (default 38);
+rem   DS41_VRAM_MARGIN=N keeps N GiB of VRAM free beside the expert cache (default 0.6) - raise it if other programs
+rem   use the card.
