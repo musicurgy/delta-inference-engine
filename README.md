@@ -63,10 +63,30 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
   DeepSeek's own model (at 0.3: 89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with
   the refresh).  The test moves by about 0.2 points between identical runs.
 - For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`.
-- We also tested ISTA-DASLab's GSQ-RCO quants
-  ([DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF))
-  in this engine. IQ2_XS answered our test questions as well as the default Q2 build, and IQ2_XXS got fewer of the
-  knowledge questions right. Neither was faster here, so the default stays.
+## Other quants: ISTA-DASLab's GSQ-RCO
+
+The IQ2_XS, IQ2_XXS and IQ1_M builds of
+[ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
+run in this engine. It reads its own file layout, so a script builds one: it keeps the default file's dense weights,
+Engram and metadata and takes GSQ's routed experts, streamed from Hugging Face (every shard SHA-256-checked; the file
+is only written into place when all match):
+
+```bat
+.venv\Scripts\python tools\v41\gsq_stream_merge.py --ours models\ds4-q2-slim.gguf --build IQ2_XS --out models\ds41-gsq-iq2_xs.gguf
+```
+
+(`--build IQ2_XXS` or `IQ1_M` for the others; 20-30 min each at 100 MB/s.)  Then point `"-m"` in
+`tools/v41/serve/ds41-windows.json` at the new file.  Measured here, exact routing, against DeepSeek's API:
+
+| | file | general | code + maths | notes |
+|---|---|---|---|---|
+| default (ds4 Q2) | 163 GB | 91.5% | 93.0% | |
+| GSQ IQ2_XS | 159 GB | 90.0% | 92.9% | answered our task questions as well as the default |
+| GSQ IQ2_XXS | 142 GB | 87.8% | 89.5% | fewer knowledge questions right; long prompts slower (IQ1_M layers) |
+| GSQ IQ1_M | 125 GB | - | - | the smallest; long prompts slower (no fast prompt kernel for IQ1_M) |
+
+IQ2_XS and IQ2_XXS wrote within 2.5% of the default's speed (IQ1_M was checked to run and answer, not timed), so the
+default stays; the smaller files may suit a PC with less disk.
 
 ## What you need
 
@@ -84,6 +104,10 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 
 ## Setup
 
+0. **Get the code** into a short folder (some paths are 140 characters; Windows stops at 260), for example:
+   ```bat
+   git clone -c core.longpaths=true <this repository's URL> C:\AI\DeepSeek
+   ```
 1. **Python environment**, in this folder:
    ```bat
    py -3.11 -m venv .venv

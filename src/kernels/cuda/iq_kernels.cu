@@ -1802,6 +1802,21 @@ __device__ void dq_iq1_m(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     grid32[0] &= 0x0f0f0f0f;
     for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (q[j] + delta));
 }
+// fork: IQ1_S (19), ggml-cuda convert.cu's dequantize_block_iq1_s - the GSQ-RCO "IQ1_M" build's main expert type
+template<typename dst_t>
+__device__ void dq_iq1_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_iq1_s* x = (const block_iq1_s*) vx;
+    const int64_t il = tid / 8, ib = tid % 8;
+    dst_t* y = yy + 32 * ib + 8 * il;
+    const float delta = x[ibs].qh[ib] & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d = (float) x[ibs].d * (2 * ((x[ibs].qh[ib] >> 12) & 7) + 1);
+    uint32_t grid32[2];
+    const int8_t* q = (const int8_t*) grid32;
+    grid32[0] = iq1s_grid_gpu[x[ibs].qs[4 * ib + il] | (((x[ibs].qh[ib] >> 3 * il) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (q[j] + delta));
+}
 template<typename dst_t>
 __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_iq4_nl* x = (const block_iq4_nl*) vx + ibs * (QK_K / QK4_NL);
@@ -2044,6 +2059,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 21: dq_iq3_s(vx, ibs, y, tid); break;
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
+        case 19: dq_iq1_s(vx, ibs, y, tid); break;   // fork: IQ1_S
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 10: dq_q2_k(vx, ibs, y, tid); break;
@@ -2101,7 +2117,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
-    if (t == 10 || t == 39 || t == 143) return true;   // fork: Q2_K, MXFP4, PTQ1_0 (11 = Q3_K is upstream's)
+    if (t == 10 || t == 19 || t == 39 || t == 143) return true;   // fork: Q2_K, IQ1_S, MXFP4, PTQ1_0 (11 = Q3_K is upstream's)
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40;

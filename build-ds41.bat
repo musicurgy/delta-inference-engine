@@ -17,6 +17,11 @@ if not defined CUDA_PATH (
   echo CUDA_PATH is not set: install the CUDA Toolkit first.
   exit /b 1
 )
+rem the .venv brings cmake 3.24+ and ninja (Visual Studio 2019's own cmake is 3.20: "CMake 3.24 or higher is required")
+if not exist "%ROOT%.venv\Scripts\cmake.exe" (
+  echo No .venv\Scripts\cmake.exe - set up the Python environment first ^(README.md, Setup step 1^), then run this again.
+  exit /b 1
+)
 set "PATH=%ROOT%.venv\Scripts;%CUDA_PATH%\bin;%PATH%"
 set "LLAMA=%ROOT%third_party\llama.cpp"
 rem llama.cpp at Xolotl's pinned commit + tools\xolotl\ggml\xolotl-ggml.patch (as tools/xolotl/fetch-llama.sh does)

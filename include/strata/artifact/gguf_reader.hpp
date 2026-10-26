@@ -197,6 +197,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 256;
         bytes = 98;
         return true;
+    case 19:   // IQ1_S: d (2) + qs (32) + qh (16) - ISTA-DASLab's GSQ-RCO "IQ1_M" build keeps most experts in it
+        elems = 256;
+        bytes = 50;
+        return true;
     case 20:
         elems = 32;
         bytes = 18;
