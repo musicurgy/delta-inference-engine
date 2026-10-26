@@ -136,11 +136,11 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
 - Windows 10 or 11, 64-bit.
 - An NVIDIA RTX card with 12 GB of VRAM or more, and driver 580 or newer.  24 GB (RTX 3090 / 4090, or a 32 GB 5090)
   is the fast path; with less, fewer experts fit on the card.  Measured on the 3090 with the expert budget of a smaller
-  card (the default model, 192 GB RAM): 24 GB 41 tok/s, 23 GB (a monitor on the card) 39, 16 GB 31, 12 GB 23.  The
-  launcher adapts by itself: under 20 GB it pins at most 48 GiB of RAM for the card (a 12 GB RTX 3060 ran out of memory
-  with more, and answers with it), under 14 GB it runs without the drafter (faster there).  Below 12 GB it probably
-  does not fit (~9 GB is fixed: dense weights, KV, buffers).  RTX 20 (Titan RTX, Quadro RTX): the engine is built for
-  it, not tested here.
+  card (the default model, 192 GB RAM): 24 GB 41 tok/s, 23 GB (a monitor on the card) 39, 16 GB 31, 12 GB 17.  The
+  launcher adapts by itself: under 20 GB it pins at most 48 GiB of RAM for the card; under 14 GB it pins none and runs
+  without the drafter (a real 12 GB RTX 3060 ran out of memory with them and answers without).  Below 12 GB it
+  probably does not fit (~9 GB is fixed: dense weights, KV, buffers).  RTX 20 (Titan RTX, Quadro RTX): the engine is
+  built for it, not tested here.
 - 128 GB of RAM or more.
 - An x86-64 CPU.  AVX2 (Intel from 2013 / Haswell on, any AMD Ryzen, Threadripper or EPYC) is the fast path; newer
   instructions (AVX-512, AVX-VNNI) are used where the CPU has them.  Older CPUs get an engine built for them, picked

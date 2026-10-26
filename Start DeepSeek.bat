@@ -49,15 +49,18 @@ if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" (
 )
 rem the card's VRAM (README.md, "What you need"):
 rem   under 20 GB: at most 48 GiB of the RAM arena pinned - a 12 GB RTX 3060 ran out of memory at its first request with
-rem            ~91 GiB pinned and answered with 8-48 GiB; on a 16 GB budget the cap costs ~2% (31.1 vs 31.8 tok/s)
-rem   under 14 GB: no drafter - its 2.4 GB of weights cost more expert cache than drafting saves
+rem            ~91 GiB pinned; on a 16 GB budget the cap costs ~2% (31.1 vs 31.8 tok/s)
+rem   under 14 GB: nothing pinned (the 3060 with 48 GiB pinned answered short prompts but a prompt read as a batch ran out
+rem            of memory - the PCIe path's buffers; unpinned it answers everything: 12 GB budget 16.9 tok/s) and no
+rem            drafter - its 2.4 GB of weights cost more expert cache than drafting saves
 rem   under 12 GB: probably does not fit (the dense half, KV and buffers need ~9 GB)
 set "VRAM_MIB="
 for /f "tokens=1" %%m in ('nvidia-smi --query-gpu^=memory.total --format^=csv^,noheader^,nounits -i %DS41_GPU% 2^>nul') do set "VRAM_MIB=%%m"
 if defined VRAM_MIB if %VRAM_MIB% LSS 20000 set STRATA_ARENA_PIN_GIB=48
 if defined VRAM_MIB if %VRAM_MIB% LSS 14000 (
-  echo This card has %VRAM_MIB% MiB of VRAM: running without the DSpark drafter ^(faster on cards under 14 GB^).
+  echo This card has %VRAM_MIB% MiB of VRAM: running without the DSpark drafter and the pinned RAM ^(they need room it lacks^).
   set STRATA_SERVE_DSPARK=
+  set STRATA_ARENA_PIN_GIB=1
 )
 if defined VRAM_MIB if %VRAM_MIB% LSS 11800 echo Under 12 GB of VRAM is untested: the model may not fit on this card.
 set STRATA_DSPARK_KEEP=tools/v41/serve/dspark_expert_counts.txt:64
