@@ -4,7 +4,7 @@
 // the server's job: tools/v41/serve/serve_ds41.py).
 //
 //   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
-//                 [--engram DIR:DIR:DIR] [--engram-hot hot.bin] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
+//                 [--engram DIR:DIR:DIR | --engram MODEL.gguf] [--engram-hot hot.bin] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
 //                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
@@ -498,7 +498,7 @@ int main(int argc, char ** argv) {
         ER = reach;
     }
     if (enc_skip) std::fprintf(stderr, "enc-skip: cut at layer %d (last kv source), replay window %lld (reach %lld)\n", CL, (long long) ER, (long long) reach);
-    if (a.engram.empty()) std::fprintf(stderr, "WARNING: no --engram dirs: the Engram add is skipped (not the real model)\n");
+    if (a.engram.empty()) std::fprintf(stderr, "WARNING: no --engram (the shard folder, or a GGUF with the tables inline): the Engram add is skipped (not the real model)\n");
 
     // ---- routed experts
     Ds41FileBlobs src(a.model);
@@ -2014,6 +2014,11 @@ int main(int argc, char ** argv) {
                 std::vector<int> spos;
                 if (bcap > 0) {   // the seed rows came off the batch (bcap_vh, its last bcap_got tokens): DSpark steps only
                     const int c0s = total - bcap_got;
+                    // upstream be8f039: the capture wrote the final batch's rows at the END of bcap_vh (row bcap_n - cn
+                    // + t); a final batch shorter than the tail fills only the last bcap_got of its bcap rows, so read
+                    // from there, not from row 0 (a short final batch seeded the drafter with zero rows: exact output,
+                    // lower acceptance).  bcap: this request's tail width (bcap_n is cleared after the feed)
+                    const size_t vh0 = (size_t) (bcap - bcap_got);
                     for (int i0 = c0s; ok && i0 < total; i0 += 16) {
                         if (stop_prefill()) { ok = false; break; }
                         const int m = std::min(16, total - i0);
@@ -2023,11 +2028,11 @@ int main(int argc, char ** argv) {
                         if (last) sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);   // the batch's last row
                         if (i0 == c0s) cur_seed_n = 0;
                         cur_seed.resize((size_t) (cur_seed_n + m) * 3 * n_embd);
-                        std::copy_n(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, (size_t) m * 3 * n_embd,
+                        std::copy_n(bcap_vh.data() + (vh0 + (size_t) (i0 - c0s)) * 3 * n_embd, (size_t) m * 3 * n_embd,
                                     cur_seed.data() + (size_t) cur_seed_n * 3 * n_embd);
                         cur_seed_n += m;
                         // dsp null: the drafter failed to load at this cache open (off for the run, see open_cache)
-                        if (dsp && !dsp->step(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
+                        if (dsp && !dsp->step(bcap_vh.data() + (vh0 + (size_t) (i0 - c0s)) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
                                               last ? sp_ids : sp_tmp, sp_conf)) {
                             ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
                         }

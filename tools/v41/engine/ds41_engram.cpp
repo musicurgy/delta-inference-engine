@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -272,8 +273,8 @@ bool Ds41Engram::read_raw(int e, uint32_t row, uint8_t * dst) const {
     const Table & T = tables_[(size_t) e];
     if ((int64_t) row >= T.rows) return false;
     const uint64_t srsz = (uint64_t) dim_ / 32;
-    return tread(T.fd_w, T.rm_w, dst, (size_t) dim_, T.off_w + (uint64_t) row * (uint64_t) dim_, T.dfd_w) == (ssize_t) dim_ &&
-           tread(T.fd_s, T.rm_s, dst + dim_, (size_t) srsz, T.off_s + (uint64_t) row * srsz, T.dfd_s) == (ssize_t) srsz;
+    return tread(T.fd_w, T.rm_w, dst, (size_t) dim_, T.off_w + (uint64_t) row * T.wst, T.dfd_w) == (ssize_t) dim_ &&
+           tread(T.fd_s, T.rm_s, dst + dim_, (size_t) srsz, T.off_s + (uint64_t) row * T.sst, T.dfd_s) == (ssize_t) srsz;
 }
 
 // Hot-set pack (written by ds41_engram_hot pack):
@@ -332,18 +333,74 @@ bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
     return true;
 }
 
+// The tables inline in a GGUF (nazeshinjite's ds4 GGUF: blk.{1,14}.engram_embd.weight, I8 [dim + dim/32, rows], the
+// last two tensors of the file).  Row r = DeepSeek's weight row r then its scale row r, byte for byte (checked against
+// the safetensors shards: the rebuilt file's SHA-256 matches the published one).
+bool Ds41Engram::open_gguf(const std::string & path, std::string & err) {
+    const uint64_t rsz = (uint64_t) dim_ + (uint64_t) dim_ / 32;
+    std::vector<uint64_t> offs;
+    try {
+        GgufFile f(path);   // the header only; the mapping is dropped at the end of the block
+        for (size_t e = 0; e < g_->engram_layers.size(); ++e) {
+            const std::string name = "blk." + std::to_string(g_->engram_layers[e]) + ".engram_embd.weight";
+            const TensorInfo * ti = nullptr;
+            for (const auto & t : f.tensors()) if (t.name == name) { ti = &t; break; }
+            if (!ti) { err = "engram: " + path + " has no " + name + " (a copy without its Engram tables?)"; return false; }
+            const uint64_t rows = (uint64_t) g_->engram_rows[e];
+            if (ti->type != 24 /* I8 */ || ti->shape.size() != 2 || ti->shape[0] != rsz || ti->shape[1] != rows) {
+                err = "engram: " + name + " in " + path + " has an unexpected type/shape";
+                return false;
+            }
+            if (f.data_start() + ti->offset + rows * rsz > f.file_size()) { err = "engram: " + path + " is truncated"; return false; }
+            offs.push_back(f.data_start() + ti->offset);
+        }
+    } catch (const std::exception & ex) {
+        err = "engram: cannot read " + path + ": " + ex.what();
+        return false;
+    }
+    for (size_t e = 0; e < offs.size(); ++e) {
+        Table t;
+        t.packed = true;
+        t.off_w = offs[e];
+        t.off_s = offs[e] + (uint64_t) dim_;
+        t.wst = t.sst = rsz;
+        t.rows = g_->engram_rows[e];
+        for (int k = 0; k < 2; ++k) {
+            const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
+            if (fd < 0) { err = "engram: cannot open " + path; return false; }
+            ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+            (k ? t.fd_s : t.fd_w) = fd;
+            (k ? t.rm_s : t.rm_w) = raw_map(path, fd);
+            if (engram_direct())
+                (k ? t.dfd_s : t.dfd_w) = ds41_sys::open(path.c_str(), O_RDONLY | O_DIRECT);
+        }
+        tables_.push_back(t);
+    }
+    return true;
+}
+
 bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err) {
     setup_hash(g);
     const int64_t nel = (int64_t) g.engram_layers.size();
+    std::string gguf;   // a .gguf entry: the tables are inline in that file
+    for (const auto & d : dirs) {
+        std::string ext = d.size() > 5 ? d.substr(d.size() - 5) : std::string();
+        for (char & c : ext) c = (char) std::tolower((unsigned char) c);
+        if (ext == ".gguf") { gguf = d; break; }
+    }
     std::string index;
     for (const auto & d : dirs) {
+        if (!gguf.empty()) break;
         index = slurp(d + "/model.safetensors.index.json");
         if (!index.empty()) break;
     }
-    if (index.empty()) { err = "engram: no model.safetensors.index.json in the given dirs"; return false; }
-    for (int64_t e = 0; e < nel; ++e) {
+    if (!gguf.empty() && !open_gguf(gguf, err)) return false;
+    if (gguf.empty() && index.empty()) { err = "engram: no model.safetensors.index.json in the given dirs"; return false; }
+    for (int64_t e = 0; gguf.empty() && e < nel; ++e) {
         const std::string base = "layers." + std::to_string(g.engram_layers[(size_t) e]) + ".engram.embed.";
         Table t;
+        t.wst = (uint64_t) dim_;
+        t.sst = (uint64_t) dim_ / 32;
         for (int k = 0; k < 2; ++k) {
             const std::string name = base + (k ? "scale" : "weight");
             const std::string file = json_str(index, name);
@@ -451,8 +508,8 @@ bool Ds41Engram::rows_reference(int64_t pos0, int n, std::vector<std::vector<flo
             const Table & T = tables_[(size_t) e];
             const int64_t r = ids[(size_t) j];
             if (r < 0 || r >= T.rows ||
-                ds41_sys::pread(T.fd_w, w, (size_t) dim_, (int64_t) (T.off_w + (uint64_t) r * (uint64_t) dim_)) != (ssize_t) dim_ ||
-                ds41_sys::pread(T.fd_s, s, (size_t) (dim_ / 32), (int64_t) (T.off_s + (uint64_t) r * (uint64_t) (dim_ / 32))) != (ssize_t) (dim_ / 32)) {
+                ds41_sys::pread(T.fd_w, w, (size_t) dim_, (int64_t) (T.off_w + (uint64_t) r * T.wst)) != (ssize_t) dim_ ||
+                ds41_sys::pread(T.fd_s, s, (size_t) (dim_ / 32), (int64_t) (T.off_s + (uint64_t) r * T.sst)) != (ssize_t) (dim_ / 32)) {
                 bad.fetch_add(1);
                 continue;
             }
@@ -508,6 +565,12 @@ void Ds41Engram::drop_cache() {
     // Evict in 4 GiB windows: one giant fadvise(0,0,DONTNEED) over a 94 GB file leaves the page cache in a state that
     // makes the next reads pathologically slow (measured 40K reads/s vs 158K/s after windowed eviction), so windows it is.
     for (const Table & t : tables_) {
+        if (t.packed) {   // a GGUF: the table's own byte range only (the rest of the file is the model)
+            const uint64_t win = 4ull << 30, end = t.off_w + (uint64_t) t.rows * t.wst;
+            for (uint64_t o = t.off_w; o < end; o += win)
+                ds41_sys::posix_fadvise(t.fd_w, (int64_t) o, (int64_t) std::min(win, end - o), POSIX_FADV_DONTNEED);
+            continue;
+        }
         const int fd = t.fd_w >= 0 ? t.fd_w : t.fd_s;
         ds41_sys::Stat st;
         if (fd < 0 || ds41_sys::fstat(fd, &st) != 0) continue;
@@ -587,15 +650,16 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
         size_t i = 0;
         while (i < u) {
             if ((uint64_t) uq[i] >= (uint64_t) T.rows || hit[i]) { ++i; continue; }   // out of range (bad set) / cached
-            const uint64_t pw = bw + (uint64_t) uq[i] * (uint64_t) dim;
+            const uint64_t pw = bw + (uint64_t) uq[i] * T.wst;
             const uint64_t page = pw & ~(uint64_t) 4095;
             size_t j = i + 1;
             while (j < u && (uint64_t) uq[j] < (uint64_t) T.rows && !hit[j] &&
-                   ((bw + (uint64_t) uq[j] * (uint64_t) dim) & ~(uint64_t) 4095) == page) ++j;
-            const uint64_t w0 = bw + (uint64_t) uq[i] * (uint64_t) dim;
-            const uint64_t w1 = bw + (uint64_t) uq[j - 1] * (uint64_t) dim + (uint64_t) dim;
-            const uint64_t s0 = bs + (uint64_t) uq[i] * (uint64_t) srsz;
-            const uint64_t s1 = bs + (uint64_t) uq[j - 1] * (uint64_t) srsz + (uint64_t) srsz;
+                   ((bw + (uint64_t) uq[j] * T.wst) & ~(uint64_t) 4095) == page) ++j;
+            // packed (GGUF) rows: one span holds the weights and the scales (len_s = 0: no second read)
+            const uint64_t w0 = bw + (uint64_t) uq[i] * T.wst;
+            const uint64_t w1 = bw + (uint64_t) uq[j - 1] * T.wst + (uint64_t) (T.packed ? dim + srsz : dim);
+            const uint64_t s0 = bs + (uint64_t) uq[i] * T.sst;
+            const uint64_t s1 = T.packed ? s0 : bs + (uint64_t) uq[j - 1] * T.sst + (uint64_t) srsz;
             b->groups.push_back(ReadGroup{ e, w0, s0, (uint32_t) (w1 - w0), (uint32_t) (s1 - s0), (uint32_t) i, (uint32_t) (j - i) });
             i = j;
         }
@@ -635,7 +699,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                 const Table & T = tables_[(size_t) G.e];
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
                     tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w, T.dfd_w) != (ssize_t) G.len_w ||
-                    tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s, T.dfd_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); bp->one_done(G.e); continue; }
+                    (G.len_s && tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s, T.dfd_s) != (ssize_t) G.len_s)) { bp->bad.fetch_add(1); bp->one_done(G.e); continue; }
                 bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
                 const auto & uq = bp->uniq[(size_t) G.e];
                 const auto & pk = bp->packed[(size_t) G.e];
@@ -645,8 +709,8 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                 for (uint32_t k = 0; k < G.count; ++k) {
                     const uint32_t uu = G.u0 + k;
                     const uint32_t row = uq[uu];
-                    const uint8_t * w = bw + (uint64_t) (row - r0) * (uint64_t) dim;
-                    const uint8_t * s = bs + (uint64_t) (row - r0) * (uint64_t) srsz;
+                    const uint8_t * w = bw + (uint64_t) (row - r0) * T.wst;
+                    const uint8_t * s = T.packed ? w + dim : bs + (uint64_t) (row - r0) * T.sst;
                     if (cache_cap_ && cache_used_ < cache_cap_) {   // keep the raw row (fill-until-full)
                         std::lock_guard<std::mutex> lk(cache_mu_);
                         if (cache_used_ < cache_cap_ && cache_idx_.emplace(((uint64_t) G.e << 32) | row, (uint32_t) cache_used_).second) {

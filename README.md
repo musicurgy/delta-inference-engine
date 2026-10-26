@@ -15,7 +15,7 @@ This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whi
 1. Get this folder (**Code > Download ZIP**, or
    `git clone -c core.longpaths=true https://github.com/musicurgy/delta-inference-engine C:\AI\Delta`) somewhere with
    a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 128 GB+ of RAM,
-   ~560 GB free on an NVMe drive.
+   ~385 GB free on an NVMe drive.
 2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
    asks before anything big:
    - Python and its packages (no Python 3.10-3.12 on the PC: it offers to install python.org's Python 3.11 with
@@ -23,14 +23,14 @@ This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whi
    - the engine: the prebuilt one for your CPU from the
      [Releases page](https://github.com/musicurgy/delta-inference-engine/releases) (under 1 GB, no compiler needed) - or it builds
      it, if you have Visual Studio Build Tools, the CUDA Toolkit and Git,
-   - the model files from Hugging Face (~565 GB of downloads, checked against their published SHA-256; it checks the
+   - the model files from Hugging Face (~375 GB of downloads, checked against their published SHA-256; it checks the
      free space first; resumable - just start it again if it stops).
 3. Then the server starts and the chat page opens in your browser. Apps use `http://127.0.0.1:8080/v1` (OpenAI) or
    `/v1/messages` (Anthropic), any API key.
 
 Every later start: double-click `Start DeepSeek.bat` again - it finds everything in place and starts the server
-(ready in about a minute). Everything else in this folder is the engine's source, upstream's files and tools - you do
-not need to open them.
+(ready in about a minute). To run another quant (see "Other quants" below), double-click **`Choose Model.bat`**.
+Everything else in this folder is the engine's source, upstream's files and tools - you do not need to open them.
 
 ## Speed
 
@@ -111,18 +111,19 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 
 The IQ2_XS, IQ2_XXS and IQ1_M builds of
 [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
-run in this engine. It reads its own file layout, so a script builds one: it keeps the default file's dense weights,
-Engram and metadata and takes GSQ's routed experts, streamed from Hugging Face (every shard SHA-256-checked; the file
-is only written into place when all match):
+run in this engine. **`Choose Model.bat`** lists the models in your model folder and the ones not made yet, builds
+the one you pick and saves your choice (`model-choice.txt`); the next start loads it.  The build keeps the default
+file's dense weights and metadata and takes GSQ's routed experts, streamed from Hugging Face (every shard
+SHA-256-checked; the file is only written into place when all match; 20-30 min at 100 MB/s).  By hand:
 
 ```bat
-.venv\Scripts\python tools\v41\gsq_stream_merge.py --ours models\ds4-q2-slim.gguf --build IQ2_XS --out models\ds41-gsq-iq2_xs.gguf
+.venv\Scripts\python tools\v41\gsq_stream_merge.py --ours models\DeepSeek-V4.1-Flash-1017-Q2.gguf --build IQ2_XS --out models\ds41-gsq-iq2_xs.gguf
 ```
 
-(`--build IQ2_XXS` or `IQ1_M` for the others; 20-30 min each at 100 MB/s.)  Then point `"-m"` in
-`tools/v41/serve/ds41-windows.json` at the new file.  Measured here, exact routing, against DeepSeek's API:
+(`--build IQ2_XXS` or `IQ1_M` for the others), then put the file's name in `model-choice.txt`.  Every model reads its
+Engram tables from the ds4 Q2 GGUF, so keep that file.  Measured here, exact routing, against DeepSeek's API:
 
-| | file | general | code + maths | writing, 192 / 128 GB RAM | notes |
+| | size (without Engram) | general | code + maths | writing, 192 / 128 GB RAM | notes |
 |---|---|---|---|---|---|
 | default (ds4 Q2) | 163 GB | 91.5% | 93.0% | 41 / 33 tok/s | |
 | GSQ IQ2_XS | 159 GB | 90.0% | 92.9% | 38 / 26 tok/s | answered our task questions as well as the default |
@@ -150,7 +151,7 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
   instructions (AVX-512, AVX-VNNI) are used where the CPU has them.  Older CPUs get an engine built for them, picked
   automatically: with AVX but not AVX2 (Sandy / Ivy Bridge Xeons) 38 tok/s, with neither (e.g. Westmere Xeons) 17 -
   measured on this PC with the newer kernels switched off, against 40 with AVX2.
-- An NVMe SSD with ~560 GB free during setup and ~365 GB after.
+- An NVMe SSD with ~385 GB free during setup and ~371 GB after (a GSQ build adds its 125-159 GB).
 - Python 3.10, 3.11 or 3.12 (3.11 recommended) - `Start DeepSeek.bat` offers to install it.
 - To build (not needed with the prebuilt engine from the Releases page):
   - Visual Studio 2019 or 2022 (Build Tools are enough) with "Desktop development with C++";
@@ -173,9 +174,10 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
 4. **Model files:** `setup-ds41-models.bat` (resumable; every large file is checked against its published SHA-256):
    - the ds4 Q2 GGUF from
      [nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF)
-     (366 GB), slimmed to 163 GB; the download is then removed;
-   - the two Engram shards, the tokenizer and config from
-     [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (~203 GB);
+     (366 GB): the model, and DeepSeek's Engram tables inline (byte for byte the official ones), which the engine
+     reads straight from it;
+   - the tokenizer, config and shard index from
+     [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (a few MB);
    - the speculative-decoding drafter (the biggest single speed-up), built from DeepSeek's own MTP heads in the same
      repository (three shards, 7.9 GB, removed afterwards) and shrunk to 4.2 GB. The drafter only proposes tokens;
      the main model checks every one.
@@ -185,6 +187,7 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
 
 - **One setting file:** `Start DeepSeek.bat` sets everything. Each line in it carries a short note.
 - **Paths:** they live in `ds41-paths.bat`.
+- **Model:** the default ds4 Q2, or the one `Choose Model.bat` picked (saved in `model-choice.txt`).
 - **RAM:** the memory used for experts is sized from your installed RAM at every start: total minus 38 GiB, at most
   140 GiB. `DS41_ARENA_GIB` or `DS41_RAM_RESERVE_GIB` in `ds41-paths.bat` override it.
 - **The first minutes after a reboot are slower** (measured: ~13 instead of ~25 tok/s on a cold start): the model's

@@ -12,8 +12,11 @@ the portable one (build-ds41-portable\, any CPU with AVX2: Intel 2013+ Haswell, 
 AVX but not AVX2 (build-ds41-compat-avx\: Sandy / Ivy Bridge) and one for the oldest (build-ds41-compat\, any x86-64
 CPU with SSE4.2: Intel 2008+; slower).  Each records the level it needs
 in cpu-level.txt; a build without one is taken as this PC's own (older builds) or as its folder's floor.  An AVX2 build
-on a CPU without AVX2 stops at its first AVX2 instruction (Windows: "illegal instruction", exit code 0xC000001D)."""
+on a CPU without AVX2 stops at its first AVX2 instruction (Windows: "illegal instruction", exit code 0xC000001D).
+A build from before 2026-10-27 cannot read the Engram tables from the model GGUF (the current setup's layout): it is
+skipped as out of date, so the first start offers the new one."""
 import ctypes
+import mmap
 import os
 import sys
 
@@ -22,6 +25,8 @@ RANK = {"sse": 0, "avx": 1, "avx2": 2, "avx512": 3}
 # folder -> the level it needs when it has no cpu-level.txt
 BUILDS = [("build-ds41", None), ("build-ds41-portable", "avx2"), ("build-ds41-compat-avx", "avx"),
           ("build-ds41-compat", "sse")]
+# text only an engine that reads Engram from the model GGUF contains (open_gguf's message in ds41_engram.cpp)
+ENGINE_MARK = b"a copy without its Engram tables"
 
 
 def level():
@@ -70,6 +75,18 @@ def needs(folder, floor):
     return floor or "sse"
 
 
+def up_to_date(folder):
+    """does the build's engine read the Engram tables from the model GGUF (this version's model layout)?"""
+    exe = os.path.join(ROOT, folder, "ds41_generate.exe")
+    if not os.path.exists(exe):
+        exe = exe[:-4]
+    try:
+        with open(exe, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            return mm.find(ENGINE_MARK) >= 0
+    except (OSError, ValueError):
+        return False
+
+
 def release_zip():
     """the prebuilt engine for this CPU on the Releases page"""
     r = RANK[level()]
@@ -81,14 +98,20 @@ def release_zip():
 def pick_build():
     """(folder, None) of the first build this CPU can run, or (None, why)"""
     cpu = level()
-    found = []
+    found, old = [], []
     for folder, floor in BUILDS:
         n = needs(folder, floor)
         if n is None:
             continue
+        if not up_to_date(folder):
+            old.append(folder)
+            continue
         found.append(f"{folder} (needs {n})")
         if RANK[cpu] >= RANK[n]:
             return folder, None
+    if not found and old:
+        return None, (f"the engine in {', '.join(old)} is from an older version of this project (it cannot read the\n"
+                      f"Engram tables from the model file): it needs the new one.")
     if not found:
         return None, "no engine build here yet"
     return None, (f"this CPU supports {cpu.upper()} only, and the engine builds here need more: {', '.join(found)}.\n"

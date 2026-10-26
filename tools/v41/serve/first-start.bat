@@ -118,13 +118,12 @@ if not defined DS41_MODELS (
 )
 set "M=%DS41_MODELS:/=\%"
 set "NEED="
-if not exist "%M%\ds4-q2-slim.gguf" (
+rem the main model: the ds4 Q2 GGUF, checked (.ok) - or an install from before 2026-10-27 (slim copy + Engram shards)
+set "OLD="
+if exist "%M%\ds4-q2-slim.gguf" if exist "%M%\engram\model-00048-of-00048.safetensors" set "OLD=1"
+if not defined OLD if not exist "%M%\DeepSeek-V4.1-Flash-1017-Q2.gguf.ok" (
   set "NEED=1"
-  echo   missing: the main model, ds4-q2-slim.gguf ^(downloads 366 GB, keeps 163 GB^)
-)
-if not exist "%M%\engram\model-00048-of-00048.safetensors" (
-  set "NEED=1"
-  echo   missing: the Engram tables ^(DeepSeek's shards 47-48, 203 GB^)
+  echo   missing: the main model, DeepSeek-V4.1-Flash-1017-Q2.gguf ^(366 GB, with its Engram tables^)
 )
 if not exist "%M%\tokenizer\vocab.json" set "NEED=1"
 if not exist "%M%\V41-1017-MTP-iq2xxs.gguf" (
@@ -135,8 +134,8 @@ if not defined NEED exit /b 0
 echo The model files above go to %M%
 echo   ^(DS41_MODELS in ds41-paths.bat - put it on your fastest NVMe drive^).  They come from Hugging Face: DeepSeek's
 echo   official repository and a Q2 GGUF of it; every large file is checked against its published SHA-256.  The first
-echo   setup needs ~560 GB free while it runs and keeps ~365 GB.  It can take hours; if it stops, start again and it
-echo   goes on where it was.
+echo   setup downloads ~375 GB, needs ~385 GB free while it runs and keeps ~371 GB.  It can take hours; if it stops,
+echo   start again and it goes on where it was.
 choice /c YN /m "Download and prepare them now"
 if errorlevel 2 exit /b 1
 call "%ROOT%\setup-ds41-models.bat"

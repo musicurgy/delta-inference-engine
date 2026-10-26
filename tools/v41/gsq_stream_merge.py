@@ -7,7 +7,7 @@ copied from our file first.
 Why: it needs half the disk of downloading the shards first (~130-160 GB instead of twice that), and a damaged
 download cannot slip through (the merged file is only renamed into place when every shard's hash matches).
 
-    gsq_stream_merge.py --ours models/ds4-q2-slim.gguf --build IQ2_XS --out models/ds41-gsq-iq2_xs.gguf
+    gsq_stream_merge.py --ours models/DeepSeek-V4.1-Flash-1017-Q2.gguf --build IQ2_XS --out models/ds41-gsq-iq2_xs.gguf
 """
 import argparse
 import hashlib
@@ -67,6 +67,8 @@ def main():
     al = ours.alignment
     infos, cur, jobs = [], 0, [[] for _ in heads]   # jobs[shard] = [(shard start, nbytes, output data offset)]
     for (n, d, t, off) in ours.tensors:
+        if ".engram_embd." in n:   # the Engram tables stay in the main GGUF (the engine's --engram reads them)
+            continue
         if M.is_expert(n):
             i, gd, gt, s0 = src[n]
             assert gd == d, n

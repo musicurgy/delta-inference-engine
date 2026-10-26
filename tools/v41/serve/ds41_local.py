@@ -5,6 +5,10 @@
 
 * ${XO_ROOT} (this repository) and ${DS41_MODELS} (the folder with the model files, default: models/ in this repository;
   set it in ds41-paths.bat) are expanded in every string, as is any other %VAR% / ${VAR} the environment has.
+* ${DS41_GGUF} / ${DS41_ENGRAM}: the main model and where the engine reads its Engram tables - both the ds4 Q2 GGUF
+  (it carries them), or in an install from before 2026-10-27 the slim copy and DeepSeek's shards in engram/.  Set
+  DS41_GGUF, or pick a model with Choose Model.bat (model-choice.txt), to run a GSQ build; its Engram still comes from
+  the ds4 Q2 GGUF.
 * "--arena-gib" "auto": the pinned/locked RAM arena that holds the routed experts the GPU cache cannot.  It is sized
   from the installed RAM: total - DS41_RAM_RESERVE_GIB (default 38 GiB: the engine's own ~24 GiB outside the arena -
   dense half, KV, prefill buffers, Engram hot set - plus ~14 GiB for Windows and other programs), capped at 140 GiB
@@ -64,6 +68,26 @@ def expand(cfg):
     """The config with this machine's paths and arena size (a new dict; IN is not changed)."""
     os.environ.setdefault("XO_ROOT", ROOT.replace("\\", "/"))
     os.environ.setdefault("DS41_MODELS", os.path.join(ROOT, "models").replace("\\", "/"))
+    m = os.environ["DS41_MODELS"].replace("\\", "/").rstrip("/")
+    full = m + "/DeepSeek-V4.1-Flash-1017-Q2.gguf"
+    old = not os.path.exists(full) and os.path.exists(m + "/ds4-q2-slim.gguf") and \
+        os.path.exists(m + "/engram/model-00048-of-00048.safetensors")
+    # model-choice.txt (Choose Model.bat, pick_model.py): another model to load - a file in the model folder or a full
+    # path.  DS41_GGUF in the environment wins over it.
+    if "DS41_GGUF" not in os.environ:
+        try:
+            with open(os.path.join(ROOT, "model-choice.txt"), encoding="utf-8") as f:
+                pick = f.readline().strip().strip('"')
+        except OSError:
+            pick = ""
+        if pick:
+            p = (pick if os.path.isabs(pick) else m + "/" + pick).replace("\\", "/")
+            if os.path.exists(p):
+                os.environ["DS41_GGUF"] = p
+            else:
+                print(f"ds41_local: model-choice.txt names {pick}, which is not in {m} - loading the default")
+    os.environ.setdefault("DS41_GGUF", m + "/ds4-q2-slim.gguf" if old else full)
+    os.environ.setdefault("DS41_ENGRAM", m + "/engram" if old else full)   # also when DS41_GGUF is a GSQ build
     # ${DS41_BUILD}: the first build this CPU can run - this PC's own (build-ds41.bat), the portable one (AVX2), the one
     # for older CPUs (cpu_level.py)
     if "DS41_BUILD" not in os.environ:
@@ -123,7 +147,9 @@ def main():
     paths = [cfg.get("exe"), cfg.get("tokenizer")] + [a[i + 1] for i, x in enumerate(a[:-1]) if x in ("-m", "--rank")]
     paths += [d for i, x in enumerate(a[:-1]) if x == "--engram" for d in a[i + 1].split(";")]   # a list of folders
     missing = [p for p in paths if p and not os.path.exists(p)]
-    print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB; models in {os.environ['DS41_MODELS']}")
+    model = a[a.index("-m") + 1] if "-m" in a else "?"
+    print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB; model {os.path.basename(model)} "
+          f"(Choose Model.bat picks another); models in {os.environ['DS41_MODELS']}")
     for p in missing:
         print(f"ds41_local: MISSING {p}  (see README.md, 'Setup')")
     sys.exit(1 if missing else 0)

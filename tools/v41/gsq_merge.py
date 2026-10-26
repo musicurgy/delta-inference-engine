@@ -8,7 +8,7 @@ tokenizer, dense tensors, Engram projections) and takes only the 120 `blk.N.ffn_
 their shards (IQ1_M / IQ2_XXS / IQ2_XS per layer; gate and up always share a type).  Our loader takes any uniform
 expert type per role, so no engine change is needed to load it.
 
-    gsq_merge.py --ours models/ds4-q2-slim.gguf --gsq <shards>/...-IQ2_XXS-00001-of-00004.gguf [...more shards]
+    gsq_merge.py --ours models/DeepSeek-V4.1-Flash-1017-Q2.gguf --gsq <shards>/...-IQ2_XXS-00001-of-00004.gguf [...more shards]
                  --out models/ds41-gsq-iq2_xxs.gguf [--dry-run]
     (gsq_stream_merge.py does the same without downloading the shards first)
 """
@@ -118,6 +118,8 @@ def main():
     plan = []   # (name, dims, type, source Gguf, source offset)
     swapped = 0
     for (n, d, t, off) in ours.tensors:
+        if ".engram_embd." in n:   # the Engram tables stay in the main GGUF (the engine's --engram reads them)
+            continue
         if is_expert(n):
             if n not in gsq:
                 sys.exit(f"GSQ shards lack {n}")

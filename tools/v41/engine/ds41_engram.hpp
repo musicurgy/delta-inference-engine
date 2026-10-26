@@ -1,7 +1,8 @@
 // tools/v41/engine/ds41_engram.hpp - DeepSeek-V4.1 Engram: the n-gram hash (model.py / engram.py NgramHashState)
 // and the row reader.  The tables are NOT copied anywhere: rows are read straight from the HF safetensors shards
 // (layers.{1,14}.engram.embed.weight F8_E4M3 [rows, 256] + .scale F8_E8M0 [rows, 8]), two small preads per row,
-// in parallel.  A row dequantizes to 256 floats = fp8 * 2^(e8m0 - 127) per 32 (model.py ParallelEngramEmbedding;
+// in parallel - or from a GGUF that carries them inline (blk.{1,14}.engram_embd.weight, I8 [264, rows]: each row the
+// same 256 weight bytes then the 8 scale bytes, one pread per row; nazeshinjite's ds4 GGUF is byte-identical).  A row dequantizes to 256 floats = fp8 * 2^(e8m0 - 127) per 32 (model.py ParallelEngramEmbedding;
 // exactly representable in bf16, so model.py's bf16 cast is a no-op on them).
 //
 // rows()/start() are the fast batch reader: hashes are deduped and sorted by row id, so per row the two preads come out
@@ -30,8 +31,9 @@ class Ds41Engram {
 public:
     struct RawMap;   ///< a fragmented table file read straight from its block device (see ds41_engram.cpp)
     ~Ds41Engram();
-    /// dirs: where the shards are (the index json is looked up in each, the shard files too).  Loads the hot set too when
-    /// one is given (set_hot_path, else STRATA_ENGRAM_HOT); a hot set that fails its checks is skipped with a warning.
+    /// dirs: where the shards are (the index json is looked up in each, the shard files too), or a .gguf file with the
+    /// tables inline (the model file itself).  Loads the hot set too when one is given (set_hot_path, else
+    /// STRATA_ENGRAM_HOT); a hot set that fails its checks is skipped with a warning.
     bool open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err);
     /// The hash state only (no tables, no threads): enough for hash() - used by the offline hot-set tool.
     void setup_hash(const Ds41Geometry & g);
@@ -78,9 +80,14 @@ public:
     size_t hot_rows() const { return hot_keys_.size(); }
 
 private:
-    struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0; int64_t rows = 0;
+    // Row r's weight bytes are at off_w + r * wst, its scale bytes at off_s + r * sst.  Safetensors: two arrays (wst =
+    // dim, sst = dim/32).  GGUF (packed): one array of whole rows (wst = sst = dim + dim/32, off_s = off_w + dim), so a
+    // read group is one pread; fd_s is a second handle on the same file.
+    struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0, wst = 0, sst = 0; int64_t rows = 0;
+                   bool packed = false;
                    std::shared_ptr<RawMap> rm_w, rm_s;
                    int dfd_w = -1, dfd_s = -1; };   // STRATA_ENGRAM_DIRECT: unbuffered handles for the row reads
+    bool open_gguf(const std::string & path, std::string & err);
     struct ReadGroup;               // one coalesced pread (defined in the .cpp)
     const Ds41Geometry * g_ = nullptr;
     std::vector<Table> tables_;

@@ -1,8 +1,8 @@
 @echo off
 rem Download and prepare the model files into DS41_MODELS (ds41-paths.bat).  "Start DeepSeek.bat" runs this for you when
 rem files are missing.  Safe to re-run: finished steps are skipped, the Hugging Face downloads resume, and every large
-rem file is checked against the SHA-256 its repository publishes before it is used.  Downloads ~565 GB; needs ~560 GB
-rem free while it runs and ~365 GB when done.  Needs .venv (README.md, Setup step 1) and the build (step 2).
+rem file is checked against the SHA-256 its repository publishes before it is used.  Downloads ~375 GB; needs ~385 GB
+rem free while it runs and ~371 GB when done.  Needs .venv (README.md, Setup step 1) and the build (step 2).
 setlocal
 cd /d "%~dp0"
 call "%~dp0ds41-paths.bat"
@@ -18,52 +18,51 @@ echo Model folder: %M%
 rem stop before a download fills the drive (the downloader only warns): what is still to do vs the free space
 "%PY%" tools\v41\setup_space.py "%M%" || exit /b 1
 set "DS=deepseek-ai/DeepSeek-V4.1-Flash-1017"
+set "Q2=DeepSeek-V4.1-Flash-1017-Q2.gguf"
 
-rem 1-2. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 GB, checked), then a copy without its
-rem      inline Engram tables (163 GB; the engine reads Engram from DeepSeek's own shards, step 3) - it loads in ~1 min
-rem      instead of ~6.  The 366 GB download is deleted once the copy is in place.
-if exist "%M%\ds4-q2-slim.gguf" goto engram
-"%HF%" download nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF DeepSeek-V4.1-Flash-1017-Q2.gguf --local-dir "%M%\download" || exit /b 1
-"%PY%" tools\v41\hf_verify.py --repo nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF --dir "%M%\download" DeepSeek-V4.1-Flash-1017-Q2.gguf || exit /b 1
-"%PY%" tools\v41\gguf_drop_tensors.py "%M%\download\DeepSeek-V4.1-Flash-1017-Q2.gguf" "%M%\ds4-q2-slim.gguf.part" || exit /b 1
-move /y "%M%\ds4-q2-slim.gguf.part" "%M%\ds4-q2-slim.gguf" >nul || exit /b 1
-rd /s /q "%M%\download"
-echo Done: ds4-q2-slim.gguf (the 366 GB download was removed).
+rem 1. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 GB, checked).  It also carries the
+rem    Engram tables - DeepSeek's own bytes - and the engine reads them straight from it.  (An install from before
+rem    2026-10-27 has ds4-q2-slim.gguf + DeepSeek's Engram shards in engram\ instead: it keeps working as it is.)
+if exist "%M%\ds4-q2-slim.gguf" if exist "%M%\engram\model-00048-of-00048.safetensors" goto small
+if exist "%M%\%Q2%.ok" goto small
+"%HF%" download nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %Q2% --local-dir "%M%" || exit /b 1
+"%PY%" tools\v41\hf_verify.py --repo nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF --dir "%M%" %Q2% || exit /b 1
 
-:engram
-rem 3. Engram: the two official shards that hold it (~203 GB, checked), plus the index, config and tokenizer
-rem    (shards already there - an earlier setup - are checked first, and downloaded again only if they differ)
-if not exist "%M%\engram\model-00047-of-00048.safetensors" goto engram_get
-if not exist "%M%\engram\model-00048-of-00048.safetensors" goto engram_get
-"%PY%" tools\v41\hf_verify.py --repo %DS% --dir "%M%\engram" model-00047-of-00048.safetensors model-00048-of-00048.safetensors && goto tok
-:engram_get
-"%HF%" download %DS% model-00047-of-00048.safetensors model-00048-of-00048.safetensors model.safetensors.index.json config.json tokenizer.json tokenizer_config.json --local-dir "%M%\engram" || exit /b 1
-"%PY%" tools\v41\hf_verify.py --repo %DS% --dir "%M%\engram" model-00047-of-00048.safetensors model-00048-of-00048.safetensors || exit /b 1
-
-:tok
-rem 4. The tokenizer tables the server reads
-if not exist "%M%\tokenizer\vocab.json" (
-  "%PY%" tools\v41\serve\export_tokenizer.py "%M%\engram" "%M%\tokenizer" || exit /b 1
+:small
+rem 2. DeepSeek's small files: the tokenizer, the config and the shard index (the drafter step reads them too)
+set "D=%M%\deepseek"
+if exist "%M%\engram\tokenizer.json" set "D=%M%\engram"
+set "GET="
+for %%f in (model.safetensors.index.json config.json tokenizer.json tokenizer_config.json) do if not exist "%D%\%%f" set "GET=1"
+if defined GET (
+  "%HF%" download %DS% model.safetensors.index.json config.json tokenizer.json tokenizer_config.json --local-dir "%D%" || exit /b 1
 )
 
-rem 5. The DSpark drafter (speculative decoding: the biggest single speed-up; the main model checks every drafted token,
+rem 3. The tokenizer tables the server reads
+if not exist "%M%\tokenizer\vocab.json" (
+  "%PY%" tools\v41\serve\export_tokenizer.py "%D%" "%M%\tokenizer" || exit /b 1
+)
+
+rem 4. The DSpark drafter (speculative decoding: the biggest single speed-up; the main model checks every drafted token,
 rem    so the output is the main model's own).  DeepSeek's MTP heads come from three small official shards (7.9 GB,
 rem    checked), are repacked into a sidecar GGUF, and its experts shrunk to IQ2_XXS (4.2 GB, ~5 min), which leaves more
 rem    VRAM for the main model.  The three shards are deleted afterwards.
 if exist "%M%\V41-1017-MTP-iq2xxs.gguf" goto done
 if exist "%M%\V41-1017-MTP.gguf" goto requant
-"%HF%" download %DS% model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors --local-dir "%M%\engram" || exit /b 1
-"%PY%" tools\v41\hf_verify.py --repo %DS% --dir "%M%\engram" model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors || exit /b 1
-set "V41_SRC=%M%\engram"
+"%HF%" download %DS% model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors --local-dir "%D%" || exit /b 1
+"%PY%" tools\v41\hf_verify.py --repo %DS% --dir "%D%" model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors || exit /b 1
+set "V41_SRC=%D%"
 set "V41_SRC_NAME=DeepSeek V4.1 Flash 1017"
 set "V41_SRC_URL=https://huggingface.co/%DS%"
 "%PY%" tools\v41\v41_sidecar.py --out "%M%\V41-1017-MTP.gguf.part" --no-vision || exit /b 1
 move /y "%M%\V41-1017-MTP.gguf.part" "%M%\V41-1017-MTP.gguf" >nul || exit /b 1
-for %%s in (44 45 46) do del /q "%M%\engram\model-000%%s-of-00048.safetensors" "%M%\engram\model-000%%s-of-00048.safetensors.ok" 2>nul
+for %%s in (44 45 46) do del /q "%D%\model-000%%s-of-00048.safetensors" "%D%\model-000%%s-of-00048.safetensors.ok" 2>nul
 
 :requant
-set "REQ=build-ds41\v41_sidecar_requant.exe"
-if not exist "%REQ%" set "REQ=build-ds41-portable\v41_sidecar_requant.exe"
+rem the engine build this CPU runs (cpu_level.py: this PC's own build, else the portable or an older-CPU one)
+set "REQ="
+for /f "usebackq delims=" %%b in (`""%PY%" tools\v41\serve\cpu_level.py --pick-build"`) do set "REQ=%%b\v41_sidecar_requant.exe"
+if not defined REQ set "REQ=build-ds41\v41_sidecar_requant.exe"
 if not exist "%REQ%" (
   echo No v41_sidecar_requant.exe - build first ^(build-ds41.bat^), then run this again.
   exit /b 1

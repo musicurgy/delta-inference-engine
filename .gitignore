@@ -89,3 +89,6 @@ out/
 tools/v41/serve/local/
 models/
 *.key
+
+# the model "Choose Model.bat" picked (this PC only)
+/model-choice.txt

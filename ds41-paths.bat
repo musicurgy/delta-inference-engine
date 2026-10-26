@@ -1,6 +1,6 @@
 @echo off
 rem ---- The settings for this PC (the launcher and setup-ds41-models.bat read them) ----------------------------
-rem DS41_MODELS: the folder that holds (or will hold) the model files - on your fastest NVMe drive, ~360 GB.
+rem DS41_MODELS: the folder that holds (or will hold) the model files - on your fastest NVMe drive, ~371 GB.
 rem   Default: the "models" folder in this repository.  Change it here, or set an environment variable of the
 rem   same name (that wins).  Example: set "DS41_MODELS=D:/DeepSeek-V4.1"
 if not defined DS41_MODELS set "DS41_MODELS=%~dp0models"
