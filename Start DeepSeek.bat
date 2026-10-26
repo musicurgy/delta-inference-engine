@@ -92,6 +92,8 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
+rem the Windows settings that make it faster, if any is off (read only: README.md, "Windows settings for speed")
+".venv\Scripts\python.exe" tools\v41\serve\windows_tips.py
 rem --open: the chat page opens in the browser once the model is ready (API clients use http://127.0.0.1:8080/v1)
 ".venv\Scripts\python.exe" tools\v41\serve\serve_ds41.py --engine strata --config tools\v41\serve\local\ds41-windows.json --port 8080 --open
 pause

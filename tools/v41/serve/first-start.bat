@@ -15,6 +15,14 @@ if errorlevel 1 (
   echo   https://www.nvidia.com/Download/index.aspx
   exit /b 1
 )
+rem the engine is built with CUDA 13, which needs driver 580 or newer (an older one fails later with a CUDA error)
+set "DRV="
+for /f "tokens=1 delims=." %%v in ('nvidia-smi --query-gpu^=driver_version --format^=csv^,noheader 2^>nul') do if not defined DRV set "DRV=%%v"
+if defined DRV if %DRV% LSS 580 (
+  echo The NVIDIA driver is version %DRV%; this needs 580 or newer ^(CUDA 13^). Update it, then start again:
+  echo   https://www.nvidia.com/Download/index.aspx
+  exit /b 1
+)
 
 rem ---- 2. the Python environment (.venv): the server, the downloader, cmake and ninja for the build
 if exist ".venv\Scripts\python.exe" if exist ".venv\Scripts\hf.exe" goto build
