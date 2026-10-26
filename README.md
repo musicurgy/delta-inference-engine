@@ -32,6 +32,11 @@ Every later start: double-click `Start DeepSeek.bat` again - it finds everything
 (ready in about a minute). To run another quant (see "Other quants" below), double-click **`Choose Model.bat`**.
 Everything else in this folder is the engine's source, upstream's files and tools - you do not need to open them.
 
+**Something wrong?** Double-click **`Start DeepSeek (debug).bat`** instead. It checks the PC and the install (a
+PASS / FAIL list), starts DeepSeek in a second window with everything it prints saved, and when you close that window
+it packs it all into `logs\debug-<time>.zip`. Attach that zip to an issue with a line on what went wrong. It holds no
+prompts or answers, and your Windows user name is replaced by `<user>`.
+
 ## Speed
 
 These numbers are from an RTX 3090 with an NVMe SSD, through the server:
