@@ -88,6 +88,13 @@ def expand(cfg):
     for i, x in enumerate(a[:-1]):
         if x == "--arena-gib" and a[i + 1] == "auto":
             a[i + 1] = f"{arena_gib():g}"
+    # DS41_GPU (ds41-paths.bat: the card with the most VRAM unless set): the server starts the engine on the config's
+    # "gpu" (it sets CUDA_VISIBLE_DEVICES from it, nvidia-smi's numbering), not on the launcher's environment
+    g = os.environ.get("DS41_GPU", "").strip()
+    if g:
+        if not g.isdigit():
+            sys.exit(f"ds41_local: DS41_GPU={g!r} is not a GPU number (nvidia-smi's index; ds41-paths.bat)")
+        out["gpu"] = int(g)
     # DS41_VRAM_MARGIN=GiB (Start DeepSeek.bat sets it for small cards): the VRAM kept free beside the expert cache
     margin = env_gib("DS41_VRAM_MARGIN", None)
     if margin is not None:
