@@ -153,15 +153,25 @@ Section "crashes.txt" "NVIDIA after the run" { nvidia-smi --query-gpu=index,name
 # scrub: the Windows user name and profile path out of every text file
 $user = $env:USERNAME
 $profilePath = $env:USERPROFILE
-Get-ChildItem $Dir -File | ForEach-Object {
-    $t = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
-    if ($null -eq $t) { return }
-    if ($profilePath) { $t = $t.Replace($profilePath, "<profile>").Replace($profilePath.Replace("\", "/"), "<profile>") }
-    if ($user -and $user.Length -ge 3) { $t = [regex]::Replace($t, [regex]::Escape($user), "<user>", "IgnoreCase") }
-    Set-Content -Path $_.FullName -Value $t -Encoding UTF8 -NoNewline
-}
+# each file read with full sharing (a process still writing or showing it - after Ctrl+C the console tail can outlive
+# the launcher - must not stop the report) and only its scrubbed text written, straight into the zip
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 $zip = "$Dir.zip"
-Compress-Archive -Path (Join-Path $Dir "*") -DestinationPath $zip -Force
+if (Test-Path $zip) { Remove-Item $zip -Force }
+$za = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
+try {
+    Get-ChildItem $Dir -File | ForEach-Object {
+        $f = $_
+        try {
+            $s = [IO.File]::Open($f.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            try { $t = (New-Object IO.StreamReader($s, [Text.Encoding]::Default, $true)).ReadToEnd() } finally { $s.Close() }
+        } catch { $t = "(could not be read: $($_.Exception.Message))" }
+        if ($profilePath) { $t = $t.Replace($profilePath, "<profile>").Replace($profilePath.Replace("\", "/"), "<profile>") }
+        if ($user -and $user.Length -ge 3) { $t = [regex]::Replace($t, [regex]::Escape($user), "<user>", "IgnoreCase") }
+        $w = New-Object IO.StreamWriter($za.CreateEntry($f.Name).Open(), (New-Object Text.UTF8Encoding($true)))
+        try { $w.Write($t) } finally { $w.Close() }
+    }
+} finally { $za.Dispose() }
 Write-Host ""
 Write-Host "Debug report ready: $zip"
 Write-Host "Send that file with a short note of what went wrong.  It holds no prompts or answers; your Windows user name"
