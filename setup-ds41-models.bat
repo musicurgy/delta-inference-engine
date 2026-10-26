@@ -24,6 +24,11 @@ rem 1. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 
 rem    Engram tables - DeepSeek's own bytes - and the engine reads them straight from it.  (An install from before
 rem    2026-10-27 has ds4-q2-slim.gguf + DeepSeek's Engram shards in engram\ instead: it keeps working as it is.)
 if exist "%M%\ds4-q2-slim.gguf" if exist "%M%\engram\model-00048-of-00048.safetensors" goto small
+rem a download the 0.9 setup left in download\ (it slimmed it there) is moved into place, not fetched again
+if not exist "%M%\%Q2%" if exist "%M%\download\%Q2%" (
+  move /y "%M%\download\%Q2%" "%M%\%Q2%" >nul || exit /b 1
+  if exist "%M%\download\%Q2%.ok" move /y "%M%\download\%Q2%.ok" "%M%\%Q2%.ok" >nul
+)
 if exist "%M%\%Q2%.ok" goto small
 "%HF%" download nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %Q2% --local-dir "%M%" || exit /b 1
 "%PY%" tools\v41\hf_verify.py --repo nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF --dir "%M%" %Q2% || exit /b 1
