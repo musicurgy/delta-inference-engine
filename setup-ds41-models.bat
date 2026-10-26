@@ -15,8 +15,8 @@ if not exist "%HF%" (
 )
 if not exist "%M%" mkdir "%M%" || exit /b 1
 echo Model folder: %M%
-for /f "usebackq" %%g in (`powershell -NoProfile -Command "[math]::Floor((Get-Item '%M%').PSDrive.Free / 1GB)"`) do set "FREE=%%g"
-echo Free space there: %FREE% GB
+rem stop before a download fills the drive (the downloader only warns): what is still to do vs the free space
+"%PY%" tools\v41\setup_space.py "%M%" || exit /b 1
 set "DS=deepseek-ai/DeepSeek-V4.1-Flash-1017"
 
 rem 1-2. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 GB, checked), then a copy without its
@@ -70,6 +70,8 @@ if not exist "%REQ%" (
 )
 "%REQ%" --in "%M%\V41-1017-MTP.gguf" --out "%M%\V41-1017-MTP-iq2xxs.gguf.part" --type IQ2_XXS --uniform-imatrix || exit /b 1
 move /y "%M%\V41-1017-MTP-iq2xxs.gguf.part" "%M%\V41-1017-MTP-iq2xxs.gguf" >nul || exit /b 1
+rem the full-size drafter (7.9 GB) is only the requant's input
+del /q "%M%\V41-1017-MTP.gguf" 2>nul
 
 :done
 echo Setup finished.
