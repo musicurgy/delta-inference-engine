@@ -8,6 +8,12 @@ rem            route bias 0.28 (prefers experts already on the GPU: roughly +20%
 rem            with DeepSeek's own API on general text, none on code/maths).  For exact routing set "--route-bias" and "--route-bias-file" to 0
 rem            in tools\v41\serve\ds41-windows.json.
 cd /d "%~dp0"
+rem the first start sets up whatever is missing (Python environment, build, model files) and asks before anything big
+call "%~dp0tools\v41\serve\first-start.bat"
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
 call "%~dp0ds41-paths.bat"
 set CUDA_DEVICE_ORDER=PCI_BUS_ID
 set CUDA_VISIBLE_DEVICES=%DS41_GPU%
@@ -86,5 +92,6 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-".venv\Scripts\python.exe" tools\v41\serve\serve_ds41.py --engine strata --config tools\v41\serve\local\ds41-windows.json --port 8080
+rem --open: the chat page opens in the browser once the model is ready (API clients use http://127.0.0.1:8080/v1)
+".venv\Scripts\python.exe" tools\v41\serve\serve_ds41.py --engine strata --config tools\v41\serve\local\ds41-windows.json --port 8080 --open
 pause

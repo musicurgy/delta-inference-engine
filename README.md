@@ -8,6 +8,23 @@ This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whi
 [Strata](https://github.com/Niko1221/Strata). Upstream targets Linux; its README is
 [README.xolotl.md](README.xolotl.md).
 
+## Quick start
+
+1. Get this folder (**Code > Download ZIP**, or `git clone -c core.longpaths=true <URL> C:\AI\DeepSeek`) somewhere with
+   a short path, and check "What you need" below: an NVIDIA RTX card with 24 GB, 128 GB+ of RAM, ~560 GB free on an
+   NVMe drive.
+2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
+   asks before anything big:
+   - the Python environment (needs Python 3.10-3.12),
+   - the engine build (needs Visual Studio Build Tools, the CUDA Toolkit and Git - it says which are missing, with
+     links; or put the prebuilt `build-ds41-portable` folder from the Releases page here and skip this),
+   - the model files from Hugging Face (~565 GB of downloads; resumable - just start it again if it stops).
+3. The chat page opens in your browser when the model is ready. Apps use `http://127.0.0.1:8080/v1` (OpenAI) or
+   `/v1/messages` (Anthropic), any API key.
+
+Every later start: double-click `Start DeepSeek.bat` again (ready in about a minute). Everything else in this folder
+is the engine's source, upstream's files and tools - you do not need to open them.
+
 ## Speed
 
 These numbers are from an RTX 3090 with an NVMe SSD, through the server:
@@ -95,46 +112,33 @@ default stays; the smaller files may suit a PC with less disk.
 - 128 GB of RAM or more.
 - An x86-64 CPU with AVX2: Intel from 2013 (Haswell) on, or any AMD Ryzen, Threadripper or EPYC. Newer instructions
   (AVX-512, AVX-VNNI) are used where the CPU has them.
-- An NVMe SSD with ~730 GB free during setup and ~360 GB after.
-- To build:
-  - Visual Studio 2019 or 2022 with "Desktop development with C++";
+- An NVMe SSD with ~560 GB free during setup and ~365 GB after.
+- Python 3.10, 3.11 or 3.12 (3.11 recommended).
+- To build (not needed with the prebuilt engine from the Releases page):
+  - Visual Studio 2019 or 2022 (Build Tools are enough) with "Desktop development with C++";
   - the CUDA Toolkit 13.0;
-  - Python 3.11 or newer;
   - Git.
 
-## Setup
+## Setup by hand (what `Start DeepSeek.bat` does for you)
 
-0. **Get the code** into a short folder (some paths are 140 characters; Windows stops at 260), for example:
-   ```bat
-   git clone -c core.longpaths=true <this repository's URL> C:\AI\DeepSeek
-   ```
 1. **Python environment**, in this folder:
    ```bat
    py -3.11 -m venv .venv
    .venv\Scripts\pip install -r requirements.txt tokenizers==0.23.3 "huggingface_hub[cli]==2.2.0"
    ```
-2. **Build** with `build-ds41.bat`.
-   - It builds for this PC's CPU and GPU.
-   - `build-ds41.bat portable` builds a version for any AVX2 CPU and RTX 30, 40 and 50 cards, which you can copy to
-     other PCs.
-   - The first build takes about 25 minutes.
-3. **Model folder.** Set `DS41_MODELS` in `ds41-paths.bat` to a folder on your fastest NVMe drive. The default is
-   `models\` in this folder.
-4. **Download and prepare the model** with `setup-ds41-models.bat`. You can run it again; it resumes.
-   - The ds4 Q2 GGUF from
+2. **Build** with `build-ds41.bat` (10-25 minutes the first time). It builds for this PC's CPU and GPU;
+   `build-ds41.bat portable` builds one for any AVX2 CPU and RTX 30, 40 and 50 cards, to copy to other PCs.
+3. **Model folder:** `DS41_MODELS` in `ds41-paths.bat`, on your fastest NVMe drive (default: `models\` here).
+4. **Model files:** `setup-ds41-models.bat` (resumable; every large file is checked against its published SHA-256):
+   - the ds4 Q2 GGUF from
      [nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF)
-     (366 GB) is slimmed to 163 GB. You can delete the download afterwards.
-   - The two Engram shards and the tokenizer come from
-     [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (~190 GB).
-5. **Speculative-decoding drafter** (recommended: the biggest single speed-up).
-   - Save a Strata v41 sidecar GGUF (DeepSeek-V4.1's MTP heads) as `V41-1017-MTP.gguf` in the model folder. One is
-     published with
-     [IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored).
-   - Run `setup-ds41-models.bat` again to convert it.
-   - The drafter only proposes tokens; the main model checks every one.
-6. **Start** with `Start DeepSeek.bat`.
-   - It is ready in about a minute.
-   - Use model `deepseek-v4.1-flash-1017-ds4-q2` with any OpenAI-compatible client.
+     (366 GB), slimmed to 163 GB; the download is then removed;
+   - the two Engram shards, the tokenizer and config from
+     [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (~203 GB);
+   - the speculative-decoding drafter (the biggest single speed-up), built from DeepSeek's own MTP heads in the same
+     repository (three shards, 7.9 GB, removed afterwards) and shrunk to 4.2 GB. The drafter only proposes tokens;
+     the main model checks every one.
+5. **Start** with `Start DeepSeek.bat`. Use model `deepseek-v4.1-flash-1017-ds4-q2` with any OpenAI-compatible client.
 
 ## Settings
 
