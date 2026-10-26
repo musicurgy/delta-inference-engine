@@ -147,7 +147,8 @@ Speed falls once a model's experts (its file without the Engram table) outgrow t
 the rest is read from the SSD on every token.  So on 192 GB the Unsloth quants above UD-IQ2_XXS (190 GB of experts) are
 slower (how much: not measured yet) - in exchange UD-Q4_K_XL / Q8_K_XL keep DeepSeek's own MXFP4 experts.  On
 128 GB the smaller files write fastest (more of their experts fit in RAM): Unsloth UD-IQ1_S and GSQ IQ1_M 37.5 vs 33
-tok/s for the default - UD-IQ1_S at 2 points less agreement than the default, IQ1_M at 6.  Checked
+tok/s for the default - UD-IQ1_S at 2 points less agreement than the default, IQ1_M at 6.  UD-IQ1_S also reads long
+prompts faster than the default (a 16K-token prompt at ~655 vs ~580 tok/s) and loaded in 25 s vs ~60 s here.  Checked
 against ISTA's files as of 2026-10-25: the merged experts are byte-identical to theirs; their norms, router and router
 bias are bit-identical to the default file's (GSQ-RCO only changes the routed experts).  Unsloth's Engram hash constants
 (token map, primes, multipliers) are identical to the default file's.
