@@ -125,7 +125,10 @@ if not defined OLD if not exist "%M%\DeepSeek-V4.1-Flash-1017-Q2.gguf.ok" (
   set "NEED=1"
   echo   missing: the main model, DeepSeek-V4.1-Flash-1017-Q2.gguf ^(366 GB, with its Engram tables^)
 )
-if not exist "%M%\tokenizer\vocab.json" set "NEED=1"
+if not exist "%M%\tokenizer\vocab.json" (
+  set "NEED=1"
+  echo   missing: the tokenizer ^(DeepSeek's small files, a few MB^)
+)
 if not exist "%M%\V41-1017-MTP-iq2xxs.gguf" (
   set "NEED=1"
   echo   missing: the speculative-decoding drafter ^(downloads 7.9 GB, keeps 4.2 GB^)
