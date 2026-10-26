@@ -1,8 +1,12 @@
 @echo off
 rem first-start.bat - "Start DeepSeek.bat" runs this before every start.  It sets up whatever is missing - the Python
 rem environment, the build, the model files - and asks before anything big.  Once everything is there it only checks
-rem (a fraction of a second).  Run from the repository's folder (the launcher does cd there first).
+rem (a fraction of a second).
 setlocal
+rem the repository's folder, from this file's place in it; the scripts below are called by full path (Windows can be
+rem set to look up commands outside the current folder only: NoDefaultCurrentDirectoryInExePath)
+for %%I in ("%~dp0..\..\..") do set "ROOT=%%~fI"
+cd /d "%ROOT%"
 
 rem ---- 1. an NVIDIA driver
 where nvidia-smi >nul 2>&1
@@ -65,7 +69,7 @@ if defined MISSING (
 echo   Visual Studio, CUDA and Git are installed.
 choice /c YN /m "Build the engine now (about 10 minutes)"
 if errorlevel 2 exit /b 1
-call build-ds41.bat
+call "%ROOT%\build-ds41.bat"
 if errorlevel 1 (
   echo The build stopped ^(above^). README.md, "Setup", lists what it needs.
   exit /b 1
@@ -73,7 +77,11 @@ if errorlevel 1 (
 
 rem ---- 4. the model files
 :models
-call ds41-paths.bat
+call "%ROOT%\ds41-paths.bat"
+if not defined DS41_MODELS (
+  echo ds41-paths.bat did not set DS41_MODELS ^(the model folder^). Check that file, then start again.
+  exit /b 1
+)
 set "M=%DS41_MODELS:/=\%"
 set "NEED="
 if not exist "%M%\ds4-q2-slim.gguf" (
@@ -97,7 +105,7 @@ echo   setup needs ~560 GB free while it runs and keeps ~365 GB.  It can take ho
 echo   goes on where it was.
 choice /c YN /m "Download and prepare them now"
 if errorlevel 2 exit /b 1
-call setup-ds41-models.bat
+call "%ROOT%\setup-ds41-models.bat"
 if errorlevel 1 (
   echo The model setup stopped ^(above^). Start again to go on from where it was.
   exit /b 1

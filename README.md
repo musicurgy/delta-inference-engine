@@ -31,10 +31,11 @@ These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 
 | | 192 GB RAM | 128 GB RAM |
 |---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on) | **42 tok/s** | **29 tok/s** * |
+| Writing (6 chats, up to 1,500 tokens each, thinking on) | **42 tok/s** | **35 tok/s** |
 | Reading a long prompt (51-64k tokens) | **610 tok/s** | **119 tok/s** * |
 
-\* Measured with an earlier version (the 192 GB figures were 36 and 408 tok/s then).
+The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  \* Measured with an earlier version (the
+192 GB figure was 408 tok/s then).
 
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
 long prompts, but the output is the same.
@@ -100,10 +101,12 @@ is only written into place when all match):
 | default (ds4 Q2) | 163 GB | 91.5% | 93.0% | |
 | GSQ IQ2_XS | 159 GB | 90.0% | 92.9% | answered our task questions as well as the default |
 | GSQ IQ2_XXS | 142 GB | 87.8% | 89.5% | fewer knowledge questions right; long prompts slower (IQ1_M layers) |
-| GSQ IQ1_M | 125 GB | - | - | the smallest; long prompts slower (no fast prompt kernel for IQ1_M) |
+| GSQ IQ1_M | 125 GB | 85.5% | - | the smallest; long prompts slower (no fast prompt kernel for IQ1_M) |
 
 IQ2_XS and IQ2_XXS wrote within 2.5% of the default's speed (IQ1_M was checked to run and answer, not timed), so the
-default stays; the smaller files may suit a PC with less disk.
+default stays; the smaller files may suit a PC with less disk.  Checked against ISTA's files as of 2026-10-25: the
+merged experts are byte-identical to theirs and every expert's format matches their published allocation; their
+norms, router and router bias are bit-identical to the default file's (GSQ-RCO only changes the routed experts).
 
 ## What you need
 
@@ -146,8 +149,11 @@ default stays; the smaller files may suit a PC with less disk.
 - **Paths:** they live in `ds41-paths.bat`.
 - **RAM:** the memory used for experts is sized from your installed RAM at every start: total minus 38 GiB, at most
   140 GiB. `DS41_ARENA_GIB` or `DS41_RAM_RESERVE_GIB` in `ds41-paths.bat` override it.
-- **Optional Engram hot set:** an `engram-hot-2g.bin` in the model folder keeps the most-used Engram rows in RAM.
-  Build it with `ds41_engram_hot.exe`; the header of `tools/v41/engine/ds41_engram_hot.cpp` explains how.
+- **The first minutes after a reboot are slower** (measured: ~13 instead of ~25 tok/s on a cold start): the model's
+  Engram tables are read from the SSD until Windows has cached the rows your text uses. It speeds up by itself as
+  you use it. An optional Engram hot set (`engram-hot-2g.bin` in the model folder) keeps the most-used rows in RAM
+  from the start; build it with `ds41_engram_hot.exe` - the header of `tools/v41/engine/ds41_engram_hot.cpp` explains
+  how.
 
 ## Credits
 
