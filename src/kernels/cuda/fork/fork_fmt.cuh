@@ -61,6 +61,10 @@ __device__ __forceinline__ float vec_dot_iq1_s_q8_1(const void* __restrict__ vbq
 template<> struct Fmt<19> { static constexpr int qk = 256, ipb = 8, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_s_q8_1(v, y, kbx, iqs); } };
 
-#define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(19) X(143)
-#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(16) X(17) X(18) X(19) X(22) X(29) X(39) X(143)
+// MXFP4 (39) on gate/up too (upstream 4bbd8da: Fmt<39> and the plain per-column kernel were there for the MiMo down
+// outliers): Unsloth's DeepSeek-V4.1 UD-Q2_K_XL and larger keep DeepSeek's own MXFP4 experts.  IQ3_S (21) as a DOWN
+// type: Unsloth's UD-Q2_K_XL / UD-IQ3_XXS pick it for some layers' ffn_down_exps (FF 2304 = 9 whole 256-blocks; its
+// Fmt<> is upstream's, on the gate/up list).
+#define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(19) X(39) X(143)
+#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(16) X(17) X(18) X(19) X(21) X(22) X(29) X(39) X(143)
 #define STRATA_MMVQ_FMTS_FORK(X) X(10) X(19) X(143)

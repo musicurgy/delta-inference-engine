@@ -2,7 +2,10 @@
 // and the row reader.  The tables are NOT copied anywhere: rows are read straight from the HF safetensors shards
 // (layers.{1,14}.engram.embed.weight F8_E4M3 [rows, 256] + .scale F8_E8M0 [rows, 8]), two small preads per row,
 // in parallel - or from a GGUF that carries them inline (blk.{1,14}.engram_embd.weight, I8 [264, rows]: each row the
-// same 256 weight bytes then the 8 scale bytes, one pread per row; nazeshinjite's ds4 GGUF is byte-identical).  A row dequantizes to 256 floats = fp8 * 2^(e8m0 - 127) per 32 (model.py ParallelEngramEmbedding;
+// same 256 weight bytes then the 8 scale bytes, one pread per row; nazeshinjite's ds4 GGUF is byte-identical), or
+// re-quantized to IQ4_NL (144-byte rows, dequantized at read): ISTA-DASLab's Engram GGUF (blk.{1,14}.engram_embd.weight
+// IQ4_NL [256, rows]) and llama.cpp mainline's GGUFs (Unsloth's: per_layer_token_embd.weight, both tables in one
+// tensor, layer after layer).  The hot set holds FP8 rows: it is not used with IQ4_NL tables.  A row dequantizes to 256 floats = fp8 * 2^(e8m0 - 127) per 32 (model.py ParallelEngramEmbedding;
 // exactly representable in bf16, so model.py's bf16 cast is a no-op on them).
 //
 // rows()/start() are the fast batch reader: hashes are deduped and sorted by row id, so per row the two preads come out
@@ -32,14 +35,14 @@ public:
     struct RawMap;   ///< a fragmented table file read straight from its block device (see ds41_engram.cpp)
     ~Ds41Engram();
     /// dirs: where the shards are (the index json is looked up in each, the shard files too), or a .gguf file with the
-    /// tables inline (the model file itself).  Loads the hot set too when one is given (set_hot_path, else
+    /// tables inline (the model file itself; a split GGUF: any of its files - every shard is searched).  Loads the hot set too when one is given (set_hot_path, else
     /// STRATA_ENGRAM_HOT); a hot set that fails its checks is skipped with a warning.
     bool open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err);
     /// The hash state only (no tables, no threads): enough for hash() - used by the offline hot-set tool.
     void setup_hash(const Ds41Geometry & g);
     /// Hot-set pack to load at open() (overrides STRATA_ENGRAM_HOT; "" = env / none).
     void set_hot_path(const std::string & p) { hot_path_ = p; }
-    /// Raw bytes of one row (dim weight bytes then dim/32 scale bytes) straight from the tables (offline tool).
+    /// Raw bytes of one row (FP8: dim weight bytes then dim/32 scale bytes; IQ4_NL: its 144 bytes) from the tables.
     bool read_raw(int e, uint32_t row, uint8_t * dst) const;
     /// Fingerprint of the hash geometry (rows, primes, multipliers, token map): a hot set is only valid for the same one.
     uint64_t geometry_fingerprint() const;
@@ -84,10 +87,15 @@ private:
     // dim, sst = dim/32).  GGUF (packed): one array of whole rows (wst = sst = dim + dim/32, off_s = off_w + dim), so a
     // read group is one pread; fd_s is a second handle on the same file.
     struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0, wst = 0, sst = 0; int64_t rows = 0;
-                   bool packed = false;
+                   bool packed = false;   // FP8 rows with their scales inline (a GGUF); IQ4_NL tables: no scale span
                    std::shared_ptr<RawMap> rm_w, rm_s;
                    int dfd_w = -1, dfd_s = -1; };   // STRATA_ENGRAM_DIRECT: unbuffered handles for the row reads
     bool open_gguf(const std::string & path, std::string & err);
+    // Row format: wrow_ weight bytes + srow_ scale bytes.  qtype_ < 0: DeepSeek's FP8 - 256 + 8 (F8_E4M3 + F8_E8M0 per
+    // 32).  qtype_ = 20 (IQ4_NL): 144 + 0 (8 blocks of fp16 d + 16 bytes of 4-bit indices).  The row cache keeps raw rows.
+    int qtype_ = -1;
+    int64_t wrow_ = 0, srow_ = 0;
+    void deq_row(const uint8_t * w, const uint8_t * s, float * out) const;   ///< one raw row -> dim_ floats
     struct ReadGroup;               // one coalesced pread (defined in the .cpp)
     const Ds41Geometry * g_ = nullptr;
     std::vector<Table> tables_;

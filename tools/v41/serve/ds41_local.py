@@ -7,8 +7,8 @@
   set it in ds41-paths.bat) are expanded in every string, as is any other %VAR% / ${VAR} the environment has.
 * ${DS41_GGUF} / ${DS41_ENGRAM}: the main model and where the engine reads its Engram tables - both the ds4 Q2 GGUF
   (it carries them), or in an install from before 2026-10-27 the slim copy and DeepSeek's shards in engram/.  Set
-  DS41_GGUF, or pick a model with Choose Model.bat (model-choice.txt), to run a GSQ build; its Engram still comes from
-  the ds4 Q2 GGUF.
+  DS41_GGUF, or pick a model with Choose Model.bat (model-choice.txt), to run a GSQ or Unsloth model: an Unsloth GGUF
+  reads its own Engram tables, a GSQ build the ds4 Q2 GGUF's.
 * "--arena-gib" "auto": the pinned/locked RAM arena that holds the routed experts the GPU cache cannot.  It is sized
   from the installed RAM: total - DS41_RAM_RESERVE_GIB (default 38 GiB: the engine's own ~24 GiB outside the arena -
   dense half, KV, prefill buffers, Engram hot set - plus ~14 GiB for Windows and other programs), capped at 140 GiB
@@ -87,7 +87,13 @@ def expand(cfg):
             else:
                 print(f"ds41_local: model-choice.txt names {pick}, which is not in {m} - loading the default")
     os.environ.setdefault("DS41_GGUF", m + "/ds4-q2-slim.gguf" if old else full)
-    os.environ.setdefault("DS41_ENGRAM", m + "/engram" if old else full)   # also when DS41_GGUF is a GSQ build
+    if "DS41_ENGRAM" not in os.environ:
+        # Engram: a split GGUF (Unsloth's, llama.cpp mainline's) carries its own tables - read them (IQ4_NL up to
+        # UD-IQ3_S: measured as good as DeepSeek's exact FP8 tables, 89.3 vs 89.0% top-1 on UD-IQ1_S, and no second file
+        # on another drive).  A GSQ build has none: the ds4 Q2 GGUF's (or an old install's shards).
+        g = os.environ["DS41_GGUF"]
+        own = "-00001-of-" in os.path.basename(g)
+        os.environ["DS41_ENGRAM"] = g if own else m + "/engram" if old else full
     # ${DS41_BUILD}: the first build this CPU can run - this PC's own (build-ds41.bat), the portable one (AVX2), the one
     # for older CPUs (cpu_level.py)
     if "DS41_BUILD" not in os.environ:
@@ -146,7 +152,7 @@ def main():
     # every file / folder the engine and server open at start (a missing one failed later, with a vaguer message)
     paths = [cfg.get("exe"), cfg.get("tokenizer")] + [a[i + 1] for i, x in enumerate(a[:-1]) if x in ("-m", "--rank")]
     paths += [d for i, x in enumerate(a[:-1]) if x == "--engram" for d in a[i + 1].split(";")]   # a list of folders
-    missing = [p for p in paths if p and not os.path.exists(p)]
+    missing = list(dict.fromkeys(p for p in paths if p and not os.path.exists(p)))   # (the model may be its Engram too)
     model = a[a.index("-m") + 1] if "-m" in a else "?"
     print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB; model {os.path.basename(model)} "
           f"(Choose Model.bat picks another); models in {os.environ['DS41_MODELS']}")

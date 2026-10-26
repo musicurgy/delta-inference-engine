@@ -24,6 +24,12 @@ rem 1. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 
 rem    Engram tables - DeepSeek's own bytes - and the engine reads them straight from it.  (An install from before
 rem    2026-10-27 has ds4-q2-slim.gguf + DeepSeek's Engram shards in engram\ instead: it keeps working as it is.)
 if exist "%M%\ds4-q2-slim.gguf" if exist "%M%\engram\model-00048-of-00048.safetensors" goto small
+rem a model Choose Model.bat picked and that is there (an Unsloth GGUF carries its own Engram) stands for the default
+set "PICK="
+if exist "%~dp0model-choice.txt" set /p PICK=<"%~dp0model-choice.txt"
+if defined PICK set "PICK=%PICK:/=\%"
+if defined PICK if exist "%M%\%PICK%" goto small
+if defined PICK if exist "%PICK%" goto small
 rem a download the 0.9 setup left in download\ (it slimmed it there) is moved into place, not fetched again
 if not exist "%M%\%Q2%" if exist "%M%\download\%Q2%" (
   move /y "%M%\download\%Q2%" "%M%\%Q2%" >nul || exit /b 1

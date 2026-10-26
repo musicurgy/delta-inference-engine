@@ -107,34 +107,44 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
   the refresh).  The test moves by about 0.2 points between identical runs.
 - For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`.
 
-## Other quants: ISTA-DASLab's GSQ-RCO
+## Other quants: ISTA-DASLab's GSQ-RCO and Unsloth
 
-The IQ2_XS, IQ2_XXS and IQ1_M builds of
-[ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
-run in this engine. **`Choose Model.bat`** lists the models in your model folder and the ones not made yet, builds
-the one you pick and saves your choice (`model-choice.txt`); the next start loads it.  The build keeps the default
-file's dense weights and metadata and takes GSQ's routed experts, streamed from Hugging Face (every shard
-SHA-256-checked; the file is only written into place when all match; 20-30 min at 100 MB/s).  By hand:
+Besides the default, the engine runs the two other most-downloaded quant families of 1017.  **`Choose Model.bat`** lists
+the models in your model folder and the ones you can add, builds or downloads the one you pick and saves your choice
+(`model-choice.txt`); the next start loads it.
 
-```bat
-.venv\Scripts\python tools\v41\gsq_stream_merge.py --ours models\DeepSeek-V4.1-Flash-1017-Q2.gguf --build IQ2_XS --out models\ds41-gsq-iq2_xs.gguf
-```
+- **ISTA-DASLab's GSQ-RCO** ([ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)):
+  IQ2_XS, IQ2_XXS and IQ1_M.  A script builds each one into the engine's layout: the default file's dense weights and
+  metadata with GSQ's routed experts, streamed from Hugging Face (every shard SHA-256-checked; 20-30 min at 100 MB/s).
+  They read their Engram tables from the default file, so keep it.  By hand:
+  `.venv\Scripts\python tools\v41\gsq_stream_merge.py --ours models\DeepSeek-V4.1-Flash-1017-Q2.gguf --build IQ2_XS --out models\ds41-gsq-iq2_xs.gguf`
+  (`--build IQ2_XXS` or `IQ1_M` for the others), then put the file's name in `model-choice.txt`.
+- **Unsloth** ([unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)):
+  UD-IQ1_S to UD-Q8_K_XL, downloaded as they are into `models\unsloth\` (every file SHA-256-checked).  They carry their
+  own Engram tables (IQ4_NL up to UD-IQ3_S - on UD-IQ1_S as good as DeepSeek's exact ones: 89.3 vs 89.0% -, DeepSeek's
+  exact FP8 from UD-Q3_K_XL), so they need no other file.  To install an Unsloth quant INSTEAD of the default: answer N
+  when `Start DeepSeek.bat` offers the default model's download, run `Choose Model.bat`, pick the download, then start
+  `Start DeepSeek.bat` again.
 
-(`--build IQ2_XXS` or `IQ1_M` for the others), then put the file's name in `model-choice.txt`.  Every model reads its
-Engram tables from the ds4 Q2 GGUF, so keep that file.  Measured here, exact routing, against DeepSeek's API:
+Measured here, exact routing, top-1 agreement with DeepSeek's own model (teacher-forced, every token):
 
-| | size (without Engram) | general | code + maths | writing, 192 / 128 GB RAM | notes |
+| | download | general | code + maths | writing, 192 / 128 GB RAM | notes |
 |---|---|---|---|---|---|
-| default (ds4 Q2) | 163 GB | 91.5% | 93.0% | 41 / 33 tok/s | |
-| GSQ IQ2_XS | 159 GB | 90.0% | 92.9% | 38 / 26 tok/s | answered our task questions as well as the default |
-| GSQ IQ2_XXS | 142 GB | 87.8% | 89.5% | 41 / 32 tok/s | fewer knowledge questions right; long prompts slower (IQ1_M layers) |
-| GSQ IQ1_M | 125 GB | 85.5% | - | 42 / 37.5 tok/s | the smallest; long prompts slower (no fast prompt kernel for IQ1_M) |
+| default (ds4 Q2) | 366 GB | 91.5% | 93.0% | 41 / 33 tok/s | DeepSeek's exact Engram tables |
+| GSQ IQ2_XS | 159 GB + the default | 90.0% | 92.9% | 38 / 26 tok/s | answered our task questions as well as the default |
+| GSQ IQ2_XXS | 142 GB + the default | 87.8% | 89.5% | 41 / 32 tok/s | fewer knowledge questions right; long prompts slower |
+| GSQ IQ1_M | 125 GB + the default | 85.5% | - | 42 / 37.5 tok/s | long prompts slower (no fast prompt kernel for IQ1_M) |
+| Unsloth UD-IQ1_S | 233 GB | 89.3% | 91.1% | 41 / - tok/s | the smallest download that needs nothing else |
+| Unsloth UD-IQ1_M ... UD-Q8_K_XL | 250-508 GB | - | - | - | load and run (every expert type checked on real weights); not measured |
 
-On 192 GB of RAM they write about as fast as the default, so the default stays (it agrees best with DeepSeek's API).  On
-128 GB IQ1_M writes fastest (more of its experts fit in RAM: 37.5 vs 33 tok/s), at 6 points less agreement; the smaller
-files also suit a PC with less disk.  Checked against ISTA's files as of 2026-10-25: the
-merged experts are byte-identical to theirs and every expert's format matches their published allocation; their
-norms, router and router bias are bit-identical to the default file's (GSQ-RCO only changes the routed experts).
+On 192 GB of RAM the default and UD-IQ1_S write about as fast as anything, and the default agrees best with DeepSeek.
+Speed falls once a model's experts (its file without the Engram table) outgrow the RAM (~150 GB of them fit at 192 GB):
+the rest is read from the SSD on every token.  So on 192 GB the Unsloth quants above UD-IQ2_XXS (190 GB of experts) are
+slower (how much: not measured yet) - in exchange UD-Q4_K_XL / Q8_K_XL keep DeepSeek's own MXFP4 experts.  On
+128 GB IQ1_M writes fastest (more of its experts fit in RAM: 37.5 vs 33 tok/s), at 6 points less agreement.  Checked
+against ISTA's files as of 2026-10-25: the merged experts are byte-identical to theirs; their norms, router and router
+bias are bit-identical to the default file's (GSQ-RCO only changes the routed experts).  Unsloth's Engram hash constants
+(token map, primes, multipliers) are identical to the default file's.
 
 ## What you need
 

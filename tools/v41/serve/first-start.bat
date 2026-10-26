@@ -118,9 +118,15 @@ if not defined DS41_MODELS (
 )
 set "M=%DS41_MODELS:/=\%"
 set "NEED="
-rem the main model: the ds4 Q2 GGUF, checked (.ok) - or an install from before 2026-10-27 (slim copy + Engram shards)
+rem the main model: the ds4 Q2 GGUF, checked (.ok) - or a model Choose Model.bat picked (model-choice.txt: a GSQ or
+rem Unsloth file that is there), or an install from before 2026-10-27 (slim copy + Engram shards)
 set "OLD="
 if exist "%M%\ds4-q2-slim.gguf" if exist "%M%\engram\model-00048-of-00048.safetensors" set "OLD=1"
+set "PICK="
+if exist "%ROOT%\model-choice.txt" set /p PICK=<"%ROOT%\model-choice.txt"
+if defined PICK set "PICK=%PICK:/=\%"
+if defined PICK if exist "%M%\%PICK%" set "OLD=1"
+if defined PICK if exist "%PICK%" set "OLD=1"
 if not defined OLD if not exist "%M%\DeepSeek-V4.1-Flash-1017-Q2.gguf.ok" (
   set "NEED=1"
   echo   missing: the main model, DeepSeek-V4.1-Flash-1017-Q2.gguf ^(366 GB, with its Engram tables^)

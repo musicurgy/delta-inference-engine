@@ -121,6 +121,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 43:   // not in ggml master (its GGML_TYPE_COUNT is 43): Unsloth's DeepSeek-V4.1 UD-Q3_K_XL+ Engram tables, see below
+        return "MXFP8";
     case 143:   // Strata-DS4 fork: llama-tq / ik_llama PTQ1_0 ternary (V4.1 routed experts; never reaches ggml)
         return "PTQ1_0";
     default:
@@ -248,6 +250,11 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 42:
         elems = 64;
         bytes = 18;
+        return true;
+    case 43:   // "MXFP8": one E8M0 scale + 32 E4M3 bytes - DeepSeek's own FP8 Engram rows regrouped per 32 (Unsloth's
+               // per_layer_token_embd in UD-Q3_K_XL / Q4_K_XL / Q8_K_XL; checked byte for byte against the official rows)
+        elems = 32;
+        bytes = 33;
         return true;
     case 143:   // Strata-DS4 fork: PTQ1_0 (128 trits in 28 B: 26 B of base-3 digits + fp16 d)
         elems = 128;
