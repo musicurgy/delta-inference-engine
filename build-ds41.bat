@@ -4,9 +4,12 @@ rem   build-ds41.bat             for THIS PC: its CPU's instruction set and its 
 rem   build-ds41.bat portable    for OTHER PCs: any x86-64 CPU with AVX2 (Intel 2013+ Haswell, every AMD Ryzen; the
 rem                              AVX-512 / AVX-VNNI kernels are picked at run time), RTX 20 / 30 / 40 / 50 (sm_75;86;89;120),
 rem                              static MSVC runtime                                              -> build-ds41-portable\
-rem   build-ds41.bat compat      for OLDER CPUs without AVX2 (e.g. Sandy / Ivy Bridge and Westmere Xeons): any x86-64
-rem                              CPU with SSE4.2 (the AVX kernels are picked at run time where the CPU has AVX), slower
-rem                              on the CPU side; RTX 20 / 30 / 40 / 50, static MSVC runtime       -> build-ds41-compat\
+rem   build-ds41.bat compat-avx  for OLDER CPUs with AVX but not AVX2 (Sandy / Ivy Bridge, 2011-2013): ggml's AVX
+rem                              paths (round 154 here, the engine held at AVX: 38 tok/s vs 17.5 with the SSE4.2 build);
+rem                              RTX 20 / 30 / 40 / 50, static MSVC runtime                        -> build-ds41-compat-avx\
+rem   build-ds41.bat compat      for the OLDEST: any x86-64 CPU with SSE4.2 (e.g. Westmere Xeons; the engine's AVX
+rem                              kernels are picked at run time where the CPU has AVX), slower on the CPU side; RTX 20 /
+rem                              30 / 40 / 50, static MSVC runtime                                 -> build-ds41-compat\
 rem   On a PC without AVX2 the plain build-ds41.bat builds for that CPU by itself.  Each build folder gets cpu-level.txt
 rem   (the CPU level it needs); the launcher picks a build this CPU can run (tools\v41\serve\cpu_level.py).
 rem Needs: Visual Studio 2019 or 2022 with "Desktop development with C++", the CUDA Toolkit (13.0 tested; it sets
@@ -69,6 +72,13 @@ if /i "%~1"=="compat" (
   set "OUT=build-ds41-compat"
   set "FLOOR=none"
   set "LEVEL=sse"
+  set "RTL=-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
+)
+if /i "%~1"=="compat-avx" (
+  set "ARCH=75;86;89;120a"
+  set "OUT=build-ds41-compat-avx"
+  set "FLOOR=avx"
+  set "LEVEL=avx"
   set "RTL=-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
 )
 echo Building %OUT% for GPU architecture %ARCH% and CPU level %LEVEL%

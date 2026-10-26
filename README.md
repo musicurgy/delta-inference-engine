@@ -142,9 +142,9 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
   tested here.
 - 128 GB of RAM or more.
 - An x86-64 CPU.  AVX2 (Intel from 2013 / Haswell on, any AMD Ryzen, Threadripper or EPYC) is the fast path; newer
-  instructions (AVX-512, AVX-VNNI) are used where the CPU has them.  A CPU without AVX2 (e.g. Sandy / Ivy Bridge or
-  Westmere Xeons) gets the engine built for older CPUs, picked automatically: it runs, slower on the CPU side
-  (measured on this PC with the AVX2 kernels switched off: 17 instead of 40 tok/s).
+  instructions (AVX-512, AVX-VNNI) are used where the CPU has them.  Older CPUs get an engine built for them, picked
+  automatically: with AVX but not AVX2 (Sandy / Ivy Bridge Xeons) 38 tok/s, with neither (e.g. Westmere Xeons) 17 -
+  measured on this PC with the newer kernels switched off, against 40 with AVX2.
 - An NVMe SSD with ~560 GB free during setup and ~365 GB after.
 - Python 3.10, 3.11 or 3.12 (3.11 recommended) - `Start DeepSeek.bat` offers to install it.
 - To build (not needed with the prebuilt engine from the Releases page):
@@ -161,8 +161,9 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
    ```
 2. **Build** with `build-ds41.bat` (10-25 minutes the first time). It builds for this PC's CPU and GPU (on a CPU
    without AVX2, for that CPU); `build-ds41.bat portable` builds one for any AVX2 CPU and RTX 20, 30, 40 and 50 cards,
-   to copy to other PCs, and `build-ds41.bat compat` one for any x86-64 CPU (SSE4.2).  The launcher takes the first of
-   `build-ds41`, `build-ds41-portable`, `build-ds41-compat` that this CPU can run.
+   to copy to other PCs; `build-ds41.bat compat-avx` one for CPUs with AVX but not AVX2, `build-ds41.bat compat` one
+   for any x86-64 CPU (SSE4.2).  The launcher takes the first of `build-ds41`, `build-ds41-portable`,
+   `build-ds41-compat-avx`, `build-ds41-compat` that this CPU can run.
 3. **Model folder:** `DS41_MODELS` in `ds41-paths.bat`, on your fastest NVMe drive (default: `models\` here).
 4. **Model files:** `setup-ds41-models.bat` (resumable; every large file is checked against its published SHA-256):
    - the ds4 Q2 GGUF from

@@ -96,8 +96,8 @@ if errorlevel 1 (
 )
 if defined MISSING (
   echo Install what is MISSING ^(then open a NEW window, so Windows sees it^) and start again.
-  echo Or skip the build: put the prebuilt engine folder from the project's Releases page here ^(build-ds41-portable,
-  echo or build-ds41-compat for a CPU without AVX2^).
+  echo Or skip the build: put the prebuilt engine folder from the project's Releases page here ^(build-ds41-portable;
+  echo for a CPU without AVX2 build-ds41-compat-avx, or build-ds41-compat without AVX^).
   exit /b 1
 )
 echo   Visual Studio, CUDA and Git are installed.

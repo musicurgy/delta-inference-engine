@@ -2,8 +2,8 @@
 r"""get_engine.py - download the prebuilt engine for this CPU from the project's GitHub Releases page, so no compiler,
 CUDA Toolkit or Git is needed (first-start.bat offers it before building).
 
-    get_engine.py            build-ds41-portable.zip (CPUs with AVX2) or build-ds41-compat.zip (older CPUs) -> unpacked
-                             into this folder as build-ds41-portable\ or build-ds41-compat\
+    get_engine.py            build-ds41-portable.zip (CPUs with AVX2), build-ds41-compat-avx.zip (AVX, no AVX2) or
+                             build-ds41-compat.zip (older) -> unpacked into this folder under the same name
     get_engine.py --url      only prints where it would download from (exit 2 if it does not know)
 
 Where from, first that is set: DS41_RELEASE_URL; the first line of tools/v41/serve/release-url.txt that is not a comment
@@ -73,7 +73,7 @@ def main():
     if base is None:
         print("No release location known (no GitHub 'origin' remote, no tools\\v41\\serve\\release-url.txt).")
         return 2
-    name = "build-ds41-portable.zip" if cpu_level.RANK[cpu_level.level()] >= cpu_level.RANK["avx2"] else "build-ds41-compat.zip"
+    name = cpu_level.release_zip()
     folder = name[:-4]
     url = base + name
     if sys.argv[1:] == ["--url"]:

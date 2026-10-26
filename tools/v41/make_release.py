@@ -3,9 +3,10 @@ r"""make_release.py - the prebuilt-engine zips for the GitHub Releases page (fir
 
     make_release.py [OUT_DIR]     (default: dist\)
 
-Zips build-ds41-portable\ and build-ds41-compat\ (build-ds41.bat portable / compat) - only what the engine needs: its
-.exe and .dll files and cpu-level.txt, under the folder's name - and prints each zip's size and SHA-256.  Upload both
-to a release; get_engine.py takes them from .../releases/latest/download/."""
+Zips build-ds41-portable\, build-ds41-compat-avx\ and build-ds41-compat\ (build-ds41.bat portable / compat-avx /
+compat) - only what the engine needs: its .exe and .dll files and cpu-level.txt, under the folder's name - and prints
+each zip's size and SHA-256.  Upload all three to a release; get_engine.py takes them from
+.../releases/latest/download/."""
 import hashlib
 import os
 import sys
@@ -18,7 +19,7 @@ def main():
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "dist")
     os.makedirs(out, exist_ok=True)
     made = 0
-    for folder in ("build-ds41-portable", "build-ds41-compat"):
+    for folder in ("build-ds41-portable", "build-ds41-compat-avx", "build-ds41-compat"):
         src = os.path.join(ROOT, folder)
         files = sorted(f for f in os.listdir(src) if f.lower().endswith((".exe", ".dll")) or f == "cpu-level.txt") \
             if os.path.isdir(src) else []
