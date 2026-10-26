@@ -15,7 +15,12 @@ New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 function Section([string]$file, [string]$title, [scriptblock]$body) {
     $out = Join-Path $Dir $file
     Add-Content -Path $out -Value "`r`n===== $title =====" -Encoding UTF8
-    try { & $body 2>&1 | Out-String -Width 220 | Add-Content -Path $out -Encoding UTF8 }
+    # a program's stderr lines come back as PowerShell error records ("NativeCommandError" + where in this script):
+    # only their text goes in the report
+    try {
+        & $body 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ } } |
+            Out-String -Width 220 | Add-Content -Path $out -Encoding UTF8
+    }
     catch { Add-Content -Path $out -Value "(failed: $($_.Exception.Message))" -Encoding UTF8 }
 }
 
