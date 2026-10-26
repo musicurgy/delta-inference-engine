@@ -47,16 +47,19 @@ if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" (
   echo No DSpark drafter at %DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf - running without it, slower. See README.md.
   set STRATA_SERVE_DSPARK=
 )
-rem the card's VRAM (measured with the expert budget of smaller cards: README.md, "Speed"): under 14 GB the drafter's
-rem 2.4 GB of weights cost more expert cache than drafting saves (12 GB: 23 tok/s without it, 17 with; 16 GB: 32 with
-rem it, 28 without); under 16 GB it is not supported yet (a 12 GB RTX 3060 loaded, then ran out of memory at the first request)
+rem the card's VRAM (README.md, "What you need"):
+rem   under 20 GB: at most 48 GiB of the RAM arena pinned - a 12 GB RTX 3060 ran out of memory at its first request with
+rem            ~91 GiB pinned and answered with 8-48 GiB; on a 16 GB budget the cap costs ~2% (31.1 vs 31.8 tok/s)
+rem   under 14 GB: no drafter - its 2.4 GB of weights cost more expert cache than drafting saves
+rem   under 12 GB: probably does not fit (the dense half, KV and buffers need ~9 GB)
 set "VRAM_MIB="
 for /f "tokens=1" %%m in ('nvidia-smi --query-gpu^=memory.total --format^=csv^,noheader^,nounits -i %DS41_GPU% 2^>nul') do set "VRAM_MIB=%%m"
+if defined VRAM_MIB if %VRAM_MIB% LSS 20000 set STRATA_ARENA_PIN_GIB=48
 if defined VRAM_MIB if %VRAM_MIB% LSS 14000 (
   echo This card has %VRAM_MIB% MiB of VRAM: running without the DSpark drafter ^(faster on cards under 14 GB^).
   set STRATA_SERVE_DSPARK=
 )
-if defined VRAM_MIB if %VRAM_MIB% LSS 15500 echo Under 16 GB of VRAM is not supported yet: on a 12 GB test card the model loaded, then ran out of memory at the first request.
+if defined VRAM_MIB if %VRAM_MIB% LSS 11800 echo Under 12 GB of VRAM is untested: the model may not fit on this card.
 set STRATA_DSPARK_KEEP=tools/v41/serve/dspark_expert_counts.txt:64
 set STRATA_DSPARK_DEPTH=5
 set STRATA_DSPARK_CONF=0.6
