@@ -14,7 +14,9 @@ CPU with SSE4.2: Intel 2008+; slower).  Each records the level it needs
 in cpu-level.txt; a build without one is taken as this PC's own (older builds) or as its folder's floor.  An AVX2 build
 on a CPU without AVX2 stops at its first AVX2 instruction (Windows: "illegal instruction", exit code 0xC000001D).
 A build from before 2026-10-27 cannot read the Engram tables from the model GGUF (the current setup's layout): it is
-skipped as out of date, so the first start offers the new one."""
+skipped as out of date, so the first start offers the new one.  So is a build from before 0.92 where the project or
+model folder's path has a letter outside A-Z (a user name with an accent, Cyrillic, Chinese ...): it opens none of its
+files there."""
 import ctypes
 import mmap
 import os
@@ -27,6 +29,14 @@ BUILDS = [("build-ds41", None), ("build-ds41-portable", "avx2"), ("build-ds41-co
           ("build-ds41-compat", "sse")]
 # text only an engine that reads Engram from the model GGUF contains (open_gguf's message in ds41_engram.cpp)
 ENGINE_MARK = b"a copy without its Engram tables"
+# text only an engine built with utf8.manifest contains: it opens paths with any letter; older ones only plain A-Z
+# ones ("cannot open C:/Users/Jos?/..."), so they count as out of date where the project or model folder needs it
+UTF8_MARK = b"activeCodePage"
+
+
+def plain_paths():
+    """are the project folder and the model folder (DS41_MODELS, set by ds41-paths.bat) plain ASCII?"""
+    return all(p.isascii() for p in (ROOT, os.environ.get("DS41_MODELS", "")))
 
 
 def level():
@@ -76,13 +86,14 @@ def needs(folder, floor):
 
 
 def up_to_date(folder):
-    """does the build's engine read the Engram tables from the model GGUF (this version's model layout)?"""
+    """does the build's engine read the Engram tables from the model GGUF (this version's model layout), and open this
+    install's paths?"""
     exe = os.path.join(ROOT, folder, "ds41_generate.exe")
     if not os.path.exists(exe):
         exe = exe[:-4]
     try:
         with open(exe, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            return mm.find(ENGINE_MARK) >= 0
+            return mm.find(ENGINE_MARK) >= 0 and (os.name != "nt" or plain_paths() or mm.find(UTF8_MARK) >= 0)
     except (OSError, ValueError):
         return False
 
@@ -110,8 +121,9 @@ def pick_build():
         if RANK[cpu] >= RANK[n]:
             return folder, None
     if not found and old:
-        return None, (f"the engine in {', '.join(old)} is from an older version of this project (it cannot read the\n"
-                      f"Engram tables from the model file): it needs the new one.")
+        why = ("it cannot open files in a folder whose path has letters outside A-Z, like this one's" if not plain_paths()
+               else "it cannot read the\nEngram tables from the model file")
+        return None, (f"the engine in {', '.join(old)} is from an older version of this project ({why}): it needs the new one.")
     if not found:
         return None, "no engine build here yet"
     return None, (f"this CPU supports {cpu.upper()} only, and the engine builds here need more: {', '.join(found)}.\n"

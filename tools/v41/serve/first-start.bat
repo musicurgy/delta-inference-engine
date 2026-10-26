@@ -60,6 +60,8 @@ if errorlevel 1 (
 )
 
 rem ---- 3. the engine: a build this CPU can run (cpu_level.py: this PC's own, the portable AVX2 one, the older-CPU one)
+rem (the model folder first: an engine from before 0.92 cannot open a path with letters outside A-Z)
+call "%ROOT%\ds41-paths.bat"
 :build
 ".venv\Scripts\python.exe" tools\v41\serve\cpu_level.py --check && goto models
 echo.

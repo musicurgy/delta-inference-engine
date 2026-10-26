@@ -176,3 +176,13 @@ if(STRATA_DS41_ASAN AND MSVC)
         target_link_options(ds41_generate PRIVATE /DEBUG /INCREMENTAL:NO)
     endif()
 endif()
+# Windows: the engine's programs take paths as char strings (argv, getenv) and open them as UTF-8, but Windows hands a
+# program its ANSI code page: a path with a non-ASCII letter (a user folder like "Jose" with an accent) opened nothing
+# ("cannot open C:/Users/.../t?st-models/...").  utf8.manifest makes their code page UTF-8 (Windows 10 1903+).
+if(WIN32 AND MSVC)
+    foreach(_t ds41_generate ds41_engram_hot v41_sidecar_requant test_ds41_geometry test_ds41_engram_src test_ds41_moe test_ds41_moe_gpu)
+        if(TARGET ${_t})
+            target_sources(${_t} PRIVATE ${_v41_dir}/utf8.manifest)
+        endif()
+    endforeach()
+endif()

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Windows 10 1903+: this program's ANSI code page is UTF-8, so its char strings (argv, getenv, CreateFileA, fopen) carry
+     paths with any letter - the engine opens files as UTF-8 (ds41_posix.hpp, ds41_sys.hpp).  v41_engine.cmake adds it. -->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>
