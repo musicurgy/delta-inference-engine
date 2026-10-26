@@ -1,6 +1,8 @@
-# DeepSeek-V4.1-Flash on one NVIDIA GPU, natively on Windows
+# Delta Inference Engine
 
-Runs all 552 billion parameters of **DeepSeek-V4.1-Flash-1017** (DeepSeek's official weights, 2-bit experts) on one
+**DeepSeek-V4.1-Flash on one NVIDIA GPU, natively on Windows.**
+
+Delta runs all 552 billion parameters of **DeepSeek-V4.1-Flash-1017** (DeepSeek's official weights, 2-bit experts) on one
 consumer PC, natively on Windows. It serves an OpenAI-compatible API at `http://127.0.0.1:8080/v1` with up to 1M tokens
 of context.
 
