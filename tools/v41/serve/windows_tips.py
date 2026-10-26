@@ -31,7 +31,9 @@ def tips():
             hags = winreg.QueryValueEx(k, "HwSchMode")[0]
     except OSError:
         hags = None
-    if hags != 2:
+    # 2 = on, 1 = off; no value = never toggled: the default, on in Windows 11 (build 22000+), off in Windows 10
+    win11 = sys.getwindowsversion().build >= 22000
+    if hags == 1 or (hags is None and not win11):
         out.append("hardware-accelerated GPU scheduling is off: Settings > System > Display > Graphics settings")
     if "SeLockMemoryPrivilege" not in run(["whoami", "/priv"]):
         out.append("no 'Lock pages in memory' right (large pages for the expert RAM): secpol.msc, see README")

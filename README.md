@@ -103,6 +103,7 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
   DeepSeek's own model (at 0.3: 89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with
   the refresh).  The test moves by about 0.2 points between identical runs.
 - For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`.
+
 ## Other quants: ISTA-DASLab's GSQ-RCO
 
 The IQ2_XS, IQ2_XXS and IQ1_M builds of
@@ -158,8 +159,8 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
    .venv\Scripts\pip install -r requirements.txt tokenizers==0.23.3 "huggingface_hub[cli]==2.2.0"
    ```
 2. **Build** with `build-ds41.bat` (10-25 minutes the first time). It builds for this PC's CPU and GPU (on a CPU
-   without AVX2, for that CPU); `build-ds41.bat portable` builds one for any AVX2 CPU and RTX 20, 30, 40 and 50 cards, to
-   copy to other PCs, and `build-ds41.bat compat` one for any x86-64 CPU (SSE4.2).  The launcher takes the first of
+   without AVX2, for that CPU); `build-ds41.bat portable` builds one for any AVX2 CPU and RTX 20, 30, 40 and 50 cards,
+   to copy to other PCs, and `build-ds41.bat compat` one for any x86-64 CPU (SSE4.2).  The launcher takes the first of
    `build-ds41`, `build-ds41-portable`, `build-ds41-compat` that this CPU can run.
 3. **Model folder:** `DS41_MODELS` in `ds41-paths.bat`, on your fastest NVMe drive (default: `models\` here).
 4. **Model files:** `setup-ds41-models.bat` (resumable; every large file is checked against its published SHA-256):
@@ -191,6 +192,7 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
   contributors: the engine.
 - [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp): the tensor library.
 - nazeshinjite: the ds4 Q2 GGUF.
-- DeepSeek: the model.
+- ISTA-DASLab: the GSQ-RCO quants.
+- DeepSeek: the model, and the MTP heads the drafter is built from.
 
 MIT license: [LICENSE](LICENSE).
