@@ -47,6 +47,16 @@ if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" (
   echo No DSpark drafter at %DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf - running without it, slower. See README.md.
   set STRATA_SERVE_DSPARK=
 )
+rem the card's VRAM (measured with the expert budget of smaller cards: README.md, "Speed"): under 14 GB the drafter's
+rem 2.4 GB of weights cost more expert cache than drafting saves (12 GB: 23 tok/s without it, 17 with; 16 GB: 32 with
+rem it, 28 without); under 12 GB it may not fit at all (the dense half, KV and buffers need ~9 GB)
+set "VRAM_MIB="
+for /f "tokens=1" %%m in ('nvidia-smi --query-gpu^=memory.total --format^=csv^,noheader^,nounits -i %DS41_GPU% 2^>nul') do set "VRAM_MIB=%%m"
+if defined VRAM_MIB if %VRAM_MIB% LSS 14000 (
+  echo This card has %VRAM_MIB% MiB of VRAM: running without the DSpark drafter ^(faster on cards under 14 GB^).
+  set STRATA_SERVE_DSPARK=
+)
+if defined VRAM_MIB if %VRAM_MIB% LSS 11800 echo Under 12 GB of VRAM is untested: the model may not fit on this card.
 set STRATA_DSPARK_KEEP=tools/v41/serve/dspark_expert_counts.txt:64
 set STRATA_DSPARK_DEPTH=5
 set STRATA_DSPARK_CONF=0.6

@@ -2,11 +2,11 @@
 rem Build the DeepSeek-V4.1 engine (ds41_generate) and its two helper tools on Windows.
 rem   build-ds41.bat             for THIS PC: its CPU's instruction set and its GPU (the fastest here)  -> build-ds41\
 rem   build-ds41.bat portable    for OTHER PCs: any x86-64 CPU with AVX2 (Intel 2013+ Haswell, every AMD Ryzen; the
-rem                              AVX-512 / AVX-VNNI kernels are picked at run time), RTX 30 / 40 / 50 (sm_86;89;120),
+rem                              AVX-512 / AVX-VNNI kernels are picked at run time), RTX 20 / 30 / 40 / 50 (sm_75;86;89;120),
 rem                              static MSVC runtime                                              -> build-ds41-portable\
 rem   build-ds41.bat compat      for OLDER CPUs without AVX2 (e.g. Sandy / Ivy Bridge and Westmere Xeons): any x86-64
 rem                              CPU with SSE4.2 (the AVX kernels are picked at run time where the CPU has AVX), slower
-rem                              on the CPU side; RTX 30 / 40 / 50, static MSVC runtime            -> build-ds41-compat\
+rem                              on the CPU side; RTX 20 / 30 / 40 / 50, static MSVC runtime       -> build-ds41-compat\
 rem   On a PC without AVX2 the plain build-ds41.bat builds for that CPU by itself.  Each build folder gets cpu-level.txt
 rem   (the CPU level it needs); the launcher picks a build this CPU can run (tools\v41\serve\cpu_level.py).
 rem Needs: Visual Studio 2019 or 2022 with "Desktop development with C++", the CUDA Toolkit (13.0 tested; it sets
@@ -58,14 +58,14 @@ if "%LEVEL%"=="avx" set "FLOOR=avx"
 if "%LEVEL%"=="sse" set "FLOOR=none"
 set "RTL="
 if /i "%~1"=="portable" (
-  set "ARCH=86;89;120a"
+  set "ARCH=75;86;89;120a"
   set "PORTABLE=ON"
   set "OUT=build-ds41-portable"
   set "FLOOR="
   set "LEVEL=avx2"
 )
 if /i "%~1"=="compat" (
-  set "ARCH=86;89;120a"
+  set "ARCH=75;86;89;120a"
   set "OUT=build-ds41-compat"
   set "FLOOR=none"
   set "LEVEL=sse"

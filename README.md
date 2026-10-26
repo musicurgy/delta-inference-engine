@@ -11,19 +11,22 @@ This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whi
 ## Quick start
 
 1. Get this folder (**Code > Download ZIP**, or `git clone -c core.longpaths=true <URL> C:\AI\DeepSeek`) somewhere with
-   a short path, and check "What you need" below: an NVIDIA RTX card with 24 GB, 128 GB+ of RAM, ~560 GB free on an
-   NVMe drive.
+   a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 128 GB+ of RAM,
+   ~560 GB free on an NVMe drive.
 2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
    asks before anything big:
-   - the Python environment (needs Python 3.10-3.12),
-   - the engine build (needs Visual Studio Build Tools, the CUDA Toolkit and Git - it says which are missing, with
-     links; or put the prebuilt `build-ds41-portable` folder from the Releases page here and skip this),
-   - the model files from Hugging Face (~565 GB of downloads; resumable - just start it again if it stops).
-3. The chat page opens in your browser when the model is ready. Apps use `http://127.0.0.1:8080/v1` (OpenAI) or
+   - Python and its packages (no Python 3.10-3.12 on the PC: it offers to install python.org's Python 3.11 with
+     Windows' own winget, for your Windows user only),
+   - the engine: the prebuilt one for your CPU from the Releases page (under 1 GB, no compiler needed) - or it builds
+     it, if you have Visual Studio Build Tools, the CUDA Toolkit and Git,
+   - the model files from Hugging Face (~565 GB of downloads, checked against their published SHA-256; it checks the
+     free space first; resumable - just start it again if it stops).
+3. Then the server starts and the chat page opens in your browser. Apps use `http://127.0.0.1:8080/v1` (OpenAI) or
    `/v1/messages` (Anthropic), any API key.
 
-Every later start: double-click `Start DeepSeek.bat` again (ready in about a minute). Everything else in this folder
-is the engine's source, upstream's files and tools - you do not need to open them.
+Every later start: double-click `Start DeepSeek.bat` again - it finds everything in place and starts the server
+(ready in about a minute). Everything else in this folder is the engine's source, upstream's files and tools - you do
+not need to open them.
 
 ## Speed
 
@@ -43,6 +46,25 @@ long prompts, but the output is the same.
 On the 192 GB PC, a new 6k-token prompt takes about 15 s and a 25k-token prompt about 41 s. Writing is fastest on
 maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the prompt and the thinking, a client sees
 ~39 tok/s.
+
+## Windows settings for speed
+
+Optional, about 15% faster.  `Start DeepSeek.bat` checks these at every start and names any that is off; they need
+administrator rights, the BIOS or a restart, so it does not change them itself.  Measured on the RTX 3090 PC: the first
+three together +12% writing speed (21.7 -> 24.3 tok/s at the time), the RAM speed another +3%.
+
+1. **Power plan: High performance.** Win+R, `powercfg.cpl`, select High performance (under "Show additional plans" if
+   it is hidden).  It stops CPU core parking and the PCIe link's power saving.
+2. **Hardware-accelerated GPU scheduling: on.** Settings > System > Display > Graphics settings, turn it on, restart.
+3. **"Lock pages in memory" for your account**: 2 MB pages for the ~140 GB of experts in RAM.  Win+R, `secpol.msc`,
+   Local Policies > User Rights Assignment > "Lock pages in memory" > Add User or Group, type your user name, Check
+   Names, OK; then sign out and in again.  (Windows Home has no `secpol.msc`; the engine then uses normal pages.)
+4. **The RAM at its rated speed.** Boards often run four large sticks below their rating: set XMP / EXPO, or the speed
+   by hand, in the BIOS (here four 48 GB DDR5 sticks went from 4000 to 5600 MT/s: +3%).  Check stability afterwards.
+5. Optional: NVIDIA Control Panel > Manage 3D settings > Power management mode > Prefer maximum performance.
+
+While it writes, a busy browser or game on the same PC can slow the CPU side down a lot; the engine already runs above
+normal priority.
 
 ## Agents, chats and tools
 
@@ -111,12 +133,18 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
 ## What you need
 
 - Windows 10 or 11, 64-bit.
-- An NVIDIA RTX 30, 40 or 50 series card with 24 GB of VRAM. Smaller cards are untested.
+- An NVIDIA RTX card with 12 GB of VRAM or more, and driver 580 or newer.  24 GB (RTX 3090 / 4090, or a 32 GB 5090)
+  is the fast path; with less, fewer experts fit on the card.  Measured on the 3090 with the expert budget of a smaller
+  card (the default model, 192 GB RAM): 24 GB 41 tok/s, 23 GB (a monitor on the card) 39, 16 GB 32, 12 GB 23 - under
+  14 GB the launcher runs without the drafter, which is faster there.  RTX 20 (Titan RTX, Quadro RTX): the engine is
+  built for it, not tested here.  Below 12 GB it probably does not fit (~9 GB is fixed: dense weights, KV, buffers).
 - 128 GB of RAM or more.
-- An x86-64 CPU with AVX2: Intel from 2013 (Haswell) on, or any AMD Ryzen, Threadripper or EPYC. Newer instructions
-  (AVX-512, AVX-VNNI) are used where the CPU has them.
+- An x86-64 CPU.  AVX2 (Intel from 2013 / Haswell on, any AMD Ryzen, Threadripper or EPYC) is the fast path; newer
+  instructions (AVX-512, AVX-VNNI) are used where the CPU has them.  A CPU without AVX2 (e.g. Sandy / Ivy Bridge or
+  Westmere Xeons) gets the engine built for older CPUs, picked automatically: it runs, slower on the CPU side
+  (measured on this PC with the AVX2 kernels switched off: 17 instead of 40 tok/s).
 - An NVMe SSD with ~560 GB free during setup and ~365 GB after.
-- Python 3.10, 3.11 or 3.12 (3.11 recommended).
+- Python 3.10, 3.11 or 3.12 (3.11 recommended) - `Start DeepSeek.bat` offers to install it.
 - To build (not needed with the prebuilt engine from the Releases page):
   - Visual Studio 2019 or 2022 (Build Tools are enough) with "Desktop development with C++";
   - the CUDA Toolkit 13.0;
@@ -129,8 +157,10 @@ norms, router and router bias are bit-identical to the default file's (GSQ-RCO o
    py -3.11 -m venv .venv
    .venv\Scripts\pip install -r requirements.txt tokenizers==0.23.3 "huggingface_hub[cli]==2.2.0"
    ```
-2. **Build** with `build-ds41.bat` (10-25 minutes the first time). It builds for this PC's CPU and GPU;
-   `build-ds41.bat portable` builds one for any AVX2 CPU and RTX 30, 40 and 50 cards, to copy to other PCs.
+2. **Build** with `build-ds41.bat` (10-25 minutes the first time). It builds for this PC's CPU and GPU (on a CPU
+   without AVX2, for that CPU); `build-ds41.bat portable` builds one for any AVX2 CPU and RTX 20, 30, 40 and 50 cards, to
+   copy to other PCs, and `build-ds41.bat compat` one for any x86-64 CPU (SSE4.2).  The launcher takes the first of
+   `build-ds41`, `build-ds41-portable`, `build-ds41-compat` that this CPU can run.
 3. **Model folder:** `DS41_MODELS` in `ds41-paths.bat`, on your fastest NVMe drive (default: `models\` here).
 4. **Model files:** `setup-ds41-models.bat` (resumable; every large file is checked against its published SHA-256):
    - the ds4 Q2 GGUF from
