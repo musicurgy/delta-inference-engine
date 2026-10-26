@@ -30,7 +30,7 @@ GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
     "ds41-gsq-iq1_m.gguf": ("GSQ IQ1_M", 125, "42 / 37.5", "85.5%", "IQ1_M"),
 }
 UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreement, its Engram tables
-    "UD-IQ1_S": (233, "41 / -", "89.3%", "IQ4_NL"),   # measured 2026-10-26 (round 167)
+    "UD-IQ1_S": (233, "40 / 37.5", "89.3%", "IQ4_NL"),   # measured 2026-10-26 (rounds 167, 170)
     "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
     "UD-IQ2_XXS": (301, "-", "-", "IQ4_NL"),
     "UD-Q2_K_XL": (335, "-", "-", "IQ4_NL"),

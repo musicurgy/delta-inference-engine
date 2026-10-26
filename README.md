@@ -139,14 +139,15 @@ Measured here, exact routing, top-1 agreement with DeepSeek's own model (teacher
 | GSQ IQ2_XS | 159 GB + the default | 90.0% | 92.9% | 38 / 26 tok/s | answered our task questions as well as the default |
 | GSQ IQ2_XXS | 142 GB + the default | 87.8% | 89.5% | 41 / 32 tok/s | fewer knowledge questions right; long prompts slower |
 | GSQ IQ1_M | 125 GB + the default | 85.5% | - | 42 / 37.5 tok/s | long prompts slower (no fast prompt kernel for IQ1_M) |
-| Unsloth UD-IQ1_S | 233 GB | 89.3% | 91.1% | 41 / - tok/s | the smallest download that needs nothing else |
+| Unsloth UD-IQ1_S | 233 GB | 89.3% | 91.1% | 40 / **37.5** tok/s | the pick for 128 GB: IQ1_M's speed, 4 points more agreement |
 | Unsloth UD-IQ1_M ... UD-Q8_K_XL | 250-508 GB | - | - | - | load and run (every expert type checked on real weights); not measured |
 
 On 192 GB of RAM the default and UD-IQ1_S write about as fast as anything, and the default agrees best with DeepSeek.
 Speed falls once a model's experts (its file without the Engram table) outgrow the RAM (~150 GB of them fit at 192 GB):
 the rest is read from the SSD on every token.  So on 192 GB the Unsloth quants above UD-IQ2_XXS (190 GB of experts) are
 slower (how much: not measured yet) - in exchange UD-Q4_K_XL / Q8_K_XL keep DeepSeek's own MXFP4 experts.  On
-128 GB IQ1_M writes fastest (more of its experts fit in RAM: 37.5 vs 33 tok/s), at 6 points less agreement.  Checked
+128 GB the smaller files write fastest (more of their experts fit in RAM): Unsloth UD-IQ1_S and GSQ IQ1_M 37.5 vs 33
+tok/s for the default - UD-IQ1_S at 2 points less agreement than the default, IQ1_M at 6.  Checked
 against ISTA's files as of 2026-10-25: the merged experts are byte-identical to theirs; their norms, router and router
 bias are bit-identical to the default file's (GSQ-RCO only changes the routed experts).  Unsloth's Engram hash constants
 (token map, primes, multipliers) are identical to the default file's.
