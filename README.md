@@ -34,7 +34,7 @@ These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 
 | | 192 GB RAM | 128 GB RAM |
 |---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on) | **42 tok/s** | **35 tok/s** |
+| Writing (6 chats, up to 1,500 tokens each, thinking on) | **41 tok/s** | **33 tok/s** |
 | Reading a long prompt (51-64k tokens) | **610 tok/s** | **119 tok/s** * |
 
 The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  \* Measured with an earlier version (the
@@ -119,15 +119,16 @@ is only written into place when all match):
 (`--build IQ2_XXS` or `IQ1_M` for the others; 20-30 min each at 100 MB/s.)  Then point `"-m"` in
 `tools/v41/serve/ds41-windows.json` at the new file.  Measured here, exact routing, against DeepSeek's API:
 
-| | file | general | code + maths | notes |
-|---|---|---|---|---|
-| default (ds4 Q2) | 163 GB | 91.5% | 93.0% | |
-| GSQ IQ2_XS | 159 GB | 90.0% | 92.9% | answered our task questions as well as the default |
-| GSQ IQ2_XXS | 142 GB | 87.8% | 89.5% | fewer knowledge questions right; long prompts slower (IQ1_M layers) |
-| GSQ IQ1_M | 125 GB | 85.5% | - | the smallest; long prompts slower (no fast prompt kernel for IQ1_M) |
+| | file | general | code + maths | writing, 192 / 128 GB RAM | notes |
+|---|---|---|---|---|---|
+| default (ds4 Q2) | 163 GB | 91.5% | 93.0% | 41 / 33 tok/s | |
+| GSQ IQ2_XS | 159 GB | 90.0% | 92.9% | 38 / 26 tok/s | answered our task questions as well as the default |
+| GSQ IQ2_XXS | 142 GB | 87.8% | 89.5% | 41 / 32 tok/s | fewer knowledge questions right; long prompts slower (IQ1_M layers) |
+| GSQ IQ1_M | 125 GB | 85.5% | - | 42 / 37.5 tok/s | the smallest; long prompts slower (no fast prompt kernel for IQ1_M) |
 
-IQ2_XS and IQ2_XXS wrote within 2.5% of the default's speed (IQ1_M was checked to run and answer, not timed), so the
-default stays; the smaller files may suit a PC with less disk.  Checked against ISTA's files as of 2026-10-25: the
+On 192 GB of RAM they write about as fast as the default, so the default stays (it agrees best with DeepSeek's API).  On
+128 GB IQ1_M writes fastest (more of its experts fit in RAM: 37.5 vs 33 tok/s), at 6 points less agreement; the smaller
+files also suit a PC with less disk.  Checked against ISTA's files as of 2026-10-25: the
 merged experts are byte-identical to theirs and every expert's format matches their published allocation; their
 norms, router and router bias are bit-identical to the default file's (GSQ-RCO only changes the routed experts).
 
