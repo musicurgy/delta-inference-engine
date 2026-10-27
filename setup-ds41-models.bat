@@ -93,7 +93,7 @@ rem 5. Pictures (on unless vision-choice.txt or DS41_VISION says off; "setup-ds4
 rem    it): DeepSeek's vision tower as one GGUF from the default model's repository (0.97 GB, checked: DeepSeek's BF16
 rem    weights) and PyTorch in .venv to run it: the CPU build (124 MB) for "cpu", the CUDA build (2.0 GB) for "gpu".
 rem    DeepSeek's image code (vision.py, image_processor.py) ships in tools\v41\vision\deepseek.
-set "VIS=cpu"
+set "VIS=off"
 if exist "%~dp0vision-choice.txt" set /p VIS=<"%~dp0vision-choice.txt"
 if defined DS41_VISION set "VIS=%DS41_VISION%"
 if /i not "%VIS%"=="cpu" if /i not "%VIS%"=="gpu" goto mainmodel

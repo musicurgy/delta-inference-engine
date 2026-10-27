@@ -17,7 +17,7 @@
 * "model_name" / "display_name": named after the model file the engine loads (deepseek-v4.1-flash-1017-ds4-q2 /
   -gsq-iq2_xs / -ud-iq1_s ...; "DeepSeek V4.1 Flash · Unsloth UD-IQ1_S"), so /v1/models and the chat page say which
   one runs.  A model_name of your own in the config is kept.  The server answers any model name a client sends.
-* "vision" (pictures, on by default): DS41_VISION, else vision-choice.txt: "cpu" (default), "gpu" or "off".
+* "vision" (pictures, off by default): DS41_VISION, else vision-choice.txt: "cpu", "gpu" or "off" (default).
   Set up (setup's pictures step: DeepSeek-V4.1-Flash-1017-Vision.gguf in the model folder, PyTorch in .venv; DeepSeek's
   image code ships in tools/v41/vision/deepseek), the server runs tools/v41/vision/ds41_vision.py beside the engine and the
   engine gets --vision.  "cpu" takes no VRAM; "gpu" encodes on the engine's card, its VRAM taken from the expert cache.
@@ -151,7 +151,7 @@ def expand(cfg):
 
 
 VISION_FILE = "DeepSeek-V4.1-Flash-1017-Vision.gguf"   # nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF
-VISION_DEFAULT = "cpu"   # on: no VRAM, decode unchanged (round 190)
+VISION_DEFAULT = "off"   # off by default (the user, 0.92); "cpu" takes no VRAM, decode unchanged (round 190)
 
 
 def vision_choice():
