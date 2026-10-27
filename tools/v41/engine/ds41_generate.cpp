@@ -1546,6 +1546,15 @@ int main(int argc, char ** argv) {
         auto env_rank = [](const char * k) { const char * e = std::getenv(k); return e ? std::max(0, std::atoi(e)) : 0; };
         const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
+        // STRATA_SERVE_REWIND_GAP (tokens; default 16, 0 = off): a request that continues the live conversation but
+        // is a FEW tokens shorter than the live history.  That is what an aborted turn leaves behind: the harness
+        // cancels the in-flight request (ctrl+x / chat:sendNow) and drops its partial assistant turn, so the next
+        // template render differs by a few tokens (DeepSeek's thinking re-render / an empty assistant turn) and
+        // lcp sits just under hist.size() - every exact reuse branch above misses and with pool_on the whole
+        // conversation is parked as "unrelated" and re-read.  Positional caches make a short rewind safe inside the
+        // window ring (RAW - SWA = 16); the forward pass re-feeds from the common prefix and overwrites the stale
+        // tail.  Same rule as the partial unpark, which is why 16 is the ceiling.
+        static const int rewind_gap = std::getenv("STRATA_SERVE_REWIND_GAP") ? std::atoi(std::getenv("STRATA_SERVE_REWIND_GAP")) : 16;
         std::string line;
         bool previous_vision = false;
         while (next_line(line)) {
@@ -1774,6 +1783,19 @@ int main(int argc, char ** argv) {
                 reused = (int) lcp;
                 std::fprintf(stderr, "serve: rewound the snapshot one token (%d -> %zu)\n", snap_len, lcp);
                 snap_len = -1;
+            } else if (rewind_gap > 0 && !unparked && !hist.empty() && lcp > 0 && lcp < hist.size() &&
+                       lcp < ids.size() && hist.size() - lcp <= (size_t) rewind_gap) {
+                // STRATA_SERVE_REWIND_GAP: the live state continues this prompt but overshoots it by a few tokens
+                // (an aborted turn's dropped assistant turn).  Keep the state and re-feed from the common prefix;
+                // round down to an even position so the ratio-2 compressor's group partner is re-fed too.
+                const size_t gap = hist.size() - lcp;
+                size_t rs = lcp & ~(size_t) 1;
+                if (rs < 1) rs = lcp;
+                hist.resize(rs);
+                snap_len = -1;   // the end state belonged to the dropped turn
+                reused = (int) rs;
+                std::fprintf(stderr, "serve: rewound the live state to %zu (gap %zu <= %d, STRATA_SERVE_REWIND_GAP)\n",
+                             rs, gap, rewind_gap);
             } else if (int si = (snap_stack_k > 0 && !unparked && lcp < ids.size()) ? snap_stack_pick(lcp) : -1;
                        si >= 0 && dense.load_conv(*snap_stack[(size_t) si].st) && dense.restore()) {
                 // STRATA_SERVE_SNAP_STACK: an earlier snapshot of this conversation (its rings back; its rows are in place)
