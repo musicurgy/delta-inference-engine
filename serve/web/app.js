@@ -1,4 +1,4 @@
-// serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
+// serve/web/app.js - the web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
 "use strict";
 
@@ -97,13 +97,12 @@ function headers(json = false) {
 $("api-key").value = store.get("apikey", "");
 $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
 
-let health = {model: "strata", images: false, max_context: 0};
+let health = {model: "deepseek", images: false, max_context: 0};
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
     $("tab-btn-images").hidden = !health.image_generation;
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
@@ -180,15 +179,16 @@ function setPill(state, text) {
   $("pill-text").textContent = text;
 }
 
-// the loaded model in the top bar and on the Model state card, so every screenshot says what is running: the
-// config's "display_name" (else the model id) and the engine adapter's mode note (DeepSeek-V4.1: the routing)
+// the loaded model in the top bar (its name: the config's "display_name", which ds41_local.py sets from the model file
+// the engine loads, else the model id) and on the Model state card (with the engine adapter's mode note - DeepSeek-V4.1:
+// the routing - which About lists too)
 function renderModelLabel(eng) {
-  const text = [eng.display_name || eng.model, eng.mode].filter(Boolean).join(" · ");
-  for (const id of ["hdr-model", "state-model"]) {
+  const name = eng.display_name || eng.model;
+  for (const [id, text] of [["hdr-model", name], ["state-model", [name, eng.mode].filter(Boolean).join(" · ")]]) {
     const el = $(id);
     if (!el) continue;
-    el.textContent = text;
-    el.title = text;
+    el.textContent = text || "";
+    el.title = [name, eng.mode].filter(Boolean).join(" · ");
     el.hidden = !text;
   }
 }
@@ -389,13 +389,14 @@ function projectionText(c) {
 function renderAbout(eng, hw, st) {
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
   facts($("facts-engine"), [
-    ["Model", eng.model],
+    ["Model", eng.display_name ? `${eng.display_name} (${eng.model})` : eng.model],
+    ["Routing", eng.mode],
     ["Engine", eng.version ? `v${eng.version}` : "built from source"],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
     ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
-    ["Images", eng.images ? "on" : "off"],
+    ["Images", eng.images ? "on" : "not set up (text only)"],
     ["Experimental speed projection", projectionText(eng.cvec)],
   ]);
   facts($("facts-hw"), [
@@ -922,7 +923,7 @@ $("export-btn").onclick = () => {
     `## ${health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([md], {type: "text/markdown"}));
-  a.download = `strata-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
+  a.download = `delta-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 };

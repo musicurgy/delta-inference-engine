@@ -14,10 +14,14 @@
   dense half, KV, prefill buffers, Engram hot set - plus ~14 GiB for Windows and other programs), capped at 140 GiB
   (15,102 of the 15,360 experts; more buys nothing).  192 GB -> 140 GiB, 128 GB -> ~89 GiB: the other experts are
   read from the NVMe drive on demand (O_DIRECT), so less RAM costs speed, not correctness.  DS41_ARENA_GIB=N overrides.
+* "model_name" / "display_name": named after the model file the engine loads (deepseek-v4.1-flash-1017-ds4-q2 /
+  -gsq-iq2_xs / -ud-iq1_s ...; "DeepSeek V4.1 Flash · Unsloth UD-IQ1_S"), so /v1/models and the chat page say which
+  one runs.  A model_name of your own in the config is kept.  The server answers any model name a client sends.
 """
 import ctypes
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -135,6 +139,27 @@ def expand(cfg):
     return out
 
 
+DEFAULT_NAME = "deepseek-v4.1-flash-1017-ds4-q2"   # the shipped config's model_name
+
+
+def model_names(path):
+    """(model id, display name) for the model file the engine loads"""
+    b = os.path.basename(path)
+    low = b.lower()
+    if low in ("deepseek-v4.1-flash-1017-q2.gguf", "ds4-q2-slim.gguf"):
+        tag, label = "ds4-q2", "ds4 Q2"
+    elif low.startswith("ds41-gsq-") and low.endswith(".gguf"):          # a GSQ build: ds41-gsq-iq2_xs.gguf
+        tag = "gsq-" + low[len("ds41-gsq-"):-len(".gguf")]
+        label = "GSQ " + tag[4:].upper()
+    elif re.search(r"UD-[A-Z0-9_]+", b):                                  # Unsloth: ...-UD-IQ1_S-00001-of-00005.gguf
+        q = re.search(r"UD-[A-Z0-9_]+", b).group(0)
+        tag, label = q.lower(), "Unsloth " + q
+    else:                                                                 # any other GGUF: its own name
+        stem = re.sub(r"-\d{5}-of-\d{5}$", "", b[:-5] if low.endswith(".gguf") else b)
+        tag, label = re.sub(r"[^a-z0-9._-]+", "-", stem.lower()).strip("-"), stem
+    return f"deepseek-v4.1-flash-1017-{tag}", f"DeepSeek V4.1 Flash · {label}"
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
@@ -144,6 +169,12 @@ def main():
     except (OSError, ValueError) as e:
         sys.exit(f"ds41_local: cannot read {sys.argv[1]}: {e}")
     cfg = expand(raw)
+    args = cfg.get("args", [])
+    if "-m" in args[:-1]:
+        mid, shown = model_names(args[args.index("-m") + 1])
+        if cfg.get("model_name", DEFAULT_NAME) == DEFAULT_NAME:
+            cfg["model_name"] = mid
+        cfg.setdefault("display_name", shown)
     os.makedirs(os.path.dirname(os.path.abspath(sys.argv[2])), exist_ok=True)
     with open(sys.argv[2], "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)

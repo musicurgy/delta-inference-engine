@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Strata</title>
+<title>Delta Inference Engine</title>
 <link rel="icon" href="web/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
@@ -19,7 +19,12 @@
 </head>
 <body>
 <header class="st-header">
-  <span class="st-header__brand">Strata</span>
+  <span class="st-header__brand"><svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+      <defs><linearGradient id="brand-grad" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#0c8a60"/></linearGradient></defs>
+      <path d="M16 4.5 28.5 26.5H3.5Z" fill="none" stroke="url(#brand-grad)" stroke-width="4" stroke-linejoin="round"/>
+      <path d="M16 14.5 21.2 23.5H10.8Z" fill="url(#brand-grad)" stroke="url(#brand-grad)" stroke-width="1.5"
+            stroke-linejoin="round"/></svg>Delta</span>
   <span class="st-header__model" id="hdr-model" hidden></span>
   <nav class="st-tabs" role="tablist" aria-label="Views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
@@ -45,7 +50,7 @@
       <div class="chat" id="chat">
         <div class="chat-empty" id="chat-empty">
           <div class="chat-empty__title">Ask anything</div>
-          <div class="chat-empty__sub" id="chat-empty-sub">The model runs on this PC. Nothing leaves it.</div>
+          <div class="chat-empty__sub" id="chat-empty-sub">Frontier AI on your own hardware.</div>
         </div>
       </div>
     </div>
@@ -197,12 +202,12 @@
         <div class="toggle-row"><span>Dark theme</span>
           <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
         <p class="muted small">Chats, settings and the key are kept in this browser only.
-          <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata on GitHub</a></p>
+          <a href="https://github.com/musicurgy/delta-inference-engine" target="_blank" rel="noopener noreferrer">Delta Inference Engine on GitHub</a></p>
       </div>
       <div class="st-card cfg-card" id="cfg-card" hidden>
         <div class="req-head"><span class="card-title">Model settings</span><span class="muted small" id="cfg-file"></span></div>
         <p class="muted small">Kept in the model's run config for every client. An empty field is the default. They
-          take effect the next time the model starts (close Strata's window and start it again).</p>
+          take effect the next time the model starts (close the DeepSeek window and start it again).</p>
         <form class="cfg-form" id="cfg-form"></form>
         <div class="cfg-actions"><button class="st-btn st-btn--primary" id="cfg-save" type="button">Save</button>
           <span class="muted small" id="cfg-msg" role="status"></span></div>

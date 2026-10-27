@@ -10,7 +10,8 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
 
 /* header */
 .st-header{display:flex;align-items:center;gap:var(--st-s-4);height:60px;padding:0 var(--st-s-6);background:var(--st-surface);border-bottom:1px solid var(--st-line)}
-.st-header__brand{font-weight:900;font-size:var(--st-fs-lg);letter-spacing:-.01em}
+.st-header__brand{display:inline-flex;align-items:center;gap:8px;font-weight:900;font-size:var(--st-fs-lg);letter-spacing:-.01em}
+.brand-mark{width:24px;height:24px;flex:none}
 .st-header__spacer{flex:1}
 
 /* status pill */

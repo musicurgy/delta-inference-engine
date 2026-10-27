@@ -1,9 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <!-- The tab icon: the layer stack the app's panels use (serve/web/sprite.svg, i-layers),
-       drawn bold enough to stay readable at 16 px. -->
-  <path d="M16 2.38 28.42 9.08 16 15.78 3.58 9.08Z" fill="#10b981"/>
-  <path d="M3.58 14.8 16 21.5 28.42 14.8" fill="none" stroke="#10b981" stroke-width="3.67"
-        stroke-linecap="round" stroke-linejoin="round" opacity="0.92"/>
-  <path d="M3.58 21.28 16 27.98 28.42 21.28" fill="none" stroke="#10b981" stroke-width="3.67"
-        stroke-linecap="round" stroke-linejoin="round" opacity="0.78"/>
+  <!-- Delta's mark: an open delta around a solid one, in the app's accent green; bold enough for a 16 px tab icon.
+       The header draws the same shapes inline (index.html, .brand-mark). -->
+  <defs>
+    <linearGradient id="d" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#0c8a60"/>
+    </linearGradient>
+  </defs>
+  <path d="M16 4.5 28.5 26.5H3.5Z" fill="none" stroke="url(#d)" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M16 14.5 21.2 23.5H10.8Z" fill="url(#d)" stroke="url(#d)" stroke-width="1.5" stroke-linejoin="round"/>
 </svg>
