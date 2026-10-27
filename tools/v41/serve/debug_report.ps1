@@ -47,6 +47,8 @@ if ($Phase -eq "before") {
         } else { "not a git clone (a ZIP download)" }
         if (Test-Path (Join-Path $Root "model-choice.txt")) { "model-choice.txt: $(Get-Content (Join-Path $Root 'model-choice.txt') -TotalCount 1)" }
         else { "model-choice.txt: none (the default model)" }
+        if (Test-Path (Join-Path $Root "vision-choice.txt")) { "vision-choice.txt: $(Get-Content (Join-Path $Root 'vision-choice.txt') -TotalCount 1)" }
+        else { "vision-choice.txt: none (pictures: the default)" }
     }
     Section "system.txt" "Windows" {
         $os = Get-CimInstance Win32_OperatingSystem

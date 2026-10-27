@@ -1,6 +1,7 @@
 """v41_sidecar.py - the DeepSeek-V4.1-Flash MTP heads + vision tower as a sidecar GGUF beside V41-GSQ.gguf (CPU only).
 
     python3 tools/v41/v41_sidecar.py --out DIR/V41-MTP-Vision.gguf [--mtp 0,1,2] [--no-vision]
+    python3 tools/v41/v41_sidecar.py --out DIR/V41-1017-Vision.gguf --mtp ""       (the vision tower alone: shards 1-2)
     python3 tools/v41/v41_sidecar.py --verify DIR/V41-MTP-Vision.gguf [--sample 4]
 
 The main GGUF leaves out mtp.* / vision.* / aligner.* / image_* (v41_gguf.py); this file holds them under their HF
@@ -8,6 +9,7 @@ names, so the 152 GiB model never has to be rewritten:
   - MTP routed experts (FP4 e2m1 + E8M0 per 32 in the checkpoint) -> MXFP4, a lossless byte repack (same value table,
     same scale byte; only the nibble order differs), stacked per role like the main file:
     mtp.N.ffn.experts.{w1,w2,w3}.weight  ggml [in, out, n_expert]
+  - the vision tower's 2-D weights (BF16 in the checkpoint) -> BF16, the same bytes
   - every other 2-D weight (FP8 e4m3 + E8M0 per 32x32, or BF16) with a row length divisible by 32 -> Q8_0
   - norms, biases, router, mHC, the rest -> F32 (the router stays F32: its top-k is what the draft depends on)
 Metadata: the vision config + image token id from config.json (the engine side reads them).
@@ -29,6 +31,7 @@ from v41_gguf import MAIN, URL, Source  # noqa: E402
 
 Q8 = gguf.GGMLQuantizationType.Q8_0
 MX = gguf.GGMLQuantizationType.MXFP4
+BF = gguf.GGMLQuantizationType.BF16
 ROLES = ("w1", "w2", "w3")
 
 
@@ -55,7 +58,7 @@ def fp4_to_mxfp4(src, name):
 
 
 def plan(src, mtps, vision):
-    """[(gguf name, kind, payload)] in write order.  kind: 'mx' (stacked experts), 'q8', 'f32'."""
+    """[(gguf name, kind, payload)] in write order.  kind: 'mx' (stacked experts), 'q8', 'bf16', 'f32'."""
     wm = src.wm
     out = []
     for m in mtps:
@@ -70,7 +73,11 @@ def plan(src, mtps, vision):
     if vision:
         for n in sorted(wm):
             if n.startswith(("vision.", "aligner.", "image_")):
-                out.append((n, None, n))
+                # the checkpoint's BF16 matrices as they are: Q8_0's rounding compounds through the 32 ViT layers (worst
+                # span row cosine 0.996 vs the checkpoint, test_ds41_vision.py), and the encoder upcasts at load anyway,
+                # so lossless costs only file size (0.52 -> 0.97 GB)
+                dt, shape, _, _ = src.info(n)
+                out.append((n, "bf16" if dt == "BF16" and len(shape) == 2 else None, n))
     res = []
     for name, kind, pay in out:
         if kind is None:
@@ -93,12 +100,18 @@ def tensor_info(src, name, kind, pay):
         R, C = shape
         shape = (R, C // 32 * 34)
         return shape, np.uint8, R * C // 32 * 34, Q8
+    if kind == "bf16":
+        R, C = shape
+        return (R, C * 2), np.uint8, R * C * 2, BF
     return tuple(shape), np.float32, int(np.prod(shape)) * 4, None
 
 
 def tensor_data(src, name, kind, pay):
     if kind == "mx":
         return np.stack([fp4_to_mxfp4(src, n) for n in pay])
+    if kind == "bf16":
+        _, (R, C), _, _ = src.info(pay)
+        return np.frombuffer(src.read(pay), np.uint8).reshape(R, C * 2)
     v = src.f32(pay)
     if kind == "q8":
         return quants.quantize(v.astype(np.float32), Q8)
@@ -111,7 +124,8 @@ def write(args):
     mtps = [int(x) for x in args.mtp.split(",")] if args.mtp else []
     pl = plan(src, mtps, not args.no_vision)
     w = gguf.GGUFWriter(args.out + ".tmp", "deepseek41-sidecar")
-    w.add_name(os.environ.get("V41_SRC_NAME", "DeepSeek V4.1 Flash UNCENSORED") + " - MTP heads + vision tower (Strata v41 sidecar)")
+    what = " + ".join(p for p, on in (("MTP heads", mtps), ("vision tower", not args.no_vision)) if on)
+    w.add_name(os.environ.get("V41_SRC_NAME", "DeepSeek V4.1 Flash UNCENSORED") + f" - {what} (Strata v41 sidecar)")
     w.add_string("deepseek41.sidecar.source", URL)
     w.add_array("deepseek41.sidecar.mtp_blocks", mtps)
     w.add_string("deepseek41.sidecar.mtp_experts_type", "MXFP4 (lossless repack of the checkpoint FP4)")
@@ -138,11 +152,12 @@ def write(args):
 
 
 def verify(args):
-    """Experts: dequantized MXFP4 == the checkpoint's FP4 values exactly.  Q8_0: relative RMS error per tensor."""
+    """Experts: dequantized MXFP4 == the checkpoint's FP4 values exactly.  BF16: the checkpoint's bytes.  Q8_0: relative
+    RMS error per tensor."""
     src = Source()
     r = gguf.GGUFReader(args.verify)
     rng = np.random.default_rng(0)
-    worst, n_mx, n_q8 = 0.0, 0, 0
+    worst, n_mx, n_q8, n_bf = 0.0, 0, 0, 0
     for t in r.tensors:
         if t.tensor_type == MX:
             ne = int(t.shape[2])
@@ -159,7 +174,12 @@ def verify(args):
             rel = float(np.sqrt(np.mean((got - ref) ** 2)) / max(np.sqrt(np.mean(ref ** 2)), 1e-30))
             worst = max(worst, rel)
             n_q8 += 1
-    print(f"verify: {n_mx} MXFP4 experts bit-exact vs FP4; {n_q8} Q8_0 tensors, worst relative RMS error {worst:.2e}")
+        elif t.tensor_type == BF:
+            if np.asarray(t.data).tobytes() != src.read(t.name):
+                raise SystemExit(f"MISMATCH {t.name}: BF16 bytes differ from the checkpoint")
+            n_bf += 1
+    print(f"verify: {n_mx} MXFP4 experts bit-exact vs FP4; {n_bf} BF16 tensors byte-identical; {n_q8} Q8_0 tensors, "
+          f"worst relative RMS error {worst:.2e}")
 
 
 def main():

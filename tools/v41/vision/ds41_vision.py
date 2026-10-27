@@ -40,6 +40,7 @@ ADAPTED (documented deviations from strata_vision.cpp)
 """
 
 import argparse
+import functools
 import json
 import os
 import struct
@@ -54,13 +55,21 @@ SVE1 = 0x31455653
 F32, F16, Q8_0, BF16 = 0, 1, 8, 30
 BYTES_PER_ELEM = {F32: 4, F16: 2, BF16: 2}
 
-DEFAULT_SIDECAR = "/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.gguf"
-DEFAULT_REFERENCE = os.environ.get("DS41_REFERENCE", os.path.expanduser("~/AI/gsq-rco/dsv41-inference"))
+DEFAULT_SIDECAR = os.environ.get("DS41_SIDECAR", "DeepSeek-V4.1-Flash-1017-Vision.gguf")   # in the model folder
+DEFAULT_REFERENCE = os.environ.get("DS41_REFERENCE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "deepseek"))
 VISION_PREFIXES = ("vision.", "aligner.", "image_")
 
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+if hasattr(os, "pread"):
+    _pread = os.pread
+else:   # Windows has no os.pread (as v41_gguf.py): seek + read; one reader per process here
+    def _pread(fd, n, off):
+        os.lseek(fd, off, os.SEEK_SET)
+        return os.read(fd, n)
 
 
 # --------------------------------------------------------------------- GGUF (header only)
@@ -142,7 +151,7 @@ class SidecarWeights:
         self.tensors = {n: (s, t, o) for n, s, t, o in tensors if n.startswith(VISION_PREFIXES)}
         if not self.tensors:
             raise ValueError(f"{path}: no vision.* / aligner.* / image_* tensors")
-        self.fd = os.open(path, os.O_RDONLY)
+        self.fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))   # Windows: binary, not text mode
 
     def names(self):
         return sorted(self.tensors)
@@ -154,7 +163,7 @@ class SidecarWeights:
         nbytes = ggml_nbytes(shape, ty)
         raw = bytearray()
         while len(raw) < nbytes:
-            b = os.pread(self.fd, nbytes - len(raw), self.data_start + off + len(raw))
+            b = _pread(self.fd, nbytes - len(raw), self.data_start + off + len(raw))
             if not b:
                 raise OSError(f"{name}: short read")
             raw += b
@@ -182,11 +191,37 @@ class VisionArgs:
         self.dim = int(dim)
 
 
-def _load_reference(reference_dir):
+def vision_config(kv):
+    """-> (config.json's vision_config dict, image token id) from either file's metadata: our sidecar (the JSON under
+    deepseek41.sidecar.*) or the published vision GGUF (llama.cpp-style deepseek4-vision.* keys, e.g.
+    nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF's DeepSeek-V4.1-Flash-1017-Vision.gguf: the same 266 tensors)."""
+    if "deepseek41.sidecar.vision_config" in kv:
+        return (json.loads(kv["deepseek41.sidecar.vision_config"]),
+                int(kv.get("deepseek41.sidecar.image_token_id", 0)))
+    p = "deepseek4-vision."
+    if p + "block_count" not in kv:
+        raise ValueError("no vision config in the GGUF (deepseek41.sidecar.vision_config or deepseek4-vision.*)")
+    ratio = kv.get(p + "image.max_width_height_ratio") or None          # 0 = no limit (config.json: null)
+    cfg = {"num_hidden_layers": kv[p + "block_count"], "hidden_size": kv[p + "embedding_length"],
+           "num_attention_heads": kv[p + "attention.head_count"], "intermediate_size": kv[p + "feed_forward_length"],
+           "patch_size": kv[p + "patch_size"], "rope_theta": kv[p + "rope.freq_base"],
+           "downsample_ratio": kv[p + "downsample_ratio"], "max_image_tokens": kv[p + "image.max_tokens"],
+           "min_pixels": kv[p + "image.min_pixels"], "max_wh_ratio": ratio}
+    return cfg, int(kv.get(p + "image.token_id", 0))
+
+
+def _load_reference(reference_dir, device="cpu"):
     if os.path.abspath(reference_dir) not in map(os.path.abspath, sys.path):
         sys.path.insert(0, os.path.abspath(reference_dir))
     import image_processor
     import vision
+    if device != "cpu" and not getattr(vision, "_ds41_device", None):
+        # the reference ViT builds its 2-D RoPE tables with torch.arange on the CPU; on a GPU they must live beside the
+        # weights (DeepSeek's file is left unchanged: its module-level helper is wrapped, keeping its lru_cache)
+        cpu_tables = vision.get_vision_cos_sin
+        vision.get_vision_cos_sin = functools.lru_cache(8)(
+            lambda n_h, n_w, dim, theta: tuple(t.to(device) for t in cpu_tables(n_h, n_w, dim, theta)))
+        vision._ds41_device = device
     return vision.ViT, vision.Aligner, image_processor.load_image, image_processor.num_image_tokens
 
 
@@ -227,15 +262,14 @@ class Encoder:
         self.torch = torch
         self.dtype = {"f32": torch.float32, "bf16": torch.bfloat16, "f16": torch.float16}[dtype]
 
-        ViT, Aligner, load_image, _ = _load_reference(reference_dir)
+        ViT, Aligner, load_image, _ = _load_reference(reference_dir, device)
         self.load_image, self.Aligner, self.ViT = load_image, Aligner, ViT
 
         w = SidecarWeights(sidecar)
-        cfg = json.loads(w.kv["deepseek41.sidecar.vision_config"])
+        cfg, self.image_token_id = vision_config(w.kv)
         tile = w.get("image_start")
         self.args = VisionArgs(cfg, dim=int(tile.shape[0]), max_n_token=max_n_token)
         self.n_embd = self.args.dim
-        self.image_token_id = int(w.kv.get("deepseek41.sidecar.image_token_id", 0))
 
         self.vit = ViT(self.args).eval()
         self.aligner = Aligner(self.args).eval()
@@ -251,8 +285,11 @@ class Encoder:
                 al_sd[name[len("aligner."):]] = w.torch(name, torch, self.dtype)
         self.vit.load_state_dict(vit_sd, strict=True)
         self.aligner.load_state_dict(al_sd, strict=True)
-        if device == "cuda":                                # only if explicitly asked; tests stay on the CPU
-            self.vit, self.aligner = self.vit.to("cuda"), self.aligner.to("cuda")
+        # load_state_dict copies into the reference's float32 parameters: cast after it, or "bf16" fed bf16 patches to
+        # f32 weights ("mat1 and mat2 must have the same dtype")
+        dev = "cuda" if device == "cuda" else "cpu"         # cuda only if explicitly asked; tests stay on the CPU
+        self.vit, self.aligner = self.vit.to(dev, self.dtype), self.aligner.to(dev, self.dtype)
+        if device == "cuda":
             for n in ("image_start", "image_end", "image_newline"):
                 setattr(self, n, getattr(self, n).to("cuda"))
         self.device = device
@@ -261,12 +298,27 @@ class Encoder:
         """-> (span [n, n_embd] float32 CPU tensor, n_llm_h, n_llm_w, n_vit_h, n_vit_w)."""
         torch = self.torch
         patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = self.load_image({"data": image_bytes}, self.args)
-        patches = patches.to(self.dtype)
+        patches = patches.to(self.device).to(self.dtype)
         with torch.inference_mode():
             embeds = self.aligner(self.vit(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
         span = build_span(embeds, n_llm_h, n_llm_w, self.image_start.to(self.dtype),
                           self.image_newline.to(self.dtype), self.image_end.to(self.dtype))
         return span.float().cpu(), n_llm_h, n_llm_w, n_vit_h, n_vit_w
+
+    def warmup(self):
+        """One encode at the token cap, before READY: on a GPU the allocator then holds the encoder's peak (weights,
+        activations, cuBLAS workspace) before the engine sizes its expert cache from the free VRAM - the server starts
+        the encoder first.  Without it the first real picture needed VRAM the cache had taken: out of memory."""
+        from PIL import Image
+        import io
+        buf = io.BytesIO()
+        Image.new("RGB", (2000, 1500), (127, 127, 127)).save(buf, format="PNG")
+        t0 = time.time()
+        span = self.encode(buf.getvalue())[0]
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+            log(f"ds41-vision: warm-up {span.shape[0]} tokens in {time.time() - t0:.1f}s, "
+                f"{torch.cuda.memory_reserved() / 2**20:.0f} MiB held on the GPU")
 
 
 # --------------------------------------------------------------------- SVE1 file
@@ -348,6 +400,8 @@ def main(argv=None):
                   dtype=a.dtype, max_n_token=a.max_tokens or None)
     log(f"ds41-vision: {len(enc.vit.blocks)} vit layers, n_embd {enc.n_embd}, image_token_id "
         f"{enc.image_token_id}, dtype {a.dtype}, device {device}, threads {enc.torch.get_num_threads()}")
+    if device == "cuda":
+        enc.warmup()
     serve(enc, a)
 
 

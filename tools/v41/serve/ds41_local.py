@@ -17,8 +17,14 @@
 * "model_name" / "display_name": named after the model file the engine loads (deepseek-v4.1-flash-1017-ds4-q2 /
   -gsq-iq2_xs / -ud-iq1_s ...; "DeepSeek V4.1 Flash · Unsloth UD-IQ1_S"), so /v1/models and the chat page say which
   one runs.  A model_name of your own in the config is kept.  The server answers any model name a client sends.
+* "vision" (pictures, on by default): DS41_VISION, else vision-choice.txt: "cpu" (default), "gpu" or "off".
+  Set up (setup's pictures step: DeepSeek-V4.1-Flash-1017-Vision.gguf in the model folder, PyTorch in .venv; DeepSeek's
+  image code ships in tools/v41/vision/deepseek), the server runs tools/v41/vision/ds41_vision.py beside the engine and the
+  engine gets --vision.  "cpu" takes no VRAM; "gpu" encodes on the engine's card, its VRAM taken from the expert cache.
+  On but not set up: one line saying what is missing, and the model starts text only.
 """
 import ctypes
+import importlib.util
 import json
 import os
 import re
@@ -136,7 +142,68 @@ def expand(cfg):
             a[a.index("--vram-margin") + 1] = f"{margin:g}"
         else:
             a += ["--vram-margin", f"{margin:g}"]
+    vision = vision_section(m)
+    if vision:
+        out["vision"] = vision
+        if "--vision" not in a:   # here, not by the server: it would add --vram-reserve-mib, which this engine refuses
+            a.append("--vision")
     return out
+
+
+VISION_FILE = "DeepSeek-V4.1-Flash-1017-Vision.gguf"   # nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF
+VISION_DEFAULT = "cpu"   # on: no VRAM, decode unchanged (round 190)
+
+
+def vision_choice():
+    v = os.environ.get("DS41_VISION", "").strip().lower()
+    if not v:
+        try:
+            with open(os.path.join(ROOT, "vision-choice.txt"), encoding="utf-8") as f:
+                v = f.readline().strip().lower()
+        except OSError:
+            v = ""
+    return v or VISION_DEFAULT
+
+
+def torch_build():
+    """'cuda', 'cpu' or None (no PyTorch in this Python) - read from torch/version.py, without importing torch (~2 s)."""
+    spec = importlib.util.find_spec("torch")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    try:
+        with open(os.path.join(list(spec.submodule_search_locations)[0], "version.py"), encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    return "cpu" if re.search(r"^cuda\s*(?::[^=]*)?=\s*None", text, re.M) else "cuda"
+
+
+def vision_section(m):
+    """The server's "vision" section for the pictures choice, or None (off, or not set up: said in one line)."""
+    mode = vision_choice()
+    if mode in ("off", "0", "no", "none", "false"):
+        return None
+    if mode not in ("cpu", "gpu"):
+        print(f"ds41_local: pictures {mode!r} (DS41_VISION / vision-choice.txt): use cpu, gpu or off - text only")
+        return None
+    side, ref = m + "/" + VISION_FILE, ROOT.replace("\\", "/") + "/tools/v41/vision/deepseek"
+    missing = [os.path.basename(p) for p in (side, ref + "/vision.py") if not os.path.exists(p)]
+    build = torch_build()
+    if build is None:
+        missing.append("PyTorch")
+    elif mode == "gpu" and build != "cuda":
+        missing.append("PyTorch with CUDA (this one is the CPU build: choose cpu, or install the CUDA build)")
+    if missing:
+        print(f"ds41_local: pictures are on ({mode}) but not set up - missing {', '.join(missing)}: text only.  "
+              f"setup-ds41-models.bat pictures sets them up")
+        return None
+    v = {"exe": ROOT.replace("\\", "/") + "/tools/v41/vision/ds41_vision.py", "mmproj": side,
+         "model": os.environ["DS41_GGUF"], "reference_dir": ref, "gpu": mode == "gpu"}
+    if mode == "gpu":   # DS41_VISION_DTYPE=f32: the CPU's exact output, ~1.1 GB more VRAM
+        v["dtype"] = os.environ.get("DS41_VISION_DTYPE", "").strip().lower() or "bf16"
+    else:   # i5-13600K: 6 threads 8.1 s for a 1024x701 photo, 14 threads 9.2 s (the E-cores slow it down)
+        v["threads"] = max(1, min(6, os.cpu_count() or 1))
+    return v
 
 
 DEFAULT_NAME = "deepseek-v4.1-flash-1017-ds4-q2"   # the shipped config's model_name
@@ -187,6 +254,8 @@ def main():
     model = a[a.index("-m") + 1] if "-m" in a else "?"
     print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB; model {os.path.basename(model)} "
           f"(Choose Model.bat picks another); models in {os.environ['DS41_MODELS']}")
+    if cfg.get("vision"):
+        print(f"ds41_local: pictures on ({'on the GPU' if cfg['vision']['gpu'] else 'on the CPU'})")
     for p in missing:
         print(f"ds41_local: MISSING {p}  (see README.md, 'Setup')")
     sys.exit(1 if missing else 0)

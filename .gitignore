@@ -90,5 +90,6 @@ tools/v41/serve/local/
 models/
 *.key
 
-# the model "Choose Model.bat" picked (this PC only)
+# the model "Choose Model.bat" picked, and whether pictures are on (this PC only)
 /model-choice.txt
+/vision-choice.txt

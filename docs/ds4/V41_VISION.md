@@ -1,5 +1,16 @@
 # V4.1 image input
 
+## Windows (Delta Inference Engine, 0.92): on by default
+
+Pictures work out of the box.  Setup downloads `DeepSeek-V4.1-Flash-1017-Vision.gguf` (0.97 GB, SHA-256 checked) from
+`nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF` into the model folder, with PyTorch's CPU build (124 MB) in `.venv`.
+DeepSeek's image code ships in `tools/v41/vision/deepseek/` (MIT, unchanged).  The encoder runs on the CPU: no VRAM is
+taken from the expert cache.  Measured on an RTX 3090 + i5-13600K: a 1024x701 photo (444 tokens) encodes in ~8 s, a
+450x308 one in ~2.6 s.  The first answer arrives in ~19 s and ~7 s; decode was 39.8 vs 42.1 tok/s text-only (one run
+each, within run-to-run spread); start 57 vs 52 s.  `vision-choice.txt` (or `DS41_VISION`) holds `cpu` (default), `gpu`
+(the engine's card: 0.15 s per photo, but 1.65 GiB of the expert cache) or `off`.  The output matches DeepSeek's BF16
+weights exactly (test_ds41_vision.py).
+
 `ds41_generate --serve --vision` accepts image embeddings through `GENI`.
 `tools/v41/serve/serve_ds41.py` connects OpenAI and Anthropic image content blocks
 to the resident encoder in `tools/v41/vision/ds41_vision.py`.

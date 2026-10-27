@@ -15,6 +15,10 @@ if not exist "%HF%" (
 )
 if not exist "%M%" mkdir "%M%" || exit /b 1
 echo Model folder: %M%
+rem "setup-ds41-models.bat pictures cpu|gpu": pictures on (step 5), before the space check counts them
+if /i "%~1"=="pictures" (
+  if /i "%~2"=="gpu" (>"%~dp0vision-choice.txt" echo gpu) else (>"%~dp0vision-choice.txt" echo cpu)
+)
 rem stop before a download fills the drive (the downloader only warns): what is still to do vs the free space
 "%PY%" tools\v41\setup_space.py "%M%" || exit /b 1
 set "DS=deepseek-ai/DeepSeek-V4.1-Flash-1017"
@@ -85,7 +89,30 @@ rem the full-size drafter (7.9 GB) is only the requant's input
 del /q "%M%\V41-1017-MTP.gguf" 2>nul
 
 :main
-rem 5. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 GB, checked).  It also carries the
+rem 5. Pictures (on unless vision-choice.txt or DS41_VISION says off; "setup-ds41-models.bat pictures cpu|gpu" sets
+rem    it): DeepSeek's vision tower as one GGUF from the default model's repository (0.97 GB, checked: DeepSeek's BF16
+rem    weights) and PyTorch in .venv to run it: the CPU build (124 MB) for "cpu", the CUDA build (2.0 GB) for "gpu".
+rem    DeepSeek's image code (vision.py, image_processor.py) ships in tools41ision\deepseek.
+set "VIS=cpu"
+if exist "%~dp0vision-choice.txt" set /p VIS=<"%~dp0vision-choice.txt"
+if defined DS41_VISION set "VIS=%DS41_VISION%"
+if /i not "%VIS%"=="cpu" if /i not "%VIS%"=="gpu" goto mainmodel
+set "VG=DeepSeek-V4.1-Flash-1017-Vision.gguf"
+if exist "%M%\%VG%.ok" goto vision_torch
+"%HF%" download nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %VG% --local-dir "%M%" || exit /b 1
+"%PY%" tools41\hf_verify.py --repo nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF --dir "%M%" %VG% || exit /b 1
+:vision_torch
+rem PyTorch: any build does for "cpu"; "gpu" needs a CUDA one (a CPU build there is replaced)
+"%PY%" -c "import sys, torch; sys.exit(0 if torch.version.cuda or '%VIS%' != 'gpu' else 1)" >nul 2>&1 && goto mainmodel
+set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
+if /i "%VIS%"=="gpu" set "TORCH_INDEX=https://download.pytorch.org/whl/cu130"
+echo Installing PyTorch for pictures from %TORCH_INDEX% ...
+rem not --force-reinstall: that would also replace its dependencies (jinja2 is pinned in requirements.txt)
+"%PY%" -m pip uninstall -y -q torch >nul 2>&1
+"%PY%" -m pip install -q --disable-pip-version-check torch==2.14.1 --index-url %TORCH_INDEX% || exit /b 1
+
+:mainmodel
+rem 6. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 GB, checked).  It also carries the
 rem    Engram tables - DeepSeek's own bytes - and the engine reads them straight from it.
 if defined SKIPMAIN goto done
 "%HF%" download nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %Q2% --local-dir "%M%" || exit /b 1

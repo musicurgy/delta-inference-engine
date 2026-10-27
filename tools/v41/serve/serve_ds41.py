@@ -275,6 +275,8 @@ class Ds41Vision(_Vision):
         args = [cfg.get("python") or sys.executable, str(V41 / "vision" / "ds41_vision.py"), *args[1:]]
         if cfg.get("reference_dir"):
             args += ["--reference-dir", os.path.abspath(cfg["reference_dir"])]
+        if cfg.get("dtype"):     # "bf16" on a GPU: half the weights' VRAM (DeepSeek's reference runs the ViT in bf16)
+            args += ["--dtype", str(cfg["dtype"])]
         self.spawn = (args, log, env)
         if not lazy and not self.lazy_vision and not self.elastic:
             self._start()

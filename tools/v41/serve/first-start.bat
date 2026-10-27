@@ -169,7 +169,16 @@ if not defined DS41_NO_DRAFTER if not exist "%M%\V41-1017-MTP-iq2xxs.gguf" (
   set "NEEDDRAFT=1"
   echo   missing: the speculative-decoding drafter ^(downloads 7.9 GB, keeps 4.2 GB^)
 )
-if not defined NEED if not defined NEEDDRAFT exit /b 0
+rem pictures: on unless vision-choice.txt / DS41_VISION says off (the vision GGUF, 0.97 GB, and PyTorch's CPU build)
+set "VIS=cpu"
+if exist "%ROOT%ision-choice.txt" set /p VIS=<"%ROOT%ision-choice.txt"
+if defined DS41_VISION set "VIS=%DS41_VISION%"
+set "NEEDVIS="
+if /i "%VIS%"=="cpu" set "NEEDVIS=1"
+if /i "%VIS%"=="gpu" set "NEEDVIS=1"
+if defined NEEDVIS if exist "%M%\DeepSeek-V4.1-Flash-1017-Vision.gguf.ok" ".venv\Scripts\python.exe" -c "import torch" >nul 2>&1 && set "NEEDVIS="
+if defined NEEDVIS echo   missing: pictures ^(the vision encoder, 0.97 GB, and PyTorch, 124 MB^)
+if not defined NEED if not defined NEEDDRAFT if not defined NEEDVIS exit /b 0
 rem what the README asks for, said before any download (the launcher's own notes come only once all is there)
 if defined VRAM_MIB if %VRAM_MIB% LSS 11800 echo   Note: this card has %VRAM_MIB% MiB of VRAM. Under 12 GB is untested: the model may not fit on it.
 set "RAM_GB="
@@ -196,9 +205,9 @@ if errorlevel 1 (
 )
 exit /b 0
 :declined
-rem only the drafter missing: start without it (slower); it is offered again at the next start
+rem only the drafter / pictures missing: start without them; they are offered again at the next start
 if defined NEED exit /b 1
-echo Starting without the drafter ^(slower^). It is offered again at the next start.
+echo Starting without what is missing ^(text only / slower^). It is offered again at the next start.
 exit /b 0
 
 :oldgpu

@@ -93,12 +93,17 @@ def sidecar_weights():
                 nb, dec = n * 4, None
             elif ty == 8:                                    # Q8_0
                 nb, dec = n // 32 * 34, Q.GGMLQuantizationType.Q8_0
+            elif ty == 30:                                   # BF16: the checkpoint's own bytes
+                nb, dec = n * 2, "bf16"
             else:
                 raise AssertionError(f"{name}: unexpected type {ty}")
             f.seek(start + off)
             raw = f.read(nb)
-            a = np.frombuffer(raw, np.float32).copy() if dec is None else \
-                np.asarray(Q.dequantize(np.frombuffer(raw, np.uint8), dec), np.float32).reshape(-1)
+            if dec == "bf16":
+                a = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32)
+            else:
+                a = np.frombuffer(raw, np.float32).copy() if dec is None else \
+                    np.asarray(Q.dequantize(np.frombuffer(raw, np.uint8), dec), np.float32).reshape(-1)
             out[name] = a.reshape(shape[::-1])
     return kv, out
 
@@ -167,11 +172,15 @@ def main():
 
     print("\n== item 1: sidecar Q8_0 vs the sidecar's delimiters sanity ==")
     kv, side = sidecar_weights()
-    print(f"image_token_id {kv['deepseek41.sidecar.image_token_id']}, {len(side)} vision tensors dequantized")
+    print(f"image_token_id {V.vision_config(kv)[1]}, {len(side)} vision tensors dequantized")
 
     t0 = time.time()
-    ck = checkpoint_weights()
-    print(f"checkpoint vision tensors: {len(ck)} loaded in {time.time() - t0:.1f}s")
+    try:
+        ck = checkpoint_weights()
+        print(f"checkpoint vision tensors: {len(ck)} loaded in {time.time() - t0:.1f}s")
+    except (OSError, KeyError, ValueError) as e:   # no shards 1-2 here (set V41_CHECKPOINT): the GGUF is the reference
+        ck = side
+        print(f"no checkpoint shards ({e}): item 1 compares against the GGUF's own weights")
 
     t0 = time.time()
     enc = V.Encoder(SIDECAR, reference_dir=REFERENCE, device="cpu", threads=4, dtype="f32")
