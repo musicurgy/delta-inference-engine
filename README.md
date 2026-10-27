@@ -15,7 +15,7 @@ This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whi
 1. Get this folder (**Code > Download ZIP**, or
    `git clone -c core.longpaths=true https://github.com/musicurgy/delta-inference-engine C:\AI\Delta`) somewhere with
    a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 128 GB+ of RAM,
-   ~385 GB free on an NVMe drive.
+   ~385 GB free on a fast NVMe drive (its speed matters - see below).
 2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
    asks before anything big:
    - Python and its packages (no Python 3.10-3.12 on the PC: it offers to install python.org's Python 3.11 with
@@ -174,7 +174,13 @@ bias are bit-identical to the default file's (GSQ-RCO only changes the routed ex
   instructions (AVX-512, AVX-VNNI) are used where the CPU has them.  Older CPUs get an engine built for them, picked
   automatically: with AVX but not AVX2 (Sandy / Ivy Bridge Xeons) 38 tok/s, with neither (e.g. Westmere Xeons) 17 -
   measured on this PC with the newer kernels switched off, against 40 with AVX2.
-- An NVMe SSD with ~385 GB free during setup and ~371 GB after (a GSQ build adds its 125-159 GB).
+- **A fast NVMe SSD - its speed matters.**  The model is read from it while it runs, not just at the start: the Engram
+  tables (~190 GB of the file) for every new piece of text, and the experts that do not fit in RAM on every token.
+  Measured on this PC, the same model on a PCIe 4.0 NVMe (Corsair MP600 PRO, 5.4 GB/s) against a nearly full system
+  SSD (0.8 GB/s): it starts in about 1 minute instead of 4-5, reads a new 4K-token prompt ~40% faster (168 vs 120
+  tok/s) and writes 6-9% faster.  With 128 GB of RAM, more experts come from the SSD, so it matters more.  Use a PCIe
+  4.0 or 5.0 NVMe with room to spare (a nearly full SSD slows down) - not a SATA SSD, a hard disk or a USB drive.
+  ~385 GB free during setup and ~371 GB after (a GSQ build adds its 125-159 GB).
 - Python 3.10, 3.11 or 3.12 (3.11 recommended) - `Start DeepSeek.bat` offers to install it.
 - To build (not needed with the prebuilt engine from the Releases page):
   - Visual Studio 2019 or 2022 (Build Tools are enough) with "Desktop development with C++";
