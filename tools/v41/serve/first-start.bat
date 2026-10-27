@@ -171,7 +171,7 @@ if not defined DS41_NO_DRAFTER if not exist "%M%\V41-1017-MTP-iq2xxs.gguf" (
 )
 rem pictures: on unless vision-choice.txt / DS41_VISION says off (the vision GGUF, 0.97 GB, and PyTorch's CPU build)
 set "VIS=cpu"
-if exist "%ROOT%ision-choice.txt" set /p VIS=<"%ROOT%ision-choice.txt"
+if exist "%ROOT%\vision-choice.txt" set /p VIS=<"%ROOT%\vision-choice.txt"
 if defined DS41_VISION set "VIS=%DS41_VISION%"
 set "NEEDVIS="
 if /i "%VIS%"=="cpu" set "NEEDVIS=1"
