@@ -43,9 +43,7 @@ set STRATA_ENGRAM_DIRECT=1
 set STRATA_DENSE_ASYNC=1
 set STRATA_PASS_NOSYNC=1
 set "STRATA_SERVE_DSPARK=%DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf"
-rem (no ( ... ) block around a line that prints a path: a ")" in the folder's name, "...-main (1)", would end the block)
 if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" set STRATA_SERVE_DSPARK=
-if not defined STRATA_SERVE_DSPARK echo No DSpark drafter at %DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf - running without it, slower. See README.md.
 rem the card's VRAM (README.md, "What you need"):
 rem   under 20 GB: at most 48 GiB of the RAM arena pinned - a 12 GB RTX 3060 ran out of memory at its first request with
 rem            ~91 GiB pinned; on a 16 GB budget the cap costs ~2% (31.1 vs 31.8 tok/s)
@@ -56,12 +54,16 @@ rem   under 12 GB: probably does not fit (the dense half, KV and buffers need ~9
 set "VRAM_MIB="
 for /f "tokens=1" %%m in ('nvidia-smi --query-gpu^=memory.total --format^=csv^,noheader^,nounits -i %DS41_GPU% 2^>nul') do set "VRAM_MIB=%%m"
 if defined VRAM_MIB if %VRAM_MIB% LSS 20000 set STRATA_ARENA_PIN_GIB=48
-if defined VRAM_MIB if %VRAM_MIB% LSS 14000 (
+set "SMALLCARD="
+if defined VRAM_MIB if %VRAM_MIB% LSS 14000 set "SMALLCARD=1"
+if defined SMALLCARD (
   echo This card has %VRAM_MIB% MiB of VRAM: running without the DSpark drafter and the pinned RAM ^(they need room it lacks^).
   set STRATA_SERVE_DSPARK=
   set STRATA_ARENA_PIN_GIB=1
 )
 if defined VRAM_MIB if %VRAM_MIB% LSS 11800 echo Under 12 GB of VRAM is untested: the model may not fit on this card.
+rem (no ( ... ) block around a line that prints a path: a ")" in the folder's name, "...-main (1)", would end the block)
+if not defined SMALLCARD if not defined STRATA_SERVE_DSPARK echo No DSpark drafter at %DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf - running without it, slower. See README.md.
 set STRATA_DSPARK_KEEP=tools/v41/serve/dspark_expert_counts.txt:64
 set STRATA_DSPARK_DEPTH=5
 set STRATA_DSPARK_CONF=0.6
@@ -109,6 +111,7 @@ if errorlevel 1 (
 )
 rem the Windows settings that make it faster, if any is off (read only: README.md, "Windows settings for speed")
 ".venv\Scripts\python.exe" tools\v41\serve\windows_tips.py
-rem --open: the chat page opens in the browser once the model is ready (API clients use http://127.0.0.1:8080/v1)
-".venv\Scripts\python.exe" tools\v41\serve\serve_ds41.py --engine strata --config tools\v41\serve\local\ds41-windows.json --port 8080 --open
+rem --open: the chat page opens in the browser once the model is ready (API clients use http://127.0.0.1:8080/v1; the
+rem port is DS41_PORT in ds41-paths.bat)
+".venv\Scripts\python.exe" tools\v41\serve\serve_ds41.py --engine strata --config tools\v41\serve\local\ds41-windows.json --port %DS41_PORT% --open
 pause

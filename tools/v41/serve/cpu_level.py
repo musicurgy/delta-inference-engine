@@ -98,6 +98,22 @@ def up_to_date(folder):
         return False
 
 
+def ram_gb():
+    """the installed RAM in GiB, rounded (0 when it cannot be read)"""
+    if os.name != "nt":
+        try:
+            return round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30)
+        except (ValueError, OSError):
+            return 0
+
+    class MemStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                   [(n, ctypes.c_ulonglong) for n in ("total", "avail", "tpf", "apf", "tv", "av", "aev")]
+    m = MemStatus()
+    m.dwLength = ctypes.sizeof(MemStatus)
+    return round(m.total / 2**30) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else 0
+
+
 def release_zip():
     """the prebuilt engine for this CPU on the Releases page"""
     r = RANK[level()]
@@ -125,7 +141,7 @@ def pick_build():
                else "it cannot read the\nEngram tables from the model file")
         return None, (f"the engine in {', '.join(old)} is from an older version of this project ({why}): it needs the new one.")
     if not found:
-        return None, "no engine build here yet"
+        return None, "No engine in this folder yet (normal on the first start):"
     return None, (f"this CPU supports {cpu.upper()} only, and the engine builds here need more: {', '.join(found)}.\n"
                   f"Use the build for this CPU: put the {release_zip()[:-4]} folder from the Releases page here, or run\n"
                   f"build-ds41.bat (it builds for this CPU).")
@@ -143,6 +159,9 @@ def main():
         return 0
     if a == ["--release-zip"]:
         print(release_zip())
+        return 0
+    if a == ["--ram-gb"]:   # first-start's note when the PC has less RAM than the README asks for
+        print(ram_gb())
         return 0
     print(level())
     return 0

@@ -126,7 +126,7 @@ def t_parser():
 
 def t_tokenizer(tok_dir):
     import strata_tokenizer as ST
-    tokens = json.load(open(tok_dir / "vocab.json"))
+    tokens = json.load(open(tok_dir / "vocab.json", encoding="utf-8"))   # not the ANSI code page (cp932 failed)
     tokens = [t for t, _ in sorted(tokens.items(), key=lambda kv: kv[1])] if isinstance(tokens, dict) else tokens
     merges = (tok_dir / "merges.txt").read_text(encoding="utf-8").split("\n")
     types = json.load(open(tok_dir / "token_type.json"))

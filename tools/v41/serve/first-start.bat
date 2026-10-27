@@ -15,6 +15,18 @@ if errorlevel 1 (
   echo   https://www.nvidia.com/Download/index.aspx
   exit /b 1
 )
+rem the card (DS41_GPU, from ds41-paths.bat) and the model folder (an engine from before 0.92 cannot open a path with
+rem letters outside A-Z: step 3 checks it)
+call "%ROOT%\ds41-paths.bat"
+rem the engine is built with CUDA 13, which runs on compute capability 7.5 and newer (RTX 20, GTX 16 and later) - a GTX 10
+rem card (6.1) would only fail at its first CUDA call, after a newer driver and the downloads.  No answer (an old
+rem driver without the query): checked later by the driver version.
+set "CCMAJ="
+set "CCMIN="
+for /f "tokens=1,2 delims=. " %%a in ('nvidia-smi --query-gpu^=compute_cap --format^=csv^,noheader -i %DS41_GPU% 2^>nul') do if not defined CCMAJ (set "CCMAJ=%%a" & set "CCMIN=%%b")
+set "CC="
+echo %CCMAJ%.%CCMIN%| findstr /r "^[0-9][0-9]*\.[0-9][0-9]*$" >nul && set /a CC=CCMAJ*10+CCMIN
+if defined CC if %CC% LSS 75 goto oldgpu
 rem the engine is built with CUDA 13, which needs driver 580 or newer (an older one fails later with a CUDA error)
 set "DRV="
 for /f "tokens=1 delims=." %%v in ('nvidia-smi --query-gpu^=driver_version --format^=csv^,noheader 2^>nul') do if not defined DRV set "DRV=%%v"
@@ -25,7 +37,13 @@ if defined DRV if %DRV% LSS 580 (
 )
 
 rem ---- 2. the Python environment (.venv): the server, the downloader, cmake and ninja for the build
-if exist ".venv\Scripts\python.exe" if exist ".venv\Scripts\hf.exe" goto build
+rem (.venv\requirements.installed: the requirements.txt it was last set up from - an update that changes the file brings
+rem the packages up to date, e.g. 0.92's gguf for the drafter's setup step)
+if exist ".venv\Scripts\python.exe" if exist ".venv\Scripts\hf.exe" fc /b requirements.txt ".venv\requirements.installed" >nul 2>&1 && goto build
+if exist ".venv\Scripts\python.exe" (
+  echo Updating the Python environment's packages ^(.venv^) ...
+  goto havepy
+)
 echo Setting up the Python environment ^(.venv: ~0.3 GB of packages, a minute or two^) ...
 set "PYEXE="
 for %%v in (3.11 3.12 3.10) do if not defined PYEXE (
@@ -39,7 +57,10 @@ rem no Python: Windows' own package manager (winget, part of Windows 11 and of r
 rem Python 3.11 for this Windows user only - no administrator rights, nothing else on the PC changes
 echo Python 3.10, 3.11 or 3.12 is needed and none was found.
 where winget >nul 2>&1
-if errorlevel 1 goto nopy
+if errorlevel 1 (
+  echo ^(Windows' package manager winget, which could install it, is not on this PC - Windows LTSC editions have none.^)
+  goto nopy
+)
 choice /c YN /m "Install Python 3.11 now (winget: python.org's installer, for this Windows user only)"
 if errorlevel 2 goto nopy
 winget install -e --id Python.Python.3.11 --scope user --accept-package-agreements --accept-source-agreements
@@ -53,15 +74,14 @@ exit /b 1
 if not exist ".venv\Scripts\python.exe" (
   %PYEXE% -m venv .venv || exit /b 1
 )
-".venv\Scripts\python.exe" -m pip install -q --disable-pip-version-check -r requirements.txt tokenizers==0.23.3 "huggingface_hub[cli]==2.2.0"
+".venv\Scripts\python.exe" -m pip install -q --disable-pip-version-check -r requirements.txt tokenizers==0.23.3 huggingface_hub==2.2.0
 if errorlevel 1 (
   echo The package install failed ^(above^). Check the internet connection and start again.
   exit /b 1
 )
+copy /y requirements.txt ".venv\requirements.installed" >nul
 
 rem ---- 3. the engine: a build this CPU can run (cpu_level.py: this PC's own, the portable AVX2 one, the older-CPU one)
-rem (the model folder first: an engine from before 0.92 cannot open a path with letters outside A-Z)
-call "%ROOT%\ds41-paths.bat"
 :build
 ".venv\Scripts\python.exe" tools\v41\serve\cpu_level.py --check && goto models
 echo.
@@ -139,11 +159,24 @@ if not exist "%M%\tokenizer\vocab.json" (
   set "NEED=1"
   echo   missing: the tokenizer ^(DeepSeek's small files, a few MB^)
 )
-if not exist "%M%\V41-1017-MTP-iq2xxs.gguf" (
-  set "NEED=1"
+rem the drafter: not used under 14 GB of VRAM (Start DeepSeek.bat runs without it there), so not set up there either
+set "VRAM_MIB="
+for /f "tokens=1" %%m in ('nvidia-smi --query-gpu^=memory.total --format^=csv^,noheader^,nounits -i %DS41_GPU% 2^>nul') do if not defined VRAM_MIB set "VRAM_MIB=%%m"
+set "DS41_NO_DRAFTER="
+if defined VRAM_MIB if %VRAM_MIB% LSS 14000 set "DS41_NO_DRAFTER=1"
+set "NEEDDRAFT="
+if not defined DS41_NO_DRAFTER if not exist "%M%\V41-1017-MTP-iq2xxs.gguf" (
+  set "NEEDDRAFT=1"
   echo   missing: the speculative-decoding drafter ^(downloads 7.9 GB, keeps 4.2 GB^)
 )
-if not defined NEED exit /b 0
+if not defined NEED if not defined NEEDDRAFT exit /b 0
+rem what the README asks for, said before any download (the launcher's own notes come only once all is there)
+if defined VRAM_MIB if %VRAM_MIB% LSS 11800 echo   Note: this card has %VRAM_MIB% MiB of VRAM. Under 12 GB is untested: the model may not fit on it.
+set "RAM_GB="
+for /f "usebackq" %%r in (`".venv\Scripts\python.exe" tools\v41\serve\cpu_level.py --ram-gb`) do set "RAM_GB=%%r"
+if defined RAM_GB if %RAM_GB% LSS 120 echo   Note: this PC has %RAM_GB% GB of RAM; DeepSeek needs 128 GB or more ^(README.md, "What you need"^).
+if defined RAM_GB if %RAM_GB% LSS 120 if %RAM_GB% GEQ 56 echo         With less it starts, but every token reads the experts that do not fit from the SSD: much slower, untested.
+if defined RAM_GB if %RAM_GB% LSS 56 echo         With this little it will probably not start at all.
 echo The model files above go to %M%
 echo   ^(DS41_MODELS in ds41-paths.bat - put it on your fastest NVMe drive^).  They come from Hugging Face: DeepSeek's
 echo   official repository and a Q2 GGUF of it; every large file is checked against its published SHA-256.
@@ -155,10 +188,22 @@ if defined NEEDMAIN (
   echo   Only the small parts are missing ^(at most ~8 GB to download^).
 )
 choice /c YN /m "Download and prepare them now"
-if errorlevel 2 exit /b 1
+if errorlevel 2 goto declined
 call "%ROOT%\setup-ds41-models.bat"
 if errorlevel 1 (
   echo The model setup stopped ^(above^). Start again to go on from where it was.
   exit /b 1
 )
 exit /b 0
+:declined
+rem only the drafter missing: start without it (slower); it is offered again at the next start
+if defined NEED exit /b 1
+echo Starting without the drafter ^(slower^). It is offered again at the next start.
+exit /b 0
+
+:oldgpu
+for /f "tokens=*" %%n in ('nvidia-smi --query-gpu^=name --format^=csv^,noheader -i %DS41_GPU% 2^>nul') do set "GPUNAME=%%n"
+echo This card, %GPUNAME% ^(compute capability %CCMAJ%.%CCMIN%^), is older than the engine runs on.
+echo It needs an NVIDIA RTX 20 or GTX 16 series card or newer ^(compute capability 7.5+^): the engine is built with
+echo CUDA 13, which no longer supports the GTX 10 series ^(Pascal^) and older.  A newer driver does not change that.
+exit /b 1

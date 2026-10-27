@@ -1,3 +1,4 @@
 @echo off
-rem Change settings or install another model (the same as START-HERE.bat --setup).
-call "%~dp0START-HERE.bat" --setup %*
+rem Choose the model DeepSeek runs - the same as "Choose Model.bat".  The settings are in ds41-paths.bat and
+rem tools\v41\serve\ds41-windows.json (README.md, "Settings").
+call "%~dp0Choose Model.bat" %*

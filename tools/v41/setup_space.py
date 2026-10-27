@@ -46,14 +46,15 @@ def main():
         pick = ""
     if pick and os.path.exists(pick if os.path.isabs(pick) else os.path.join(m, pick)):
         old = True
-    if not old and not os.path.exists(os.path.join(m, Q2_NAME + ".ok")):
-        n = max(0.0, Q2 - size(os.path.join(m, Q2_NAME)) - partial(m))
-        steps.append(("main model (366 GB download)", n, n))
-    if not os.path.exists(os.path.join(m, "V41-1017-MTP-iq2xxs.gguf")):
+    # the drafter first (setup-ds41-models.bat builds it before the main model's download); none under 14 GB of VRAM
+    if os.environ.get("DS41_NO_DRAFTER") != "1" and not os.path.exists(os.path.join(m, "V41-1017-MTP-iq2xxs.gguf")):
         if os.path.exists(os.path.join(m, "V41-1017-MTP.gguf")):
             steps.append(("drafter", DRAFTER, DRAFTER - SIDECAR))
         else:
             steps.append(("drafter (while it is built)", MTP_SHARDS + SIDECAR, DRAFTER))
+    if not old and not os.path.exists(os.path.join(m, Q2_NAME + ".ok")):
+        n = max(0.0, Q2 - size(os.path.join(m, Q2_NAME)) - partial(m))
+        steps.append(("main model (366 GB download)", n, n))
     if not steps:
         return 0
     need, kept = 0.0, 0.0

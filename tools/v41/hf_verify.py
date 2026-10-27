@@ -51,7 +51,7 @@ def main():
             print(f"  DIFFERS  {name}: {got[:12]} (the repo's: {want[name][:12]}) - delete it and run the setup again")
             bad += 1
             continue
-        open(path + ".ok", "w").write(got + "\n")
+        open(path + ".ok", "w", encoding="ascii").write(got + "\n")
         print(f"  ok  {name}  ({os.path.getsize(path) / 1e9:.1f} GB checked in {time.time() - t0:.0f} s)")
     sys.exit(1 if bad else 0)
 

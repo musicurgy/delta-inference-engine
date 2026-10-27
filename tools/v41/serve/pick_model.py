@@ -112,17 +112,22 @@ def main():
         p = unsloth_first(m, q)
         if p:
             row("use", p, "Unsloth " + q, gb, tps, agr)
+    free = shutil.disk_usage(m).free
+
+    def room(gb):   # what a build / download says when it would not fit (picking it is refused below)
+        return "" if free >= (gb + 5) * GB else f"  - too big for this drive ({free / GB:.0f} GB free)"
+
     gsq_todo = [(f, k) for f, k in GSQ.items() if not os.path.exists(os.path.join(m, f))]
     if gsq_todo and base:
         print("\n  Build (ISTA-DASLab's GSQ-RCO experts into a copy of the default; 20-30 min at 100 MB/s):")
         for f, (name, gb, tps, agr, _) in gsq_todo:
-            row("build", f, "build " + name, gb, tps, agr)
+            row("build", f, "build " + name, gb, tps, agr, room(gb))
     uns_todo = [q for q in UNSLOTH_Q if not unsloth_first(m, q)]
     if uns_todo:
         print("\n  Download (Unsloth's GGUFs as they are, SHA-256 checked; 100 MB/s = ~40-90 min):")
         for q in uns_todo:
             gb, tps, agr, eng = UNSLOTH_Q[q]
-            row("download", q, "download Unsloth " + q, gb, tps, agr, f"  ({eng} Engram)")
+            row("download", q, "download Unsloth " + q, gb, tps, agr, f"  ({eng} Engram){room(gb)}")
     print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, exact routing.  On 192 GB of RAM")
     print("  the default writes as fast as any and agrees best; on 128 GB a smaller file writes faster (more of it fits).")
     print("  A model bigger than your RAM reads the rest from the SSD on every token: slower.\n")

@@ -4,6 +4,9 @@ rem DS41_MODELS: the folder that holds (or will hold) the model files - on your 
 rem   Default: the "models" folder in this repository.  Change it here, or set an environment variable of the
 rem   same name (that wins).  Example: set "DS41_MODELS=D:/DeepSeek-V4.1"
 if not defined DS41_MODELS set "DS41_MODELS=%~dp0models"
+rem DS41_PORT: the port the server listens on: apps use http://127.0.0.1:<port>/v1.  Default 8080 - change it here if
+rem   another program on this PC uses 8080.
+if not defined DS41_PORT set "DS41_PORT=8080"
 rem DS41_GPU: the NVIDIA GPU to run on, counted in PCI bus order (nvidia-smi's order; 0 = the first card).
 rem   Default: the card with the most VRAM (the first of equals) - set it here to choose another.
 if defined DS41_GPU goto gpu_done

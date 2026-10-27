@@ -26,11 +26,16 @@ This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whi
    - the model files from Hugging Face (~375 GB of downloads, checked against their published SHA-256; it checks the
      free space first; resumable - just start it again if it stops).
 3. Then the server starts and the chat page opens in your browser. Apps use `http://127.0.0.1:8080/v1` (OpenAI) or
-   `/v1/messages` (Anthropic), any API key.
+   `/v1/messages` (Anthropic), any API key.  (Another port: `DS41_PORT` in `ds41-paths.bat`.)
 
 Every later start: double-click `Start DeepSeek.bat` again - it finds everything in place and starts the server
 (ready in about a minute). To run another quant (see "Other quants" below), double-click **`Choose Model.bat`**.
 Everything else in this folder is the engine's source, upstream's files and tools - you do not need to open them.
+
+**Updating:** a git clone: `git pull` in this folder (or double-click `UPDATE.bat`, which does that). A ZIP copy:
+download the new ZIP and unpack it over this folder, or next to it with `models\` moved across. Then double-click
+`Start DeepSeek.bat`: if the new version needs a new engine or new Python packages, it gets them first. Your model
+files stay as they are.
 
 **Something wrong?** Double-click **`Start DeepSeek (debug).bat`** instead. It checks the PC and the install (a
 PASS / FAIL list), starts DeepSeek in a second window with everything it prints saved, and when you close that window
@@ -162,7 +167,8 @@ bias are bit-identical to the default file's (GSQ-RCO only changes the routed ex
   launcher adapts by itself: under 20 GB it pins at most 48 GiB of RAM for the card; under 14 GB it pins none and runs
   without the drafter (a real 12 GB RTX 3060 ran out of memory with them and answers without).  Below 12 GB it
   probably does not fit (~9 GB is fixed: dense weights, KV, buffers).  RTX 20 (Titan RTX, Quadro RTX): the engine is
-  built for it, not tested here.
+  built for it, not tested here.  GTX 10 series (Pascal) and older cards cannot run it, whatever the driver: CUDA 13
+  supports compute capability 7.5 and newer only.  `Start DeepSeek.bat` says so before downloading anything.
 - 128 GB of RAM or more.
 - An x86-64 CPU.  AVX2 (Intel from 2013 / Haswell on, any AMD Ryzen, Threadripper or EPYC) is the fast path; newer
   instructions (AVX-512, AVX-VNNI) are used where the CPU has them.  Older CPUs get an engine built for them, picked

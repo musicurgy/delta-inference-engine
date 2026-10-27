@@ -508,9 +508,42 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
 S.Service._note = _note_ds41
 S.Service.run = _run_ds41
 
+def _port_taken(argv):
+    """the port this start asks for, if another program listens on it already - said before the engine loads, in the
+    launcher's words (the server's own check comes after a minute of loading and names --port, which a
+    Start DeepSeek.bat user does not pass)"""
+    import socket
+    port = int(argv[argv.index("--port") + 1]) if "--port" in argv[:-1] else 8095
+    host = argv[argv.index("--host") + 1] if "--host" in argv[:-1] else "127.0.0.1"
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host if host not in ("", "0.0.0.0") else "127.0.0.1", port))
+        return None
+    except OSError as e:
+        return port if (getattr(e, "winerror", None) or e.errno) in (10048, 98) else None
+    finally:
+        s.close()
+
+
 if __name__ == "__main__":
     for i, v in enumerate(sys.argv[:-1]):   # paths are the caller's; the server runs from Strata's directory
         if v in ("--config", "--tokenizer", "--mcp-config"):
             sys.argv[i + 1] = os.path.abspath(sys.argv[i + 1])
+    taken = _port_taken(sys.argv)
+    if taken:
+        print(f"[strata] Port {taken} is already in use: DeepSeek is probably running already (another window), or "
+              f"another program uses it.\n[strata] Close that, or set DS41_PORT in ds41-paths.bat to another port, then "
+              f"start again.", file=sys.stderr, flush=True)
+        sys.exit(1)
     os.chdir(str(STRATA))
-    sys.exit(S.main())
+    try:
+        sys.exit(S.main())
+    except S.EngineDied as e:   # the engine stopped while starting: its reason and log lines, without Python's traceback
+        msg = str(e)
+        print(f"\n[strata] {msg}", file=sys.stderr, flush=True)
+        if "failed to initialize CUDA" in msg or "no cuda backend" in msg:
+            print("[strata] CUDA could not start on this PC: it needs NVIDIA driver 580 or newer and an RTX 20 / GTX 16 "
+                  "series card or newer (README.md, \"What you need\").", file=sys.stderr, flush=True)
+        print("[strata] For a bug report: \"Start DeepSeek (debug).bat\" packs this and everything else needed into one "
+              "zip.", file=sys.stderr, flush=True)
+        sys.exit(1)

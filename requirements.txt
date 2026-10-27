@@ -13,6 +13,9 @@ cmake==4.4.3
 ninja==1.13.2
 pillow==12.3.0
 psutil==7.2.2
+# the DeepSeek drafter's setup step (tools/v41/v41_sidecar.py): the version of the pinned llama.cpp's gguf-py
+# (3cf03257) - a prebuilt-engine install has no third_party/llama.cpp to take it from
+gguf==0.19.0
 
 # their dependencies
 markupsafe==3.0.3

@@ -105,5 +105,6 @@ rem that this CPU can run (tools\v41\serve\cpu_level.py)
 echo Built: %OUT%\ds41_generate.exe
 exit /b 0
 :novs
-echo Visual Studio 2019/2022 with the C++ build tools was not found (vswhere).
+echo Visual Studio 2019/2022 with the C++ build tools was not found (vswhere).  Install the Build Tools with
+echo "Desktop development with C++": https://visualstudio.microsoft.com/visual-cpp-build-tools/
 exit /b 1

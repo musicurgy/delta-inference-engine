@@ -7,8 +7,10 @@ CUDA Toolkit or Git is needed (first-start.bat offers it before building).
     get_engine.py --url      only prints where it would download from (exit 2 if it does not know)
 
 Where from, first that is set: DS41_RELEASE_URL; the first line of tools/v41/serve/release-url.txt that is not a comment
-or the placeholder; this clone's `origin` remote on GitHub (.../OWNER/REPO/releases/latest/download/).  Exit 0 done,
-1 failed (says why), 2 no release location known."""
+or the placeholder; this clone's `origin` remote on GitHub (.../OWNER/REPO/releases/latest/download/).  The zip is
+checked against the release's SHA256SUMS.txt before it is unpacked (a release without one: said, not checked).
+Exit 0 done, 1 failed (says why), 2 no release location known."""
+import hashlib
 import os
 import re
 import shutil
@@ -48,8 +50,26 @@ def release_base():
     return None
 
 
+def published_sha256(base, name):
+    """the zip's SHA-256 from the release's SHA256SUMS.txt ("<hex> *<name>" lines), or None when the release has none
+    (0.9 had none) or it cannot be read"""
+    try:
+        req = urllib.request.Request(base + "SHA256SUMS.txt", headers={"User-Agent": "ds41-first-start"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            text = r.read(1 << 16).decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError):
+        return None
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == name and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            return parts[0].lower()
+    return None
+
+
 def download(url, dst):
+    """the file at url into dst; returns its SHA-256"""
     req = urllib.request.Request(url, headers={"User-Agent": "ds41-first-start"})
+    h = hashlib.sha256()
     with urllib.request.urlopen(req, timeout=60) as r, open(dst, "wb") as f:
         total = int(r.headers.get("Content-Length") or 0)
         got, t0, last = 0, time.time(), 0.0
@@ -58,6 +78,7 @@ def download(url, dst):
             if not b:
                 break
             f.write(b)
+            h.update(b)
             got += len(b)
             if time.time() - last > 2:
                 last = time.time()
@@ -66,6 +87,7 @@ def download(url, dst):
     print()
     if total and got != total:
         raise OSError(f"the download stopped at {got} of {total} bytes")
+    return h.hexdigest()
 
 
 def main():
@@ -81,8 +103,9 @@ def main():
         return 0
     tmp = os.path.join(ROOT, name + ".part")
     print(f"Downloading the prebuilt engine: {url}")
+    want = published_sha256(base, name)
     try:
-        download(url, tmp)
+        got = download(url, tmp)
     except (urllib.error.URLError, OSError) as e:
         code = getattr(e, "code", None)
         print(f"  failed: {e}" + ("  (no such file on the Releases page yet)" if code == 404 else ""))
@@ -90,6 +113,12 @@ def main():
             os.remove(tmp)
         return 1
     try:
+        if want is None:
+            print("  (the release publishes no SHA256SUMS.txt line for it: not checked)")
+        elif got != want:
+            raise zipfile.BadZipFile(f"its SHA-256 {got[:16]}... is not the release's {want[:16]}... (SHA256SUMS.txt)")
+        else:
+            print("  SHA-256 checked against the release's SHA256SUMS.txt")
         with zipfile.ZipFile(tmp) as z:
             bad = z.testzip()
             if bad is not None:
