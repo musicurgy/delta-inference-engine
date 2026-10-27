@@ -12,6 +12,11 @@ This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whi
 
 ## Quick start
 
+**Which download?** Just this repository: **Code > Download ZIP** (or `git clone`). You do not need any of the
+`build-ds41-*.zip` files on the Releases page - `Start DeepSeek.bat` downloads the right engine for your CPU by
+itself.  (Only if you set it up by hand: almost every PC wants `build-ds41-portable.zip`; the two `compat` zips are for
+CPUs from before 2013.)
+
 1. Get this folder (**Code > Download ZIP**, or
    `git clone -c core.longpaths=true https://github.com/musicurgy/delta-inference-engine C:\AI\Delta`) somewhere with
    a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 128 GB+ of RAM,
