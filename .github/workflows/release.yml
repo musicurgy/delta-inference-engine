@@ -1,0 +1,138 @@
+# The prebuilt-engine zips for the Releases page, built on GitHub's public Windows runners, so anyone can see how each
+# zip was made and check it (README.md, "Prebuilt engine: built by CI").
+#   A tag push (e.g. 0.93): builds the three zips, attests their build provenance and attaches them with SHA256SUMS.txt
+#   to a draft release for the tag, which the maintainer reviews and publishes.
+#   Run workflow (workflow_dispatch): the same build of the chosen branch, as workflow artifacts only (no release).
+# Each zip is what `build-ds41.bat <variant>` and tools/v41/make_release.py make on a PC: CUDA archs 75;86;89;120a,
+# the CUDA runtime DLLs beside the exe, cpu-level.txt, LICENSE.txt and THIRD-PARTY-NOTICES.txt.
+# Actions are pinned by commit SHA (the tag is in the comment).
+name: Release engine zips
+
+on:
+  push:
+    tags: ['[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build-ds41-${{ matrix.variant }}
+    runs-on: windows-latest
+    timeout-minutes: 360   # GitHub's limit; four CUDA archs on a hosted runner's 4 cores may take hours
+    strategy:
+      fail-fast: false
+      matrix:
+        # build-ds41.bat's argument: portable = AVX2 CPUs, compat-avx = AVX without AVX2, compat = SSE4.2
+        variant: [portable, compat-avx, compat]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      # build-ds41.bat takes cmake and ninja from .venv (requirements.txt's pins)
+      - name: Python environment (.venv with cmake and ninja)
+        shell: powershell
+        run: |
+          python -m venv .venv
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .venv\Scripts\python -m pip install --disable-pip-version-check cmake==4.4.3 ninja==1.13.2
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # MSVC comes with the runner image (Visual Studio with the C++ tools); build-ds41.bat finds it with vswhere
+      - name: MSVC (Visual Studio C++ tools)
+        shell: powershell
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { Write-Host '::error::no Visual Studio with the C++ build tools on this runner'; exit 1 }
+          Write-Host "Visual Studio: $vs"
+          & $vswhere -latest -products * -property catalog_productDisplayVersion
+
+      - name: CUDA Toolkit 13.0.2 (nvcc, cudart, cuBLAS; SHA-256-pinned)
+        shell: powershell
+        run: .github\scripts\install-cuda.ps1 -Dest "$env:RUNNER_TEMP\cuda"
+
+      - name: build-ds41.bat ${{ matrix.variant }}
+        shell: cmd
+        run: call .\build-ds41.bat ${{ matrix.variant }}
+
+      - name: Zip (tools/v41/make_release.py)
+        shell: powershell
+        run: |
+          .venv\Scripts\python tools\v41\make_release.py dist
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Test-Path 'dist\build-ds41-${{ matrix.variant }}.zip')) { exit 1 }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: build-ds41-${{ matrix.variant }}
+          path: dist/build-ds41-${{ matrix.variant }}.zip
+          compression-level: 0   # already a zip
+          if-no-files-found: error
+
+  release:
+    name: checksums, attestation, draft release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # the draft release
+      id-token: write       # the attestation's signing certificate
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: build-ds41-*
+          path: dist
+          merge-multiple: true
+
+      # the format tools/v41/serve/get_engine.py reads: "<sha256> *<file>" lines
+      - name: SHA256SUMS.txt
+        working-directory: dist
+        run: |
+          sha256sum -b build-ds41-portable.zip build-ds41-compat-avx.zip build-ds41-compat.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            dist/build-ds41-portable.zip
+            dist/build-ds41-compat-avx.zip
+            dist/build-ds41-compat.zip
+
+      # a draft for the tag (or the draft already there, e.g. one made by hand: its zips are replaced); never published
+      # here - the maintainer adds the notes and publishes it
+      - name: Draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        working-directory: dist
+        run: |
+          files="build-ds41-portable.zip build-ds41-compat-avx.zip build-ds41-compat.zip SHA256SUMS.txt"
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2> /dev/null); then
+            if [ "$draft" != "true" ]; then
+              echo "::error::release $TAG is already published: its zips stay as they are"
+              exit 1
+            fi
+            gh release upload "$TAG" $files --clobber
+          else
+            gh release create "$TAG" $files --draft --verify-tag --title "$TAG" \
+              --notes "Built by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi

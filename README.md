@@ -192,6 +192,27 @@ bias are bit-identical to the default file's (GSQ-RCO only changes the routed ex
   - the CUDA Toolkit 13.0;
   - Git.
 
+## Prebuilt engine: built by CI
+
+The three `build-ds41-*.zip` files on the Releases page are built on GitHub's public Windows runners by
+[`.github/workflows/release.yml`](.github/workflows/release.yml), not on anyone's PC.  A version tag starts it; the
+log of every build is public under [Actions](https://github.com/musicurgy/delta-inference-engine/actions/workflows/release.yml).
+Each zip is what `build-ds41.bat portable` / `compat-avx` / `compat` builds (CUDA Toolkit 13.0.2 from NVIDIA's
+SHA-256-checked archives, archs 75;86;89;120a), packed by `tools/v41/make_release.py`.  (Releases up to 0.92 were
+built here by hand.)
+
+`Start DeepSeek.bat` checks the zip it downloads against the release's `SHA256SUMS.txt` by itself.  To check one by
+hand:
+
+- **Checksum:** compare `certutil -hashfile build-ds41-portable.zip SHA256` (or `Get-FileHash build-ds41-portable.zip`
+  in PowerShell) with the zip's line in `SHA256SUMS.txt`.
+- **Attestation** (that the zip came from this repository's workflow, at which commit), with the
+  [GitHub CLI](https://cli.github.com/):
+  ```bat
+  gh attestation verify build-ds41-portable.zip --repo musicurgy/delta-inference-engine
+  ```
+  It prints the workflow run and commit the zip was built from; a zip that was not built there fails.
+
 ## Setup by hand (what `Start DeepSeek.bat` does for you)
 
 1. **Python environment**, in this folder:
