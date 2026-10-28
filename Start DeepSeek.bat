@@ -42,6 +42,8 @@ set STRATA_ENGRAM_ASYNC=1
 set STRATA_ENGRAM_DIRECT=1
 set STRATA_DENSE_ASYNC=1
 set STRATA_PASS_NOSYNC=1
+rem the next layer's attention is queued before the prediction readback (exact; server +2.2 percent, round 224)
+set STRATA_D3_PF_ASYNC=1
 set "STRATA_SERVE_DSPARK=%DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf"
 if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" set STRATA_SERVE_DSPARK=
 rem the card's VRAM (README.md, "What you need"):
