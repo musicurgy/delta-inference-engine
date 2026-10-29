@@ -4024,8 +4024,8 @@ class Service:
         images = images_of(messages)
         if images:
             if self.vision is None:
-                raise ValueError("this server was started without the vision encoder (run setup again and choose "
-                                 "'vision'), so it cannot read images")
+                raise ValueError("this server was started without the vision encoder (pictures are off: run "
+                                 "'Enable Pictures.bat', then start again), so it cannot read images")
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
             def fetch(src):

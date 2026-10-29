@@ -116,6 +116,11 @@ normal priority.
 - **Tool calls** (OpenAI `tools`, including a forced `tool_choice`: `"required"` or a named function) and **JSON
   output** (`response_format` `json_object` / `json_schema`) work through the OpenAI-compatible API. Requests sent at
   the same time are answered one after another.
+- **Pictures** are off by default. Double-click **`Enable Pictures.bat`** once, then start DeepSeek again: it downloads
+  DeepSeek's vision encoder (0.97 GB, checked) and PyTorch's CPU build (124 MB). Then attach, drop or paste a picture
+  in the chat page, or send one through the OpenAI (`image_url`) or Anthropic (`image`) API. The encoder runs on the
+  CPU and takes no VRAM. On an i5-13600K a 1024x701 photo takes ~8 s to read and its first answer ~19 s; writing speed
+  stays the same. To turn pictures off again, put `off` in `vision-choice.txt`.
 
 ## Privacy
 

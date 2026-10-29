@@ -396,8 +396,12 @@ def main(argv=None):
 
     sidecar = a.sidecar or a.mmproj or DEFAULT_SIDECAR
     device = a.device or ("cuda" if a.gpu else "cpu")
-    enc = Encoder(sidecar, reference_dir=a.reference_dir, device=device, threads=a.threads,
-                  dtype=a.dtype, max_n_token=a.max_tokens or None)
+    try:
+        enc = Encoder(sidecar, reference_dir=a.reference_dir, device=device, threads=a.threads,
+                      dtype=a.dtype, max_n_token=a.max_tokens or None)
+    except Exception as e:                          # noqa: BLE001 - said on the protocol line: the server shows it
+        print(f"ERR {type(e).__name__}: {e}", flush=True)
+        raise
     log(f"ds41-vision: {len(enc.vit.blocks)} vit layers, n_embd {enc.n_embd}, image_token_id "
         f"{enc.image_token_id}, dtype {a.dtype}, device {device}, threads {enc.torch.get_num_threads()}")
     if device == "cuda":
