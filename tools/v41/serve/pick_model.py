@@ -8,6 +8,9 @@ Lists the models in the model folder (DS41_MODELS, ds41-paths.bat) and the ones 
   * Unsloth's quants (UD-IQ1_S ... UD-Q8_K_XL), downloaded into unsloth/<quant>/ as they are (every file SHA-256
     checked).  Their files carry their own Engram tables (IQ4_NL up to UD-IQ3_S - measured as good as DeepSeek's exact
     FP8 tables on UD-IQ1_S -, exact from UD-Q3_K_XL), which the launcher reads (ds41_local.py).
+  * the quality mode: bertholomus' EXL3 2.5 bpw routed experts (exllamav3's trellis format) on the default's dense layers
+    and Engram, downloaded as they are into exl3/<repo name>/ (every shard SHA-256 checked); the launcher gives the
+    engine --exl3 <that folder>.  It agrees more with DeepSeek's model than the default and writes slower.
 The choice goes into model-choice.txt in this folder (one line: a path in the model folder, or a full path); the launcher
 reads it.  Delete that file, or pick the default, to go back to the ds4 Q2 GGUF.
 """
@@ -45,6 +48,11 @@ UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreemen
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
     "UD-Q8_K_XL": (508, "-", "-", "exact"),
 }
+EXL3 = {   # folder in exl3/ -> name, GB to download, speed, agreement, Hugging Face repo
+    "DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw": ("EXL3 2.5 bpw (quality)", 185, "25 / - / - / -", "94.4%",
+                                             "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw"),   # round 238
+}
+EXL3_MIN_RAM_GB = 180   # its experts are 159 GiB: below ~192 GB of RAM most of them would come from the SSD (not measured)
 
 
 def ram_gb():
@@ -88,6 +96,37 @@ def unsloth_first(m, q):
         if f.endswith(".gguf") and "-00001-of-" in f and os.path.exists(os.path.join(d, f + ".ok")):
             return f"unsloth/{q}/{f}"
     return None
+
+
+def exl3_ready(m, d):
+    """an EXL3 folder in exl3/ whose every shard has its .ok (hf_verify.py), relative path, or None"""
+    p = os.path.join(m, "exl3", d)
+    if not os.path.isdir(p):
+        return None
+    shards = [f for f in os.listdir(p) if f.endswith(".safetensors")]
+    if not shards or not os.path.exists(os.path.join(p, "config.json")):
+        return None
+    if not all(os.path.exists(os.path.join(p, f + ".ok")) for f in shards):
+        return None
+    return f"exl3/{d}"
+
+
+def download_exl3(m, d):
+    """hf download REPO --local-dir <models>/exl3/<d>, then every shard's SHA-256 (hf_verify.py)"""
+    from huggingface_hub import HfApi
+    repo = EXL3[d][4]
+    files = [f for f in HfApi().list_repo_files(repo) if f.endswith(".safetensors")]
+    hf = os.path.join(ROOT, ".venv", "Scripts", "hf.exe")
+    py = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
+    dst = os.path.join(m, "exl3", d)
+    os.makedirs(dst, exist_ok=True)
+    r = subprocess.call([hf if os.path.exists(hf) else "hf", "download", repo, "--local-dir", dst])
+    if r != 0:
+        sys.exit("The download stopped (above) - start Choose Model.bat again to go on where it was.")
+    r = subprocess.call([py if os.path.exists(py) else sys.executable, os.path.join(ROOT, "tools", "v41", "hf_verify.py"),
+                         "--repo", repo, "--dir", dst] + files)
+    if r != 0:
+        sys.exit("A file differs from its published SHA-256 (above): delete it and start Choose Model.bat again.")
 
 
 def download_unsloth(m, q):
@@ -163,6 +202,10 @@ def main():
         p = unsloth_first(m, q)
         if p:
             row("use", p, "Unsloth " + q, gb, tps, agr)
+    for d, (name, gb, tps, agr, _) in EXL3.items():
+        p = exl3_ready(m, d)
+        if p and base:
+            row("use", p, name, gb, tps, agr, "  (+ the default)")
     free = shutil.disk_usage(m).free
 
     def room(gb):   # what a build / download says when it would not fit (picking it is refused below)
@@ -179,10 +222,20 @@ def main():
         for q in uns_todo:
             gb, tps, agr, eng = UNSLOTH_Q[q]
             row("download", q, "download Unsloth " + q, gb, tps, agr, f"  ({eng} Engram){room(gb)}")
+    x3_todo = [d for d in EXL3 if not exl3_ready(m, d)]
+    if x3_todo and base:
+        print("\n  Download the quality mode (EXL3 experts on the default; 100 MB/s = ~30 min; for 192 GB of RAM and an")
+        print("  internal NVMe drive - its experts outgrow the RAM, so some are read from the drive on every token):")
+        for d in x3_todo:
+            name, gb, tps, agr, _ = EXL3[d]
+            small = ram is not None and ram < EXL3_MIN_RAM_GB
+            row("download", d, "download " + name.split(" (")[0], gb, tps, agr,
+                ("  - needs ~192 GB of RAM" if small else "") + room(gb))
     print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, exact routing.  On 192 GB of RAM")
     print("  the default writes as fast as any and agrees best; with less RAM a smaller file writes faster (more of it")
     print("  fits; the rest is read from the SSD on every token).  Under 110 GB: Unsloth UD-IQ1_S, 30 / 25.5 tok/s at")
-    print("  96 / 64 GB against the default's 22 / 16, one point lower agreement.  (Measured on an RTX 3090.)\n")
+    print("  96 / 64 GB against the default's 22 / 16, one point lower agreement.  The EXL3 quality mode: 94.4% agreement")
+    print("  (the default 91.5%) at 25 tok/s (the default 41), with 192 GB of RAM.  (Measured on an RTX 3090.)\n")
     if not menu:
         sys.exit("No model yet - run Start DeepSeek.bat first: it downloads the default one.")
     pick = input(f"Number to use (1-{len(menu)}), Enter = keep the current one: ").strip()
@@ -204,6 +257,16 @@ def main():
                              "--ours", os.path.join(m, base), "--build", build, "--out", os.path.join(m, f)])
         if r != 0 or not os.path.exists(os.path.join(m, f)):
             sys.exit("The build stopped (above) - nothing changed.")
+    elif kind == "download" and f in EXL3:
+        name, gb = EXL3[f][0], EXL3[f][1]
+        free = shutil.disk_usage(m).free
+        if free < (gb + 5) * GB:
+            sys.exit(f"Not enough space for {name}: it needs ~{gb + 5} GB free in {m}, there are {free / GB:.0f} GB.")
+        print(f"Downloading {name} (~{gb} GB) into {os.path.join(m, 'exl3', f)} - if it stops, start again: it resumes.")
+        download_exl3(m, f)
+        f = exl3_ready(m, f)
+        if not f:
+            sys.exit("The download finished but a shard is not checked - nothing changed.")
     elif kind == "download":
         gb = UNSLOTH_Q[f][0]
         free = shutil.disk_usage(m).free

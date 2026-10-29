@@ -69,6 +69,12 @@ NativeExpertLayout native_expert_layout3(int gate_type, int up_type, int d_type,
 /// pairs that have a kernel (Q2_K/Q3_K either way round).
 bool native_expert_supported3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
 
+/// Delta: EXL3 experts (src/kernels/cuda/exl3_experts.cu) - what native_expert_grouped runs for an EXL3 class: gate and
+/// up into `gate` / `up` (cap_entries x n_ff floats each, by entry), the SwiGLU into `gate`, down into out row ent_dst[e].
+bool exl3_expert_supported(int k2, int64_t n_embd, int64_t n_ff) noexcept;
+void exl3_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                         const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t grid_groups,
+                         int64_t cap_entries, const void* x_q8_1, float* gate, float* up, float* out, void* stream);
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 /// out[t] = sum_k w[t*K + k] * parts[t*K + k] over rows of H floats, t < n (device pointers; the prompt chunk's mix).

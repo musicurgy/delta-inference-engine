@@ -1253,7 +1253,7 @@ class StrataEngine:
             # the DeepSeek-V4.1 engine's live decode knobs (ds41_generate's LiveKnobs): SSD read-ahead experts per
             # layer and layers ahead, prefetch slots per layer, the prefetch's P floor, the bias refresh period -
             # for A/Bs inside one loaded server; exact settings
-            for k, hi in (("d3_spec", 64), ("d3_spec_ahead", 8), ("d3_pf", 6), ("bias_refresh", 64)):
+            for k, hi in (("d3_spec", 64), ("d3_spec_ahead", 8), ("d3_pf", 6), ("bias_refresh", 64), ("bias_top", 64)):
                 v = tune.get(k)
                 if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= hi:
                     keys += f" {k}={v}"

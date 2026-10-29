@@ -3,11 +3,14 @@
 // VRAM cache, pinned RAM arena, file tier, CPU pool, PCIe share) + sampling.  Token ids in, token ids out (text is
 // the server's job: tools/v41/serve/serve_ds41.py).
 //
-//   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
+//   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu] [--exl3 DIR]
 //                 [--engram DIR:DIR:DIR | --engram MODEL.gguf] [--engram-hot hot.bin] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
-//                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
+//                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F] [--gpus 0,1] [--gpu-split L] [--gpu-margin 1.5]
+// --gpus A,B,.. (the expert layer split, opt-in): the dense half, KV and head on card A; each further card holds the
+// routed-expert tier (VRAM cache + its RAM arena share) of a contiguous range of layers (by free VRAM, or --gpu-split
+// = the first layer of each further card's range).  Without it: one card, as before.
 // --enc-skip (layer-major batches only; DEFAULT for one-shot runs, --no-enc-skip = full path): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
 // after layer 20's persistent-KV writes; only the last 2560 tokens run layers 21-39.  Same last-token logits / decode.
 //
@@ -66,6 +69,7 @@ struct Args {
     std::string tier_replay;       // --tier-replay F [--tier-replay-reps N]: replay a STRATA_TIER_RECORD file through the
     int tier_replay_reps = 3;      //   tier after the seed (exact old-vs-new kernel check + timing, no decode) and exit
     double mirror_gib = 85.0;
+    std::string exl3;             // --exl3 DIR: the routed experts from an EXL3 checkpoint (LibertAIDAI's; Delta). --experts cpu: CPU tier only
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
     float route_bias_file = 0.6f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena);
@@ -96,6 +100,9 @@ struct Args {
     double chunk_prefetch_gib = 0.0;
     int image_token = 129264;     // --image-token N: the model's <|image|> id (each image is one run of it in the prompt)
     bool vision = false;
+    std::vector<int> gpus;        // --gpus: CUDA devices, the dense card first (empty / one = one card)
+    std::vector<int> gpu_split;   // --gpu-split: the first layer of each further card's range (empty = by free VRAM)
+    double gpu_margin_gib = 1.5;  // --gpu-margin: VRAM a further card keeps free (its prompt-chunk buffers)
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -180,6 +187,9 @@ bool parse(int argc, char ** argv, Args & a) {
 #endif
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
         else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
+        else if (k == "--gpus") a.gpus = parse_csv(next());
+        else if (k == "--gpu-split") a.gpu_split = parse_csv(next());
+        else if (k == "--gpu-margin") a.gpu_margin_gib = std::atof(next().c_str());
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--rank") a.rank = next();
         else if (k == "--build-mirror") a.build_mirror = next();
@@ -214,6 +224,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--no-actquant") a.act_quant = false;
         else if (k == "--kv-fp4") a.kv_fp4 = true;
         else if (k == "--serve") a.serve = true;
+        else if (k == "--exl3") a.exl3 = next();
         else if (k == "--prune") a.prune = next();
         else if (k == "--prune-penalty") a.prune_penalty = (float) std::atof(next().c_str());
         else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
@@ -439,8 +450,17 @@ int main(int argc, char ** argv) {
     std::mt19937_64 rng(a.seed);
 
     // ---- dense half
-    ggml_backend_t be = a.backend == "cuda" ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr)
-                                            : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t be = nullptr;
+    if (a.backend == "cuda" && !a.gpus.empty()) {   // --gpus: the dense half on the first card listed (the n-th GPU device)
+        for (size_t i = 0, g = 0; i < ggml_backend_dev_count() && !be; ++i) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+            if ((int) g++ == a.gpus[0]) be = ggml_backend_dev_init(d, nullptr);
+        }
+    } else {
+        be = a.backend == "cuda" ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr)
+                                 : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    }
     if (!be) { std::fprintf(stderr, "ds41_generate: no %s backend\n", a.backend.c_str()); return 1; }
     if (ggml_backend_is_cpu(be)) ggml_backend_cpu_set_n_threads(be, a.threads > 0 ? a.threads : 8);
     int64_t ctx = a.ctx > 0 ? a.ctx : (int64_t) prompt.size() + a.n_predict + 64;
@@ -507,6 +527,7 @@ int main(int argc, char ** argv) {
 
     // ---- routed experts
     Ds41FileBlobs src(a.model);
+    if (!a.exl3.empty()) src.set_exl3(a.exl3);   // Delta: the EXL3 checkpoint's experts (its config.json must say exl3)
     if (!src.open(err)) { std::fprintf(stderr, "ds41_generate: experts: %s\n", err.c_str()); return 1; }
     const Ds41MoeGeom & TG = src.geom();
     double slot_gib = 0;
@@ -558,12 +579,169 @@ int main(int argc, char ** argv) {
                      a.prune_penalty > 0 ? ("penalised -" + std::to_string(a.prune_penalty)).c_str() : "masked out of routing", a.prune.c_str());
         mc.exclude = pruned;
     }
+    // --gpus A,B[,..] (the expert layer split): the dense half, every KV cache and the head stay on card A (the backend
+    // above); each further card holds a whole tier - VRAM expert cache + its share of the RAM arena - for a contiguous
+    // range of routed layers.  Those layers take the tier's host paths (run / run_multi / run_chunk: the activation in,
+    // the sum out through the host; no peer access needed); card A's layers run exactly as on one card.
+    const bool multi = a.gpus.size() > 1;
+    if (multi && mc.cpu_only) { std::fprintf(stderr, "ds41_generate: --gpus needs the GPU tier\n"); return 2; }
+    std::vector<int> layer_card((size_t) n_layer, 0);   // index into a.gpus (0 = the dense card)
+    std::vector<std::unique_ptr<Ds41MoeTier>> xtier;    // xtier[c - 1]: card c's tier
+    std::vector<double> card_gib(a.gpus.size(), 0.0), card_share(a.gpus.size(), 0.0);
+    if (multi) {
+        const int NC = (int) a.gpus.size();
+        card_gib[0] = slot_gib;
+        for (int c = 1; c < NC; ++c) {
+            strata::v41::ds41_cuda_schedule_from_env(a.gpus[(size_t) c]);   // STRATA_CUDA_SPIN, before its context
+            std::string name;
+            size_t fr = 0, tot = 0;
+            if (a.gpus[(size_t) c] == a.gpus[0] || !strata::v41::ds41_cuda_device_info(a.gpus[(size_t) c], name, fr, tot)) {
+                std::fprintf(stderr, "ds41_generate: --gpus: no usable CUDA device %d\n", a.gpus[(size_t) c]);
+                return 2;
+            }
+            card_gib[(size_t) c] = std::max(0.0, (double) fr / 1073741824.0 - a.gpu_margin_gib);
+            std::fprintf(stderr, "gpus: card %d = CUDA %d (%s): %.2f of %.2f GiB free -> %.2f GiB of expert slots (margin %.2f)\n",
+                         c, a.gpus[(size_t) c], name.c_str(), fr / 1073741824.0, tot / 1073741824.0, card_gib[(size_t) c], a.gpu_margin_gib);
+            const int pa = strata::v41::ds41_cuda_can_peer(a.gpus[0], a.gpus[(size_t) c]);
+            std::fprintf(stderr, "gpus: card %d peer access with card 0: %s (the sums go through the host either way)\n", c,
+                         pa > 0 ? "yes" : pa == 0 ? "no" : "unknown");
+        }
+        std::vector<int> rl;   // the routed layers, in order
+        for (int l = 0; l < n_layer; ++l) if (TG.routed(l)) rl.push_back(l);
+        if (!a.gpu_split.empty()) {   // explicit: the first layer of each further card's range
+            if ((int) a.gpu_split.size() != NC - 1) { std::fprintf(stderr, "ds41_generate: --gpu-split needs %d layer(s) for %d cards\n", NC - 1, NC); return 2; }
+            for (int c = 0; c + 1 < NC; ++c)
+                if (a.gpu_split[(size_t) c] <= (c ? a.gpu_split[(size_t) c - 1] : 0) || a.gpu_split[(size_t) c] >= n_layer) {
+                    std::fprintf(stderr, "ds41_generate: --gpu-split must increase, inside 1..%d\n", n_layer - 1); return 2;
+                }
+            for (int l = 0; l < n_layer; ++l)
+                for (int c = 0; c + 1 < NC; ++c) if (l >= a.gpu_split[(size_t) c]) layer_card[(size_t) l] = c + 1;
+        }
+        // STRATA_SPLIT_HOT=1 (with --rank; off by default): split by expert hotness - the boundaries that let the cards'
+        // slots hold the most of the global ranked head (the experts one card with all the slots would cache), less
+        // STRATA_SPLIT_LAYER_COST (default 0.005) of that head per layer on a further card (each costs a crossing).
+        // Card A's estimate is less STRATA_SPLIT_A_RESERVE GiB (default 2: the prompt / DSpark buffers).  Rounds
+        // 212-213 (3090 + x1 3060): it chose 22 next to the share split's 23 and measured the same (30.85 vs 30.73
+        // tok/s); 12 (a routes-file coverage optimum) 25.26, 30 30.33 - so the share split stays the default.
+        bool split_done = !a.gpu_split.empty();
+        if (!split_done && !a.rank.empty() && std::getenv("STRATA_SPLIT_HOT") && std::getenv("STRATA_SPLIT_HOT")[0] == '1') {
+            std::string rerr;
+            const std::vector<std::pair<int32_t, int32_t>> order = ds41_read_ranked(a.rank, rerr);
+            const char * rv = std::getenv("STRATA_SPLIT_A_RESERVE");
+            const char * lv = std::getenv("STRATA_SPLIT_LAYER_COST");
+            std::vector<double> budget(card_gib);
+            budget[0] = std::max(0.0, budget[0] - (rv ? std::atof(rv) : 2.0));
+            double all = 0;
+            for (double g : budget) all += g * 1073741824.0;
+            std::vector<int> ri((size_t) n_layer, -1);   // routed layer -> its index in rl
+            for (size_t i = 0; i < rl.size(); ++i) ri[(size_t) rl[i]] = (int) i;
+            std::vector<std::pair<int, double>> head;    // (rl index, bytes) of the global ranked head that fits `all`
+            for (const auto & le : order) {
+                if (le.first < 0 || le.first >= n_layer || ri[(size_t) le.first] < 0) continue;
+                const double b = (double) ((src.expert_bytes(le.first, le.second) + 4095) & ~(size_t) 4095);
+                if (all < b) break;
+                all -= b;
+                head.emplace_back(ri[(size_t) le.first], b);
+            }
+            const int L = (int) rl.size();
+            if (!head.empty() && L >= NC) {
+                const double lcost = (lv ? std::atof(lv) : 0.005) * (double) head.size();
+                // cov(c, i, j): the head experts of routed layers [i, j) that card c's budget holds (the range's head
+                // comes first in its own ranking, so it is that prefix)
+                auto cov = [&](int c, int i, int j) {
+                    double left = budget[(size_t) c] * 1073741824.0;
+                    int n = 0;
+                    for (const auto & h : head)
+                        if (h.first >= i && h.first < j) { if (left < h.second) break; left -= h.second; ++n; }
+                    return (double) n - (c ? lcost * (double) (j - i) : 0.0);
+                };
+                // best[c][j]: routed layers [0, j) on cards 0..c, each a non-empty range; ties keep more layers early
+                const double NEG = -1e300;
+                std::vector<std::vector<double>> best((size_t) NC, std::vector<double>((size_t) L + 1, NEG));
+                std::vector<std::vector<int>> from((size_t) NC, std::vector<int>((size_t) L + 1, -1));
+                for (int j = 1; j <= L; ++j) best[0][(size_t) j] = cov(0, 0, j);
+                for (int c = 1; c < NC; ++c)
+                    for (int j = c + 1; j <= L; ++j)
+                        for (int i = c; i < j; ++i) {
+                            if (best[(size_t) c - 1][(size_t) i] <= NEG) continue;
+                            const double v = best[(size_t) c - 1][(size_t) i] + cov(c, i, j);
+                            if (v >= best[(size_t) c][(size_t) j]) { best[(size_t) c][(size_t) j] = v; from[(size_t) c][(size_t) j] = i; }
+                        }
+                std::vector<int> start((size_t) NC, 0);
+                for (int c = NC - 1, j = L; c > 0; --c) { start[(size_t) c] = from[(size_t) c][(size_t) j]; j = start[(size_t) c]; }
+                for (int c = 0; c < NC; ++c)
+                    for (int i = start[(size_t) c]; i < (c + 1 < NC ? start[(size_t) c + 1] : L); ++i) layer_card[(size_t) rl[(size_t) i]] = c;
+                double held = 0;
+                for (int c = 0; c < NC; ++c) held += cov(c, start[(size_t) c], c + 1 < NC ? start[(size_t) c + 1] : L) +
+                                                     (c ? lcost * (double) ((c + 1 < NC ? start[(size_t) c + 1] : L) - start[(size_t) c]) : 0.0);
+                std::fprintf(stderr, "gpus: split by expert hotness: the cards hold %.0f of the %zu-expert ranked head (%.1f%%)\n", held, head.size(), 100.0 * held / (double) head.size());
+                split_done = true;
+            }
+        }
+        if (!split_done) {   // by free VRAM: the slots each card can give, routed layers dealt out in proportion
+            double sum = 0;
+            for (double g : card_gib) sum += g;
+            if (sum <= 0) { std::fprintf(stderr, "ds41_generate: --gpus: no free VRAM for experts on any card\n"); return 2; }
+            double cum = 0;
+            size_t i = 0;
+            for (int c = 0; c < NC; ++c) {
+                cum += card_gib[(size_t) c];
+                const size_t end = c + 1 == NC ? rl.size() : (size_t) std::llround(cum / sum * (double) rl.size());
+                for (; i < end && i < rl.size(); ++i) layer_card[(size_t) rl[i]] = c;
+            }
+        }
+        for (int l : rl) card_share[(size_t) layer_card[(size_t) l]] += 1.0 / (double) rl.size();
+        for (int c = 0; c < NC; ++c) {
+            int lo = -1, hi = -1;
+            for (int l : rl) if (layer_card[(size_t) l] == c) { if (lo < 0) lo = l; hi = l; }
+            std::fprintf(stderr, "gpus: card %d (CUDA %d): layers %d-%d (%.0f%% of the routed layers)\n", c, a.gpus[(size_t) c],
+                         lo, hi, 100.0 * card_share[(size_t) c]);
+        }
+        // the RAM arena is split by the same shares (the RAM total is unchanged)
+        mc.device = a.gpus[0];
+    }
+    const Ds41MoeConfig mc_all = mc;   // the further cards' tiers start from the whole-model config
+    if (multi) {
+        mc.arena_gib = a.arena_gib * card_share[0];
+        mc.max_arena_gib = mc.arena_gib;
+        // WDDM: with a second card's context in the process, ~45-50 GiB of pinned host memory IN ALL is what works; past
+        // that the further card cannot allocate anything (rounds 204-209: card A 45 GiB + card 1 1 GiB ran; 45 + 11,
+        // 64 + 1 and 71 + 1 did not, portable or not).  STRATA_MULTI_PIN_GIB overrides card A's 44 GiB.
+        const char * mp = std::getenv("STRATA_MULTI_PIN_GIB");
+        mc.pin_cap_gib = mp ? std::max(1.0, std::atof(mp)) : 44.0;
+    }
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
+    for (size_t c = 1; multi && c < a.gpus.size(); ++c) {
+        Ds41MoeConfig xc = mc_all;
+        xc.device = a.gpus[c];
+        xc.shared_pool = tier.shared_pool();   // one set of CPU workers: the tiers run one layer at a time
+        xc.arena_gib = a.arena_gib * card_share[c];
+        xc.max_arena_gib = xc.arena_gib;
+        // STRATA_SPLIT_PIN_GIB (default 1): a further card's pin.  WDDM charges a card's pinned host memory to that card's
+        // budget (see card A's cap above): with 1 GiB it ran (round 206).  Its arena misses go through staging copies.
+        const char * xp = std::getenv("STRATA_SPLIT_PIN_GIB");
+        xc.pin_cap_gib = xp ? std::max(1.0, std::atof(xp)) : 1.0;
+        xc.slot_gib = card_gib[c];
+        xc.sum_on_card = !std::getenv("STRATA_SPLIT_HOST_SUM");   // the sums on the card (STRATA_SPLIT_HOST_SUM=1: the host's)
+        xc.defer_cache = true;
+        xtier.push_back(std::make_unique<Ds41MoeTier>());
+        if (!xtier.back()->init(TG, &src, xc, err)) { std::fprintf(stderr, "ds41_generate: card %zu tier init: %s\n", c, err.c_str()); return 1; }
+    }
+    // the tier that owns layer l, and whether it is on another card than the dense half
+    auto T = [&](int64_t l) -> Ds41MoeTier & {
+        const int c = multi && l >= 0 && l < n_layer ? layer_card[(size_t) l] : 0;
+        return c ? *xtier[(size_t) c - 1] : tier;
+    };
+    auto remote = [&](int64_t l) { return multi && l >= 0 && l < n_layer && layer_card[(size_t) l] != 0; };
+    auto each_tier = [&](const std::function<void(Ds41MoeTier &)> & f) { f(tier); for (auto & x : xtier) f(*x); };
+    auto stats_all = [&]() { Ds41MoeStats s = tier.stats(); for (auto & x : xtier) s.add(x->stats()); return s; };
+    auto resident_all = [&]() { int64_t r = tier.resident(); for (auto & x : xtier) r += x->resident(); return r; };
     dense.set_oom_hook([&]() { return tier.release_prestage(); });   // a prompt pass that does not fit: prestage gives way
     // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
     // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
     // per request: a multi-token prompt closes the cache (release_cache), the decode after it re-seeds (~0.6 s)
-    const bool defer_vram = !mc.cpu_only && (a.prefill_chunk > 1 || a.prompt_batch > 1);
+    // (--tier-replay: no prompt will run, so the VRAM cache seeds now - the replay exercises the hit class too)
+    const bool defer_vram = !mc.cpu_only && (a.prefill_chunk > 1 || a.prompt_batch > 1) && a.tier_replay.empty();
     std::vector<std::pair<int32_t, int32_t>> ranked;
     if (!mc.cpu_only) {
         if (!a.rank.empty()) {
@@ -574,6 +752,56 @@ int main(int argc, char ** argv) {
                 for (int64_t e = 0; e < TG.n_experts; ++e) ranked.emplace_back((int32_t) l, (int32_t) e);
         }
         const double t0 = now_ms();
+        std::vector<std::vector<std::pair<int32_t, int32_t>>> rk(multi ? a.gpus.size() : 0);
+        if (multi) {   // each card's tier gets its own layers' share of the ranking; card A keeps `ranked`
+            for (const auto & le : ranked)
+                if (le.first >= 0 && le.first < n_layer) rk[(size_t) layer_card[(size_t) le.first]].push_back(le);
+            ranked.swap(rk[0]);
+        }
+        // the further cards' tiers: arena, then the VRAM cache.  After card A by default, so card A pins its arena share
+        // first (WDDM takes ~45-50 GiB pinned in all with two cards); STRATA_SPLIT_SEED_FIRST=1: before it (their cache
+        // allocated before card A pins).  Round 212: card A then pinned 76 GiB and its own next cudaMalloc failed - the budget
+        // is the whole process's, so it does not help; kept for tests on other drivers)
+        auto seed_extra = [&]() -> bool {
+            for (size_t c = 1; c < a.gpus.size(); ++c) {
+                const double tc = now_ms();
+                Ds41MoeTier & xt = *xtier[c - 1];
+                if (!xt.build_arena_ranked(rk[c], err)) {
+                    std::fprintf(stderr, "ds41_generate: card %zu arena: %s\n", c, err.c_str());
+                    return false;
+                }
+                // the cache is sized from the card's free VRAM NOW (after its context and pinning), and stepped down
+                // 0.5 GiB at a time when one big cudaMalloc is refused: WDDM can refuse it with the memory reported
+                // free (round 201: 9.48 GiB failed on the 3060 with 10.99 GiB free).  The arena is already built, so a
+                // retry only re-opens the cache; below 1 GiB the card runs with its cache off (arena + file tier).
+                std::string nm;
+                size_t fb = 0, tb = 0;
+                double slot = card_gib[c];
+                if (ds41_cuda_device_info(a.gpus[c], nm, fb, tb))
+                    slot = std::min(slot, (double) fb / 1073741824.0 - a.gpu_margin_gib);
+                bool seeded = false;
+                for (; slot >= 1.0 && !seeded; slot -= 0.5) {
+                    xt.set_cache_enabled(true);
+                    xt.set_slot_gib(slot);
+                    seeded = xt.seed_from_ranked(rk[c], err);
+                    if (!seeded) std::fprintf(stderr, "gpus: card %zu cache of %.2f GiB refused (%s) - trying 0.5 GiB less\n", c, slot, err.c_str());
+                }
+                if (!seeded) {
+                    std::fprintf(stderr, "gpus: card %zu: no VRAM cache (the arena + file tier serve its layers)\n", c);
+                    xt.set_cache_enabled(false);
+                    if (!xt.seed_from_ranked(rk[c], err)) {
+                        std::fprintf(stderr, "ds41_generate: card %zu seed: %s\n", c, err.c_str());
+                        return false;
+                    }
+                }
+                std::fprintf(stderr, "gpus: card %zu tier: %lld experts in VRAM, %lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
+                             c, (long long) xtier[c - 1]->resident(), (long long) xtier[c - 1]->arena_experts(),
+                             xtier[c - 1]->arena_gib(), (long long) xtier[c - 1]->file_tier(), (now_ms() - tc) / 1000.0);
+            }
+            return true;
+        };
+        static const bool seed_first = std::getenv("STRATA_SPLIT_SEED_FIRST") && std::getenv("STRATA_SPLIT_SEED_FIRST")[0] == '1';
+        if (multi && seed_first && !seed_extra()) return 1;
         if (defer_vram ? !tier.build_arena_ranked(ranked, err) : !tier.seed_from_ranked(ranked, err)) {
             std::fprintf(stderr, "ds41_generate: seed: %s\n", err.c_str());
             return 1;
@@ -581,6 +809,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "tier: %lld experts in VRAM, %lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
                      (long long) tier.resident(), (long long) tier.arena_experts(), tier.arena_gib(), (long long) tier.file_tier(),
                      (now_ms() - t0) / 1000.0);
+        if (multi && !seed_first && !seed_extra()) return 1;
     }
     // STRATA_ROUTE_TRACE=<file> (measurement only, both modes): the routing trace tools/v41/sim/route_sim.py and
     // place_sim.py replay.  Opened here (round 231) so the server's passes are in it too; each decode start adds an
@@ -608,25 +837,44 @@ int main(int argc, char ** argv) {
         }
     }
     auto resident_now = [&](int64_t l, int64_t e) {
-        return proxy_res.empty() ? tier.resident(l, e) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
+        return proxy_res.empty() ? T(l).resident(l, e) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
     };
     // bias_now: route-bias / file penalty are DECODE levers - before the VRAM seed (the prompt) only the prune part
     // applies, unless --bias-prompt measures them (the prompt's file tier is prefetched; a penalty there buys nothing)
     bool bias_now = a.bias_prompt > 0 || !defer_vram;
     bool bias_set = false;   // a nonzero bias is in the dense half now (--serve turns it off again for the next prompt)
+    // Live decode knobs (round 240): the settings an A/B most often flips, read from the environment once here and
+    // changeable per request through the serve protocol (GEN ... d3_spec=N d3_spec_ahead=N d3_pf=N pf_p=X
+    // bias_refresh=N bias_top=N; the server passes a request's "strata_tune" fields), so two settings can alternate
+    // inside ONE loaded server (bench/win3090/bench_server.py --tune-ab).  All exact except bias_top (A9, lossy
+    // like the bias itself): 0 = the flat bias on every resident expert (today); N = only the N experts the
+    // NEXT layer's prediction ranks highest, if resident, get the bias - the rest of routing is exact (arXiv
+    // 2610.34721's bounded steer; the per-layer upload happens one layer ahead in pass_v).
+    struct LiveKnobs {
+        int d3_spec, d3_spec_ahead, d3_pf, bias_refresh, bias_top;
+        float pf_pmin;
+    } knobs {
+        std::getenv("STRATA_D3_SPEC") ? std::atoi(std::getenv("STRATA_D3_SPEC")) : 0,
+        std::getenv("STRATA_D3_SPEC_AHEAD") ? std::atoi(std::getenv("STRATA_D3_SPEC_AHEAD")) : 2,
+        std::getenv("STRATA_D3_PF") ? std::atoi(std::getenv("STRATA_D3_PF")) : 1,
+        std::getenv("STRATA_BIAS_REFRESH") ? std::max(0, std::atoi(std::getenv("STRATA_BIAS_REFRESH"))) : 0,
+        std::getenv("STRATA_BIAS_TOP") ? std::max(0, std::atoi(std::getenv("STRATA_BIAS_TOP"))) : 0,
+        std::getenv("STRATA_D3_PF_P") ? (float) std::atof(std::getenv("STRATA_D3_PF_P")) : 0.0f,
+    };
     std::vector<std::vector<float>> rb_up((size_t) TG.n_layers);   // the bias each layer has on the card (changed_only)
     // changed_only (STRATA_BIAS_REFRESH): upload just the layers whose bias differs from what the card has - between two
     // verify passes only a few experts change residency, and every set_route_bias is a synchronous upload
     auto apply_bias = [&](bool changed_only = false) {
         const bool want = n_pruned > 0 || (bias_now && (a.route_bias != 0.0f || a.route_bias_file != 0.0f));
         if (!want && !bias_set) return;
+        if (changed_only && knobs.bias_top > 0) return;   // A9: pass_v keeps each layer's bounded bias current itself
         bias_set = want;
         std::vector<float> rb((size_t) TG.n_experts);
         for (int64_t l = 0; l < TG.n_layers; ++l) {
             for (int64_t e = 0; e < TG.n_experts; ++e)
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
-                               : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
-                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+                               : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && knobs.bias_top == 0 && resident_now(l, e)) ? a.route_bias
+                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !T(l).in_arena(l, e)) ? -a.route_bias_file : 0.0f;
             if (changed_only && rb_up[(size_t) l] == rb) continue;
             dense.set_route_bias((int) l, rb.data());
             rb_up[(size_t) l] = rb;
@@ -699,7 +947,7 @@ int main(int argc, char ** argv) {
     const int pred_ahead = std::getenv("STRATA_PRED_AHEAD") ? std::max(1, std::atoi(std::getenv("STRATA_PRED_AHEAD"))) : 1;
     std::vector<std::vector<int>> pl_ahead((size_t) n_layer);   // [layer]: its k-ahead prediction (16 per pass row)
     auto plog_rec = [&](std::FILE * plf, int l, int m, int pos, const int * pred, const int * act) {
-        auto tier_of = [&](int e) -> int16_t { return (int16_t) (e < 0 ? -1 : tier.resident(l, e) ? 0 : tier.in_arena(l, e) ? 1 : 2); };
+        auto tier_of = [&](int e) -> int16_t { return (int16_t) (e < 0 ? -1 : T(l).resident(l, e) ? 0 : T(l).in_arena(l, e) ? 1 : 2); };
         pl_buf.assign({ (int16_t) 'R', (int16_t) l, (int16_t) m, (int16_t) top_k, (int16_t) (pos & 0x7fff), (int16_t) (pos >> 15) });
         for (int i = 0; i < m * 16; ++i) pl_buf.push_back((int16_t) (pred ? pred[i] : -1));
         for (int i = 0; i < m * top_k; ++i) pl_buf.push_back((int16_t) act[i]);
@@ -743,13 +991,13 @@ int main(int argc, char ** argv) {
                     if (l + k < n_layer && !dense.predict(l + k, pk, 16)) std::fill(pk, pk + 16, -1);
                     if (l + k < n_layer)   // file-tier candidates = the reads a speculative fetch would issue
                         for (int i = 0; i < 16; ++i)
-                            if (pk[i] >= 0 && !tier.resident(l + k, pk[i]) && !tier.in_arena(l + k, pk[i]))
+                            if (pk[i] >= 0 && !T(l + k).resident(l + k, pk[i]) && !T(l + k).in_arena(l + k, pk[i]))
                                 for (int c = 0; c < 3; ++c) fp_cand[k][c] += i < (4 << c);
                 }
             }
             if (advise_ahead > 0 && l + advise_ahead < n_layer) {   // file-tier readahead for layer l+k's predicted experts
                 int ta[16];
-                if (dense.predict(l + advise_ahead, ta, 16)) tier.advise_file(l + advise_ahead, ta, advise_top);
+                if (dense.predict(l + advise_ahead, ta, 16)) T(l + advise_ahead).advise_file(l + advise_ahead, ta, advise_top);
             }
             const float * fn = nullptr;
             ggml_tensor * fn_t = nullptr;   // the same activation on the card: the tier quantizes it there
@@ -759,7 +1007,7 @@ int main(int argc, char ** argv) {
                 static const bool pf_spin = std::getenv("STRATA_PF_SPIN") && std::getenv("STRATA_PF_SPIN")[0] == '1';
                 if (pf_spin) strata::v41::ds41_cuda_event_spin(dense.predict_event());
                 if (!(pf_spin ? dense.predict_take(top16, 16) : dense.predict_wait(top16, 16))) { ferr = dense.last_error(); return false; }
-                tier.prefetch(l, top16, 16);   // its DMAs overlap the attention already on the card
+                T(l).prefetch(l, top16, 16);   // its DMAs overlap the attention already on the card
                 pl_have = true;
                 pred_pending = false;
                 have_pred = false;
@@ -769,11 +1017,11 @@ int main(int argc, char ** argv) {
             } else if (mc.pf_b > 0 && !mc.cpu_only) {   // the DMAs run under this layer's attention
                 int t16[16];
                 if (have_pred) {                  // predicted by the previous layer's finish_predict (same state)
-                    tier.prefetch(l, top16, 16);
+                    T(l).prefetch(l, top16, 16);
                     pl_have = true;
                 } else if (dense.predict(l, t16, 16)) {
                     for (int i = 0; i < 16; ++i) top16[i] = t16[i];
-                    tier.prefetch(l, top16, 16);
+                    T(l).prefetch(l, top16, 16);
                     pl_have = true;
                 }
                 have_pred = false;
@@ -789,7 +1037,7 @@ int main(int argc, char ** argv) {
             if (file_pred) {
                 for (int j = 0; j < top_k; ++j) {
                     const int e = ids1[(size_t) j];
-                    if (e < 0 || tier.resident(l, e) || tier.in_arena(l, e)) continue;
+                    if (e < 0 || T(l).resident(l, e) || T(l).in_arena(l, e)) continue;
                     ++fp_miss[0];
                     for (int k = 1; k <= kFP; ++k) {
                         if (l - k < 0) continue;   // nothing predicted this layer k layers ago
@@ -804,12 +1052,13 @@ int main(int argc, char ** argv) {
                 }
             }
             if (!dense.shexp_launch(l)) { ferr = dense.last_error(); return false; }   // STRATA_SHEXP_SPLIT
-            const bool tok = rdev1 ? tier.run_to_dev(l, ids1.data(), w1.data(), fn, rdev1, fn_t ? fn_t->data : nullptr)
-                                   : tier.run(l, ids1.data(), w1.data(), fn, routed1.data());
+            float * const rd1 = remote(l) ? nullptr : rdev1;   // --gpus: another card's layer sums through the host
+            const bool tok = rd1 ? tier.run_to_dev(l, ids1.data(), w1.data(), fn, rd1, fn_t ? fn_t->data : nullptr)
+                                 : T(l).run(l, ids1.data(), w1.data(), fn, routed1.data());
             if (!tok) { ferr = "tier.run failed"; return false; }
-            if (void * ev = tier.take_sum_event()) dense.wait_event(ev);   // STRATA_SUM_NOSYNC: order on the card
+            if (void * ev = T(l).take_sum_event()) dense.wait_event(ev);   // STRATA_SUM_NOSYNC: order on the card
             if (dprof) { const double t = now_ms(); dp[3] += t - ta; ta = t; }
-            const float * rsum = rdev1 ? nullptr : routed1.data();   // null: already in the routed tensor
+            const float * rsum = rd1 ? nullptr : routed1.data();   // null: already in the routed tensor
             if (fuse_predict && mc.pf_b > 0 && !mc.cpu_only && l + 1 < n_layer) {
                 int t16[16];
                 if (spec_top > 0 && spec_ahead > 0) {
@@ -817,8 +1066,8 @@ int main(int argc, char ** argv) {
                     const int na = std::min(spec_ahead, 8);
                     if (!dense.finish_predict_ahead(l, rsum, l + 1, t16, 16, na, ahead)) { ferr = dense.last_error(); return false; }
                     if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
-                    if (spec_l1) tier.spec_read(l + 1, t16, std::min(spec_top, 16));
-                    for (int a = 0; a < na; ++a) tier.spec_read(l + 2 + a, ahead + a * 16, std::min(spec_top, 16));
+                    if (spec_l1) T(l + 1).spec_read(l + 1, t16, std::min(spec_top, 16));
+                    for (int a = 0; a < na; ++a) T(l + 2 + a).spec_read(l + 2 + a, ahead + a * 16, std::min(spec_top, 16));
                     if (dprof) { const double t = now_ms(); dp[5] += t - ta; ta = t; }
                 } else if (pf_overlap) {   // launch only: the next layer waits for the prediction after its attention starts
                     if (!dense.finish_predict_launch(l, rsum, l + 1)) { ferr = dense.last_error(); return false; }
@@ -860,16 +1109,17 @@ int main(int argc, char ** argv) {
         for (int l = 0; l < n_layer; ++l) {
             const float * fn = nullptr;
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
+            float * const rdl = remote(l) ? nullptr : rdev1;   // --gpus: another card's layer through the host
             for (int t = 0; t < m; ++t) {
-                const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
-                                                        fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
-                                      : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
-                                                 fn + (size_t) t * n_embd, routed1.data());
+                const bool ok = rdl ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                      fn + (size_t) t * n_embd, rdl + (size_t) t * n_embd)
+                                    : T(l).run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                               fn + (size_t) t * n_embd, routed1.data());
                 if (!ok) { ferr = "tier.run failed"; return false; }
-                if (void * ev = tier.take_sum_event()) dense.wait_event(ev);   // STRATA_SUM_NOSYNC
-                if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
+                if (void * ev = T(l).take_sum_event()) dense.wait_event(ev);   // STRATA_SUM_NOSYNC
+                if (!rdl) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
             }
-            if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
+            if (!dense.finish(l, rdl ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
         }
         return true;
     };
@@ -882,6 +1132,7 @@ int main(int argc, char ** argv) {
     std::vector<std::pair<int, int>> pv_score;
     std::vector<std::pair<int, float>> pv_noq;         // STRATA_D3_PF_NOISYOR: (expert, prod over rows of 1 - p)
     double pv_ms[4] = {0, 0, 0, 0};   // pass_v split: dense (begin/attn_router/finish), tier, taps (read_state), logits
+    double pv_rm = 0;   // --gpus: the wall of the other cards' layers' tier calls (part of pv_ms[1])
     long pv_n = 0, pv_tok = 0;
     auto pass_v = [&](const int * toks, int m, int pos) -> bool {
         // D3 (the batched per-class verify tier) is the default: correct (bias-off verify-vs-prefill gate, near-ties
@@ -896,21 +1147,32 @@ int main(int argc, char ** argv) {
         // STRATA_ROUTE_TRACE (round 231): the same per-pass numbers as a 'V' record of the trace - {m, wall us, dense
         // us, tier us, hits, cpu, pcie, file, spec hits, spec issued, prefetch useful, prefetch issued, trace us} -
         // the last being the time the trace's own extra predictions took ('R' records below: in the wall and the
-        // dense time, never the tier's; the replay subtracts it)
+        // dense time, never the tier's; the replay subtracts it).  --gpus (multigpu): the pass log line also carries
+        // the other cards' tier wall and their hits / cpu / pcie / file.
         const bool tracing = tier.tracing();
         double tr_extra_ms = 0;
-        const double pl_t0 = tq, pl_d0 = pv_ms[0], pl_t1 = pv_ms[1];
+        const double pl_t0 = tq, pl_d0 = pv_ms[0], pl_t1 = pv_ms[1], pl_r0 = pv_rm;
         const Ds41MoeStats pl_s0 = (pass_log || tracing) ? tier.stats() : Ds41MoeStats{};
+        auto xstats = [&]() { Ds41MoeStats s; for (auto & x : xtier) s.add(x->stats()); return s; };
+        const Ds41MoeStats pl_x0 = pass_log && multi ? xstats() : Ds41MoeStats{};
         struct PassLogLine {
-            std::FILE * f; int m; double t0, d0, k0; const double * ms; const Ds41MoeStats * s0; Ds41MoeTier * tr;
+            std::FILE * f; int m; double t0, d0, k0, r0; const double * ms; const double * rm; const Ds41MoeStats * s0;
+            Ds41MoeTier * tr; const Ds41MoeStats * x0; const std::function<Ds41MoeStats()> xs;
             bool trace; const double * extra;
             ~PassLogLine() {
                 if (!f && !trace) return;
                 const Ds41MoeStats s = tr->stats();
                 if (f) {
-                    std::fprintf(f, "%d %.3f %.3f %.3f %lld %lld %lld %lld\n", m, now_ms() - t0, ms[0] - d0, ms[1] - k0,
+                    std::fprintf(f, "%d %.3f %.3f %.3f %lld %lld %lld %lld", m, now_ms() - t0, ms[0] - d0, ms[1] - k0,
                                  (long long) (s.hits - s0->hits), (long long) (s.cpu - s0->cpu), (long long) (s.pcie - s0->pcie),
                                  (long long) (s.file_tier - s0->file_tier));
+                    if (xs) {   // --gpus: + the other cards' tier wall (ms) and their hits / cpu / pcie / file
+                        const Ds41MoeStats x = xs();
+                        std::fprintf(f, " %.3f %lld %lld %lld %lld", *rm - r0, (long long) (x.hits - x0->hits),
+                                     (long long) (x.cpu - x0->cpu), (long long) (x.pcie - x0->pcie),
+                                     (long long) (x.file_tier - x0->file_tier));
+                    }
+                    std::fputc('\n', f);
                     std::fflush(f);
                 }
                 if (trace) {
@@ -923,7 +1185,8 @@ int main(int argc, char ** argv) {
                     tr->trace_rec('V', v, 13);
                 }
             }
-        } pass_log_line { pass_log, m, pl_t0, pl_d0, pl_t1, pv_ms, &pl_s0, &tier, tracing, &tr_extra_ms };
+        } pass_log_line { pass_log, m, pl_t0, pl_d0, pl_t1, pl_r0, pv_ms, &pv_rm, &pl_s0, &tier, &pl_x0,
+                          multi ? std::function<Ds41MoeStats()>(xstats) : std::function<Ds41MoeStats()>(), tracing, &tr_extra_ms };
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
         vh.assign((size_t) m * 3 * n_embd, 0.0f);
@@ -935,7 +1198,7 @@ int main(int argc, char ** argv) {
         // docs prompt, same text: slots 0/1/2/3/6 -> verify 104.4/101.7/104.5/111.1/124.1 ms (precision 40% at 1).
         // Its row cap stays 8 (the old kMaxMulti, i.e. the passes it was measured on): since kMaxMulti 16 a 9-16-row
         // pass is ONE tier call too, but it ran without the prefetch before and still does (a separate experiment).
-        static const int d3_pf = std::getenv("STRATA_D3_PF") ? std::atoi(std::getenv("STRATA_D3_PF")) : 1;
+        const int d3_pf = knobs.d3_pf;   // live knob (per request)
         // STRATA_D3_PF_EARLY=K (default 0 = off; rounds 117 / 119): K experts of the NEXT layer, ranked as this layer's
         // (noisy-OR when on) from a prediction made one layer early in the same graph (predict_multi2: no extra sync),
         // copied into a second staging right after this layer's tier call has queued its demand copies - they have the
@@ -960,7 +1223,7 @@ int main(int argc, char ** argv) {
         // (then STRATA_D3_PF can be raised: P >= 0.8 x 2 slots = 82%).  STRATA_D3_PF_PTAB=F: per-layer p rows, 16 per
         // line, '#' comments (bench/win3090/pred_noisyor.py --write-table) instead of the pooled ones.
         static const bool pf_noisyor = std::getenv("STRATA_D3_PF_NOISYOR") && std::getenv("STRATA_D3_PF_NOISYOR")[0] == '1';
-        static const float pf_pmin = std::getenv("STRATA_D3_PF_P") ? (float) std::atof(std::getenv("STRATA_D3_PF_P")) : 0.0f;
+        const float pf_pmin = knobs.pf_pmin;   // live knob (per request)
         static const std::vector<std::vector<float>> pf_ptab = [] {
             std::vector<std::vector<float>> t;
             const char * fn = std::getenv("STRATA_D3_PF_PTAB");
@@ -1012,7 +1275,7 @@ int main(int argc, char ** argv) {
             // STRATA_D3_L3WARM=K: the next K predicted experts (not in VRAM, not prefetched to the card) are read into the
             // CPU's cache under the attention, for the tier's pool (Ds41MoeTier::warm_multi)
             static const int d3_l3warm = std::getenv("STRATA_D3_L3WARM") ? std::atoi(std::getenv("STRATA_D3_L3WARM")) : 0;
-            if (pf_now && !pf_async) {
+            if (pf_now && !pf_async && !remote(l)) {   // (--gpus: another card's layers go without the D3 prefetch)
                 pv_pred.resize((size_t) m * 16);
                 const bool two = d3_pf_early > 0 && l + 1 < n_layer;   // STRATA_D3_PF_EARLY: the next layer's too
                 if (two) pv_next.resize((size_t) m * 16);
@@ -1029,6 +1292,33 @@ int main(int argc, char ** argv) {
                         have_next = true;
                     }
                 }
+            }
+            // A9 (bias_top=N, round 241): the bounded cache-aware bias.  The bias for layer l + 1 is built here, one
+            // layer ahead, from the router's own prediction for l + 1 made on the state entering l (as the trace's
+            // 'R' records and predict_multi2 do): only the N highest-ranked predicted experts that are resident get
+            // the route bias; every other expert routes exactly (the file penalty stays as apply_bias sets it).
+            // One prediction and one small upload per layer (~1.5% of a pass); the upload lands before layer l + 1's
+            // attention is launched, on both the async and the sync prefetch paths.  Lossy like the flat bias;
+            // arXiv 2610.34721 measured this shape at +1.7-2.2 points over the flat bias at the same latency.
+            if (knobs.bias_top > 0 && bias_now && a.route_bias != 0.0f && rdev1 && !no_tier_batch && m <= Ds41MoeTier::kMaxMulti &&
+                l + 1 < n_layer && !remote(l + 1)) {
+                pv_pred.resize((size_t) m * 16);
+                std::vector<float> & rb = rb_up[(size_t) (l + 1)];
+                rb.assign((size_t) TG.n_experts, 0.0f);
+                for (int64_t e = 0; e < TG.n_experts; ++e)   // the base: the prune mask and the file penalty, as apply_bias
+                    rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) ((l + 1) * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
+                                   : (a.route_bias_file != 0.0f && !resident_now(l + 1, e) && !T(l + 1).in_arena(l + 1, e)) ? -a.route_bias_file : 0.0f;
+                if (dense.predict_multi(l + 1, pv_pred.data())) {
+                    rank_union(l + 1);
+                    int given = 0;
+                    for (int e : pv_rank) {
+                        if (given >= knobs.bias_top) break;
+                        if (e < 0 || e >= TG.n_experts || !resident_now(l + 1, e)) continue;
+                        rb[(size_t) e] = a.route_bias;
+                        ++given;
+                    }
+                }
+                dense.set_route_bias((int) (l + 1), rb.data());
             }
             // STRATA_ROUTE_TRACE (round 231): the ranked prediction for layers l + a, a in STRATA_ROUTE_TRACE_AHEAD
             // (default "0,2": the prefetch's own layer and the read-ahead's), as an 'R' record {l, l + a, n, n x
@@ -1070,8 +1360,7 @@ int main(int argc, char ** argv) {
             // union ranked as above, and the NVMe-tier experts among the top n read into the stash by background
             // readers while layers l..l+k-1 run - the verify pass otherwise waits on them (nsys x0.5: pthread_join
             // 7.9 ms/token on the decode thread).  A wrong guess costs SSD bandwidth only.
-            static const int d3_spec = std::getenv("STRATA_D3_SPEC") ? std::atoi(std::getenv("STRATA_D3_SPEC")) : 0;
-            static const int d3_spec_ahead = std::getenv("STRATA_D3_SPEC_AHEAD") ? std::atoi(std::getenv("STRATA_D3_SPEC_AHEAD")) : 2;
+            const int d3_spec = knobs.d3_spec, d3_spec_ahead = knobs.d3_spec_ahead;   // live knobs (per request)
             // (round 229 / A7: the launcher can set STRATA_D3_SPEC=8 for every PC - with no file tier (the arena holds
             // every expert: 128 GB and up) the extra prediction per layer buys nothing, so it is skipped)
             if (rdev1 && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + d3_spec_ahead < n_layer &&
@@ -1079,12 +1368,12 @@ int main(int argc, char ** argv) {
                 pv_pred.resize((size_t) m * 16);
                 if (dense.predict_multi(l + d3_spec_ahead, pv_pred.data())) {
                     rank_union(l + d3_spec_ahead);
-                    tier.spec_read(l + d3_spec_ahead, pv_rank.data(), std::min(d3_spec, (int) pv_rank.size()), true);
+                    T(l + d3_spec_ahead).spec_read(l + d3_spec_ahead, pv_rank.data(), std::min(d3_spec, (int) pv_rank.size()), true);
                 }
             }
             const float * fn = nullptr;
             bool attn_done = false;
-            if (pf_now && pf_async && dense.predict_multi_launch(l)) {
+            if (pf_now && pf_async && !remote(l) && dense.predict_multi_launch(l)) {
                 pv_pred.resize((size_t) m * 16);
                 const bool launched = dense.attn_router_launch(l);   // false: no cached pass graph - attn_router below
                 if (dense.predict_multi_wait(pv_pred.data())) {
@@ -1102,7 +1391,8 @@ int main(int argc, char ** argv) {
             if (plog2 && !pl_ahead[(size_t) l].empty()) plog_rec(plog2, l, m, pos, pl_ahead[(size_t) l].data(), mids.data());
             pl_have = false;
             lap(0);
-            if (rdev1 && !no_tier_batch) {
+            float * const rdl = remote(l) ? nullptr : rdev1;   // --gpus: another card's layer through the host
+            if (rdl && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
                 // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (16: a depth-4 pass and a 16-row
                 // lookup verify / prompt pass are one call each).
@@ -1117,21 +1407,33 @@ int main(int argc, char ** argv) {
                 if (void * ev = tier.take_sum_event()) dense.wait_event(ev);   // STRATA_PASS_NOSYNC: order on the card
                 // STRATA_D3_PF_EARLY: the next layer's copies start now - behind this layer's demand copies, ahead of
                 // the rest of this layer and the next attention
-                if (have_next) tier.prefetch_next(l + 1, pv_rank_next.data(), (int) pv_rank_next.size(), d3_pf_early);
+                if (have_next && !remote(l + 1)) tier.prefetch_next(l + 1, pv_rank_next.data(), (int) pv_rank_next.size(), d3_pf_early);
+                have_next = false;
+            } else if (rdev1 && !no_tier_batch) {   // --gpus: another card's layer - one batched call, sums to the host
+                const double tr0 = now_ms();
+                constexpr int kMM = Ds41MoeTier::kMaxMulti;
+                for (int off = 0; off < m; off += kMM) {
+                    const int chunk = std::min(kMM, m - off);
+                    if (!T(l).run_multi(l, chunk, mids.data() + (size_t) off * top_k, mw.data() + (size_t) off * top_k,
+                                        fn + (size_t) off * n_embd, crouted_m.data() + (size_t) off * n_embd)) {
+                        ferr = "tier.run_multi failed"; return false;
+                    }
+                }
+                pv_rm += now_ms() - tr0;
                 have_next = false;
             } else {
                 for (int t = 0; t < m; ++t) {
-                    const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
-                                                            fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
-                                          : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
-                                                     fn + (size_t) t * n_embd, routed1.data());
+                    const bool ok = rdl ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                          fn + (size_t) t * n_embd, rdl + (size_t) t * n_embd)
+                                        : T(l).run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                   fn + (size_t) t * n_embd, routed1.data());
                     if (!ok) { ferr = "tier.run failed"; return false; }
-                    if (void * ev = tier.take_sum_event()) dense.wait_event(ev);   // STRATA_SUM_NOSYNC
-                    if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
+                    if (void * ev = T(l).take_sum_event()) dense.wait_event(ev);   // STRATA_SUM_NOSYNC
+                    if (!rdl) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
                 }
             }
             lap(1);
-            if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
+            if (!dense.finish(l, rdl ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
             lap(0);
             for (int j = 0; j < 3; ++j) {
                 if (l != dm_layers[j]) continue;
@@ -1363,15 +1665,15 @@ int main(int argc, char ** argv) {
                     fd_dense += t1 - t0;
                     // GPU: the tier writes the routed sums straight into the dense half's routed tensor (no 2 x n*D*4
                     // host round trip per layer); CPU / STRATA_ROUTED_HOST=1: through the host as before
-                    float * rdev = routed_host ? nullptr : dense.routed_dev();
+                    float * rdev = (routed_host || remote(l)) ? nullptr : dense.routed_dev();   // --gpus: another card's via the host
                     if (l < 2) vram_log("pre-tier", l);
                     for (int s = d0; s < B; s += piece) {   // the experts for the dense rows (in pieces if the buffers cap)
                         const int pn = std::min(piece, B - s);
-                        const bool ok = rdev ? tier.run_chunk_dev(l, pn, dense.batch_ids() + (size_t) s * top_k,
+                        const bool ok = rdev ? T(l).run_chunk_dev(l, pn, dense.batch_ids() + (size_t) s * top_k,
                                                                   dense.batch_wts() + (size_t) s * top_k,
                                                                   dense.batch_fn() + (size_t) s * n_embd,
                                                                   rdev + (size_t) s * n_embd)
-                                             : tier.run_chunk(l, pn, dense.batch_ids() + (size_t) s * top_k,
+                                             : T(l).run_chunk(l, pn, dense.batch_ids() + (size_t) s * top_k,
                                                               dense.batch_wts() + (size_t) s * top_k,
                                                               dense.batch_fn() + (size_t) s * n_embd,
                                                               brouted.data() + (size_t) s * n_embd);
@@ -1446,8 +1748,8 @@ int main(int argc, char ** argv) {
                     ds41_heapcheck("attn", l);
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
-                    const bool ok = m == 1 ? tier.run(l, cids.data(), cw.data(), fn, crouted.data())
-                                           : tier.run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
+                    const bool ok = m == 1 ? T(l).run(l, cids.data(), cw.data(), fn, crouted.data())
+                                           : T(l).run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
                     if (!ok) { ferr = "tier run refused"; return false; }
                     if (dump_dir) {
                         char nb[64];
@@ -1476,7 +1778,7 @@ int main(int argc, char ** argv) {
             if (!dense.set_columns(0)) { ferr = dense.last_error(); return false; }
             if (rdev1) rdev1 = dense.routed_dev();
         }
-        tier.release_chunk();
+        each_tier([](Ds41MoeTier & t) { t.release_chunk(); });
         return true;
     };
 
@@ -1606,7 +1908,7 @@ int main(int argc, char ** argv) {
         const int step_max = std::getenv("STRATA_SERVE_STEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_STEP_MAX")) : 768;
         // STRATA_SERVE_PASS_BIAS=0: those passes route exactly (the decode biases only while decoding)
         const bool pass_bias = !(std::getenv("STRATA_SERVE_PASS_BIAS") && std::getenv("STRATA_SERVE_PASS_BIAS")[0] == '0');
-        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
+        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) resident_all(),
                     (long long) tier.arena_experts());
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
@@ -1650,6 +1952,7 @@ int main(int argc, char ** argv) {
             int max_new = 0, tk = 0;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
             float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file;
+            bool bias_top_changed = false;   // a bias_top= key: the flat bias must be rebuilt (apply_bias) for the new mode
             int req_rprot = cfg_rprot, req_rpool = cfg_rpool;
             ss >> w >> max_new;
             while (ss >> w) {
@@ -1673,11 +1976,18 @@ int main(int argc, char ** argv) {
                 else if (k == "route_bias_file") req_rbf = fin ? std::min(8.0f, std::max(0.0f, fv)) : 0.0f;
                 else if (k == "route_protect") req_rprot = std::min(32, std::max(0, std::atoi(v.c_str())));
                 else if (k == "route_pool") req_rpool = std::min(32, std::max(0, std::atoi(v.c_str())));
+                // the live decode knobs (LiveKnobs above): for this request and the ones after it until changed again
+                else if (k == "d3_spec") knobs.d3_spec = std::min(64, std::max(0, std::atoi(v.c_str())));
+                else if (k == "d3_spec_ahead") knobs.d3_spec_ahead = std::min(8, std::max(1, std::atoi(v.c_str())));
+                else if (k == "d3_pf") knobs.d3_pf = std::min(6, std::max(0, std::atoi(v.c_str())));   // 6 = the prefetch staging slots (kMaxPf)
+                else if (k == "pf_p") knobs.pf_pmin = fin ? std::min(1.0f, std::max(0.0f, fv)) : 0.0f;
+                else if (k == "bias_refresh") knobs.bias_refresh = std::min(64, std::max(0, std::atoi(v.c_str())));
+                else if (k == "bias_top") { const int nb = std::min(64, std::max(0, std::atoi(v.c_str()))); bias_top_changed = nb != knobs.bias_top; knobs.bias_top = nb; }
             }
             // a changed bias is applied again just before the decode: a repeated prompt (regenerate) runs no prompt pass,
             // and the passes are what turn the decode bias on - without this it decoded with the previous request's
             bool bias_changed = false;
-            if (req_rb != a.route_bias || req_rbf != a.route_bias_file) {
+            if (req_rb != a.route_bias || req_rbf != a.route_bias_file || bias_top_changed) {
                 a.route_bias = req_rb;
                 a.route_bias_file = req_rbf;
                 bias_changed = true;
@@ -1992,8 +2302,7 @@ int main(int argc, char ** argv) {
                 bias_now = a.bias_prompt > 0;
                 apply_bias();
             }
-            tier.rebalance_begin_prompt();
-            tier.reset_stats();
+            each_tier([](Ds41MoeTier & t) { t.rebalance_begin_prompt(); t.reset_stats(); });
             if (const char* rl = std::getenv("STRATA_ROUTE_LOG")) {   // a turn marker for the route log (see ds41_moe.cpp)
                 if (FILE* f = std::fopen(rl, "a")) { std::fprintf(f, "# turn %d new %d %s\n", n_req, dh, by_step ? "passes" : "batch"); std::fclose(f); }
             }
@@ -2203,8 +2512,7 @@ int main(int argc, char ** argv) {
                     dense.release_pass();
                     const bool cleaned = !dc.elastic_cols || dense.set_columns(0);
                     if (rdev1) rdev1 = dense.routed_dev();
-                    tier.release_chunk();
-                    tier.rebalance_tick(true);
+                    each_tier([](Ds41MoeTier & t) { t.release_chunk(); t.rebalance_tick(true); });
                     if (cleaned) std::printf("DONE 0 %d %.1f 0.0 cancel 0 0 %d 0 0 0 0 0 0\n",
                                              total, now_ms() - tp0, reused);
                     else std::printf("ERR cancelled prefill cleanup: %s\n", dense.last_error().c_str());
@@ -2243,7 +2551,7 @@ int main(int argc, char ** argv) {
                 bias_now = true;
                 apply_bias();
             }
-            const Ds41MoeStats pst = tier.stats();
+            const Ds41MoeStats pst = stats_all();
             std::fprintf(stderr, "serve: prompt %d tokens (%d reused, %s) in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / "
                                  "%lld pcie / %lld file)\n", total, reused, by_step ? (exact_pass ? "exact passes" : "passes") : "batch", prompt_ms / 1000.0,
                          1000.0 * (total - reused) / std::max(prompt_ms, 1e-9), (long long) pst.hits, (long long) pst.cpu,
@@ -2258,12 +2566,12 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: VRAM %.2f GiB free -> %lld experts in VRAM (seed %.2f s)\n", seed_free,
                              (long long) tier.resident(), seed_s);
             }
-            if (ok) tier.rebalance_plan();
+            if (ok) each_tier([](Ds41MoeTier & t) { t.rebalance_plan(); });
             if (bias_changed) {   // decode: this request's route bias + file penalty (see bias_changed)
                 bias_now = true;
                 apply_bias();
             }
-            tier.reset_stats();
+            each_tier([](Ds41MoeTier & t) { t.reset_stats(); });
             dense.route_meter(true);
             const double td0 = now_ms();
             int gen = 0, pos = total;
@@ -2368,7 +2676,7 @@ int main(int argc, char ** argv) {
                     // during a decode (vram_lru admissions, arena rebalancing), so the request-start snapshot favours
                     // evicted experts and penalises admitted ones.  Upstream (Q8, Linux): 17-19.5 -> 21-22 tok/s, API
                     // top-1 85.1 -> 86.7%.  Changes outputs, as any residency change does.
-                    static const int bias_refresh = std::getenv("STRATA_BIAS_REFRESH") ? std::max(0, std::atoi(std::getenv("STRATA_BIAS_REFRESH"))) : 0;
+                    const int bias_refresh = knobs.bias_refresh;   // live knob (per request)
                     if (bias_refresh > 0 && bias_now && bias_set && rq_pass > 0 && rq_pass % bias_refresh == 0) apply_bias(true);
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
                     int acc = 0, tn = -1;
@@ -2401,7 +2709,7 @@ int main(int argc, char ** argv) {
                     dirty = acc < k;
                     P += 1 + acc;
                     t = tn;
-                    tier.rebalance_tick();
+                    each_tier([](Ds41MoeTier & t) { t.rebalance_tick(); });
                     if (!more) break;
                 }
                 if (lk_pass > 0)
@@ -2425,10 +2733,10 @@ int main(int argc, char ** argv) {
                 if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok);
                 ++pos;
-                tier.rebalance_tick();
+                each_tier([](Ds41MoeTier & t) { t.rebalance_tick(); });
             }
             const double dec_ms = now_ms() - td0;
-            const Ds41MoeStats st = tier.stats();
+            const Ds41MoeStats st = stats_all();
             if (std::strcmp(finish, "error") == 0) {
                 std::fprintf(stderr, "serve: decode failed: %s\n", ferr.c_str());
                 hist.clear();
@@ -2438,6 +2746,7 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
                          (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+            if (st.remote > 0) std::fprintf(stderr, "serve: experts on the STRATA_DS41_REMOTE helper's card: %lld\n", (long long) st.remote);
             if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
                 size_t tf = 0, tt = 0;
                 ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
@@ -2466,11 +2775,12 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,
                              1.0 + (double) rq_acc / rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
 #endif
-            tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader
+            each_tier([](Ds41MoeTier & t) { t.rebalance_tick(true); });   // the gap until the next request: retire a large batch for the reader
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
             std::fflush(stdout);
         }
+        for (auto & x : xtier) x->close();
         tier.close();
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits
         // on it until the client closes the pipe - leave without the static destructors
@@ -2544,7 +2854,7 @@ int main(int argc, char ** argv) {
 
     // ---- one-shot: prompt (+ perplexity), then generate
     if (prompt.empty()) { std::fprintf(stderr, "ds41_generate: empty prompt\n"); return 2; }
-    tier.reset_stats();
+    each_tier([](Ds41MoeTier & t) { t.reset_stats(); });
     const double tp0 = now_ms();
     std::vector<float> all;
     const int dm_tail = dump_main ? std::min<int>(128, (int) prompt.size() - 1) : 0;   // DSpark's window, as steps
@@ -2638,7 +2948,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
                      seed_free, seed_gib, (long long) tier.resident(), seed_s);
     }
-    const Ds41MoeStats pst = tier.stats();
+    const Ds41MoeStats pst = stats_all();
     std::fprintf(stderr, "\nprompt: %zu tokens in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / %lld pcie / %lld file)\n",
                  prompt.size(), prompt_ms / 1000.0, 1000.0 * prompt.size() / prompt_ms, (long long) pst.hits,
                  (long long) pst.cpu, (long long) pst.pcie, (long long) pst.file_tier);
@@ -2725,7 +3035,7 @@ int main(int argc, char ** argv) {
         std::ofstream f(a.dump_last, std::ios::binary);
         f.write((const char *) last_logits.data(), (std::streamsize) (last_logits.size() * 4));
     }
-    tier.reset_stats();
+    each_tier([](Ds41MoeTier & t) { t.reset_stats(); });
     // STRATA_PROFILE_DECODE=1: nsys --capture-range=cudaProfilerApi captures exactly the decode
     static const bool prof_decode = std::getenv("STRATA_PROFILE_DECODE") != nullptr;
     // STRATA_PROFILE_FROM=K (DSpark decode): the capture starts at the K-th generated token instead, past the first
@@ -2898,7 +3208,7 @@ int main(int argc, char ** argv) {
     }
     const double dec_ms = now_ms() - td0;
     if (prof_decode) Ds41MoeTier::profiler(false);
-    const Ds41MoeStats st = tier.stats();
+    const Ds41MoeStats st = stats_all();
     std::fprintf(stderr, "decode: %d tokens in %.2f s = %.2f tok/s; experts %lld hit / %lld cpu / %lld pcie / %lld file "
                  "(%.1f%% VRAM hits), cpu %.0f ms, file %.0f ms; spec reads %lld issued / %lld used; prefetch %lld issued / "
                  "%lld outside the arena / %lld used\n",
@@ -2907,6 +3217,9 @@ int main(int argc, char ** argv) {
                  100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms,
                  (long long) st.spec_issued, (long long) st.spec_hits, (long long) st.prefetch_issued,
                  (long long) st.prefetch_dummy, (long long) st.prefetched_useful);
+    if (st.remote > 0)   // STRATA_DS41_REMOTE: the helper's card (not counted as VRAM hits above)
+        std::fprintf(stderr, "decode: experts on the helper's card %lld (%.1f%% of the lookups)\n", (long long) st.remote,
+                     100.0 * st.remote / std::max<int64_t>(1, st.lookups()));
     if (spec)
         std::fprintf(stderr, "DSpark: %ld verify passes, %.3f accepted drafts/pass = %.3f tokens/pass, %.1f%% full, %ld re-fed; "
                      "verify %.1f ms/pass, draft %.2f ms/pass (depth %d)\n", sp_pass, (double) sp_acc / std::max(1L, sp_pass),
@@ -2916,6 +3229,8 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "pass_v split (all %ld passes, %.2f tokens each): dense %.1f ms, tier %.1f ms, taps %.1f ms, "
                      "logits %.1f ms per pass\n", pv_n, (double) pv_tok / std::max(1L, pv_n), pv_ms[0] / std::max(1L, pv_n),
                      pv_ms[1] / std::max(1L, pv_n), pv_ms[2] / std::max(1L, pv_n), pv_ms[3] / std::max(1L, pv_n));
+    if (spec && multi)
+        std::fprintf(stderr, "pass_v split: the other cards' layers %.1f ms of the tier's per pass\n", pv_rm / std::max(1L, pv_n));
     if (dump_main) std::fclose(dump_main);
     if (file_pred) {
         std::fprintf(stderr, "file-pred: %lld file-tier routes", fp_miss[0]);
@@ -2928,6 +3243,7 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, " k=%d %lld/%lld/%lld", k, fp_cand[k][0], fp_cand[k][1], fp_cand[k][2]);
         std::fprintf(stderr, "\n");
     }
+    for (auto & x : xtier) x->close();
     tier.close();
     return 0;
 }

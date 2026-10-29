@@ -9,6 +9,9 @@
   (it carries them), or in an install from before 2026-10-27 the slim copy and DeepSeek's shards in engram/.  Set
   DS41_GGUF, or pick a model with Choose Model.bat (model-choice.txt), to run a GSQ or Unsloth model: an Unsloth GGUF
   reads its own Engram tables, a GSQ build the ds4 Q2 GGUF's.
+* ${DS41_EXL3}: a folder of EXL3 routed experts (the quality mode, bertholomus' 2.5 bpw: Choose Model.bat downloads it
+  into exl3/ and names the folder in model-choice.txt).  The engine then runs the default GGUF's dense layers and Engram
+  with these experts (--exl3 FOLDER, added to the args here).
 * "--arena-gib" "auto": the pinned/locked RAM arena that holds the routed experts the GPU cache cannot.  It is sized
   from the installed RAM: total - DS41_RAM_RESERVE_GIB (default 28 GiB: the engine's own ~12-14 GiB outside the
   arena - dense half, KV, prefill buffers, Engram hot set; measured - plus ~14 GiB for Windows and other programs;
@@ -93,7 +96,12 @@ def expand(cfg):
             pick = ""
         if pick:
             p = (pick if os.path.isabs(pick) else m + "/" + pick).replace("\\", "/")
-            if os.path.exists(p):
+            if os.path.isdir(p):   # an EXL3 folder: its experts on the default GGUF
+                if os.path.exists(p + "/config.json"):
+                    os.environ.setdefault("DS41_EXL3", p)
+                else:
+                    print(f"ds41_local: model-choice.txt names {pick}, a folder without config.json - loading the default")
+            elif os.path.exists(p):
                 os.environ["DS41_GGUF"] = p
             else:
                 print(f"ds41_local: model-choice.txt names {pick}, which is not in {m} - loading the default")
@@ -129,6 +137,9 @@ def expand(cfg):
     for i, x in enumerate(a[:-1]):
         if x == "--arena-gib" and a[i + 1] == "auto":
             a[i + 1] = f"{arena_gib():g}"
+    x3 = os.environ.get("DS41_EXL3", "").strip().replace("\\", "/")
+    if x3 and "--exl3" not in a:
+        a += ["--exl3", x3]
     # DS41_GPU (ds41-paths.bat: the card with the most VRAM unless set): the server starts the engine on the config's
     # "gpu" (it sets CUDA_VISIBLE_DEVICES from it, nvidia-smi's numbering), not on the launcher's environment
     g = os.environ.get("DS41_GPU", "").strip()
@@ -240,6 +251,11 @@ def main():
     args = cfg.get("args", [])
     if "-m" in args[:-1]:
         mid, shown = model_names(args[args.index("-m") + 1])
+        if "--exl3" in args[:-1]:   # EXL3 experts on the default GGUF: named after the experts
+            b = re.search(r"EXL3-([0-9.]+)bpw", args[args.index("--exl3") + 1], re.I)
+            bpw = b.group(1) if b else ""
+            mid = f"deepseek-v4.1-flash-1017-exl3-{bpw}bpw" if bpw else "deepseek-v4.1-flash-1017-exl3"
+            shown = f"DeepSeek V4.1 Flash · EXL3 {bpw} bpw".replace("  ", " ")
         if cfg.get("model_name", DEFAULT_NAME) == DEFAULT_NAME:
             cfg["model_name"] = mid
         cfg.setdefault("display_name", shown)
@@ -249,12 +265,15 @@ def main():
     a = cfg.get("args", [])
     gib = a[a.index("--arena-gib") + 1] if "--arena-gib" in a else "?"
     # every file / folder the engine and server open at start (a missing one failed later, with a vaguer message)
-    paths = [cfg.get("exe"), cfg.get("tokenizer")] + [a[i + 1] for i, x in enumerate(a[:-1]) if x in ("-m", "--rank")]
+    paths = [cfg.get("exe"), cfg.get("tokenizer")] + [a[i + 1] for i, x in enumerate(a[:-1])
+                                                      if x in ("-m", "--rank", "--exl3")]
     paths += [d for i, x in enumerate(a[:-1]) if x == "--engram" for d in a[i + 1].split(";")]   # a list of folders
     missing = list(dict.fromkeys(p for p in paths if p and not os.path.exists(p)))   # (the model may be its Engram too)
     model = a[a.index("-m") + 1] if "-m" in a else "?"
-    print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB; model {os.path.basename(model)} "
-          f"(Choose Model.bat picks another); models in {os.environ['DS41_MODELS']}")
+    x3 = a[a.index("--exl3") + 1] if "--exl3" in a[:-1] else ""
+    print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB; model {os.path.basename(model)}"
+          + (f" with the EXL3 experts in {os.path.basename(x3)}" if x3 else "")
+          + f" (Choose Model.bat picks another); models in {os.environ['DS41_MODELS']}")
     # under ~110 GB of RAM the default reads most experts from the SSD (rounds 220 / 225 / 227, an RTX 3090): one line
     # on the model that runs better there
     if total_ram_gib() < 102 and os.path.basename(model) in ("DeepSeek-V4.1-Flash-1017-Q2.gguf", "ds4-q2-slim.gguf"):

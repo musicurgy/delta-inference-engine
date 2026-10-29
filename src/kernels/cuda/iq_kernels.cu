@@ -5,6 +5,7 @@
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"   // Delta: EXL3 types
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
@@ -3016,6 +3017,8 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
 }
 
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
+    if (cpu::is_exl3_type(gu_type))   // Delta: EXL3 (exl3_experts.cu), one K for the whole expert
+        return d_type == gu_type && exl3_expert_supported(cpu::exl3_k2_of(gu_type), n_embd, n_ff);
     const int qg = gu_qk(gu_type), qd = d_qk(d_type);
     return qg > 0 && qd > 0 && is_iq(gu_type) && is_iq(d_type) && n_embd % qg == 0 && n_ff % qd == 0 &&
            n_embd % 256 == 0 && (n_ff * n_embd) % 256 == 0;
@@ -3023,6 +3026,17 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
 
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
     NativeExpertLayout L;
+    if (cpu::is_exl3_type(gu_type)) {   // Delta: EXL3 - the CPU tier's blob (exl3_native.cpp), three parts
+        const size_t p = cpu::exl3_native_part_bytes(n_embd, n_ff, cpu::exl3_k2_of(gu_type));
+        L.gu_type = gu_type;
+        L.d_type = d_type;
+        L.n_embd = n_embd;
+        L.n_ff = n_ff;
+        L.up_off = p;
+        L.down_off = 2 * p;
+        L.bytes = 3 * p;
+        return L;
+    }
     L.gu_type = gu_type;
     L.d_type = d_type;
     L.n_embd = n_embd;
@@ -3757,6 +3771,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
+    if (cpu::is_exl3_type(L.gu_type)) {   // Delta: EXL3 experts (exl3_experts.cu); no LoRA (DeepSeek has none)
+        const int64_t gy3 = (grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+        exl3_expert_grouped(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, gy3, cap_entries, x_q8_1, gate, up, out, stream);
+        return;
+    }
     static const bool v2 = [] { const char* v = std::getenv("STRATA_EXPERT_V2"); return v && v[0] == '1'; }();
     if (v2 && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
         // S26 STRATA_TSUM=1: the sums as one transposed butterfly per warp (s26_tsum.cuh; bitwise the same values)
