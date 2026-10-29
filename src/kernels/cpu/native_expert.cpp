@@ -58,6 +58,7 @@ bool iq256_supported(int type) noexcept {
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+    if (is_exl3_type(gu_type)) return exl3_native_fmt(gu_type, gu_type, d_type, n_embd, n_ff, f, err);   // Delta: EXL3
     init_once();
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* td = traits(d_type);
@@ -104,6 +105,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 
 bool native_fmt3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f,
                  std::string& err) {
+    if (is_exl3_type(gate_type)) return exl3_native_fmt(gate_type, up_type, d_type, n_embd, n_ff, f, err);   // Delta: EXL3
     if (!native_fmt(gate_type, d_type, n_embd, n_ff, f, err)) return false;
     if (up_type == gate_type) return true;
     const ggml_type_traits_cpu* tu = traits(up_type);
@@ -141,12 +143,14 @@ bool q8k_avx1(int type) {
 }  // namespace
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (f.gu_act == kExl3ActType) { exl3_native_quant(x, f.n_embd, dst); return; }   // Delta: EXL3 takes F32
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     if (q8k_avx1(f.gu_act)) { q8k_quant_avx1(x, dst, f.n_embd); return; }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.d_act == kExl3ActType) { exl3_native_quant(h, f.n_ff, dst); return; }   // Delta: EXL3 takes F32
     if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
     if (q8k_avx1(f.d_act)) { q8k_quant_avx1(h, dst, f.n_ff); return; }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
@@ -173,6 +177,7 @@ int native_gu_mt_min(int gu_type) {
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (is_exl3_type(f.gu_type)) { exl3_native_gu_rows(f, blob, act, nt, ff, r0, r1); return; }   // Delta: EXL3
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
@@ -292,6 +297,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (is_exl3_type(f.d_type)) { exl3_native_down_rows(f, blob, hq, nt, out, r0, r1); return; }   // Delta: EXL3
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;

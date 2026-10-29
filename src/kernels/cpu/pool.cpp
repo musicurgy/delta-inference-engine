@@ -687,7 +687,13 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             // per expert, so one batch covers every format class.  The row partition stays the batch's (uniform
             // n_embd/n_ff across a model's classes); only the format the rows are computed with changes per expert.
             const int per = (int) mper_;
-            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            // Delta (EXL3): a format whose rows come in bands (row_align 128) gets band-edged ranges - neighbours
+            // round the same shared edge, so the ranges still tile the rows; row_align 1 leaves them as they were
+            if (const int al = nfmt_->row_align; al > 1) {
+                g0 = (g0 + al / 2) / al * al;
+                g1 = (g1 + al / 2) / al * al;
+            }
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
