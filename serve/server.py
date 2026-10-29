@@ -1250,6 +1250,16 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 32:
                     keys += f" {k}={v}"
+            # the DeepSeek-V4.1 engine's live decode knobs (ds41_generate's LiveKnobs): SSD read-ahead experts per
+            # layer and layers ahead, prefetch slots per layer, the prefetch's P floor, the bias refresh period -
+            # for A/Bs inside one loaded server; exact settings
+            for k, hi in (("d3_spec", 64), ("d3_spec_ahead", 8), ("d3_pf", 6), ("bias_refresh", 64)):
+                v = tune.get(k)
+                if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= hi:
+                    keys += f" {k}={v}"
+            v = tune.get("pf_p")
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
+                keys += f" pf_p={float(v)!r}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
