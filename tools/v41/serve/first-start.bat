@@ -184,8 +184,20 @@ if defined VRAM_MIB if %VRAM_MIB% LSS 11800 echo   Note: this card has %VRAM_MIB
 set "RAM_GB="
 for /f "usebackq" %%r in (`".venv\Scripts\python.exe" tools\v41\serve\cpu_level.py --ram-gb`) do set "RAM_GB=%%r"
 if defined RAM_GB if %RAM_GB% LSS 120 echo   Note: this PC has %RAM_GB% GB of RAM; DeepSeek needs 128 GB or more ^(README.md, "What you need"^).
-if defined RAM_GB if %RAM_GB% LSS 120 if %RAM_GB% GEQ 56 echo         With less it starts, but every token reads the experts that do not fit from the SSD: much slower, untested.
+if defined RAM_GB if %RAM_GB% LSS 120 if %RAM_GB% GEQ 56 echo         With less it runs, but the experts that do not fit are read from the SSD on every token: measured on an RTX 3090 the default writes ~22 tok/s at 96 GB, ~16 at 64 GB.
 if defined RAM_GB if %RAM_GB% LSS 56 echo         With this little it will probably not start at all.
+rem under 110 GB: offer Unsloth's UD-IQ1_S instead of the default (rounds 227 / 225: 30 / 25.5 vs 22 / 16 tok/s)
+if defined NEEDMAIN if defined RAM_GB if %RAM_GB% LSS 110 if %RAM_GB% GEQ 56 (
+  echo.
+  echo   With %RAM_GB% GB of RAM, Unsloth's UD-IQ1_S is the better model for this PC: measured on an RTX 3090 it
+  echo   writes 30 / 25.5 tok/s at 96 / 64 GB, the default 22 / 16, and agrees with DeepSeek's API 89.3%% of the
+  echo   time against the default's 91.5%%.  It is a 233 GB download ^(the default: ~375 GB^).
+  choice /c YN /m "Download UD-IQ1_S instead of the default"
+  if not errorlevel 2 (
+    ".venv\Scripts\python.exe" tools\v41\serve\pick_model.py --get UD-IQ1_S || exit /b 1
+    set "NEEDMAIN="
+  )
+)
 echo The model files above go to %M%
 echo   ^(DS41_MODELS in ds41-paths.bat - put it on your fastest NVMe drive^).  They come from Hugging Face: DeepSeek's
 echo   official repository and a Q2 GGUF of it; every large file is checked against its published SHA-256.

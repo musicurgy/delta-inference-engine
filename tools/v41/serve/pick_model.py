@@ -22,15 +22,20 @@ Q2 = "DeepSeek-V4.1-Flash-1017-Q2.gguf"
 SLIM = "ds4-q2-slim.gguf"   # an install from before 2026-10-27: the same model without its inline Engram tables
 UNSLOTH = "unsloth/DeepSeek-V4.1-Flash-1017-GGUF"
 GB = 1e9
-# (menu name, GB on disk, writing tok/s at 192 / 128 GB RAM, top-1 agreement with DeepSeek's API, kind, source)
-DEFAULT = ("ds4 Q2 (the default)", 366, "41 / 33", "91.5%")
+# Writing tok/s through the server at 192 / 128 / 96 / 64 GB of RAM (the 96 / 64 GB columns: 2026-10-28/29, a PC with
+# that much RAM simulated by locking the rest away, so neither Windows' file cache nor the pagefile could use it; "-" =
+# not measured).  The model to recommend on a PC with less than LOW_RAM_GB of RAM:
+LOW_RAM_GB = 110
+LOW_RAM_PICK = "UD-IQ1_S"
+# (menu name, GB on disk, writing tok/s, top-1 agreement with DeepSeek's API)
+DEFAULT = ("ds4 Q2 (the default)", 366, "41 / 33 / 22 / 16", "91.5%")
 GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
-    "ds41-gsq-iq2_xs.gguf": ("GSQ IQ2_XS", 159, "38 / 26", "90.0%", "IQ2_XS"),
-    "ds41-gsq-iq2_xxs.gguf": ("GSQ IQ2_XXS", 142, "41 / 32", "87.8%", "IQ2_XXS"),
-    "ds41-gsq-iq1_m.gguf": ("GSQ IQ1_M", 125, "42 / 37.5", "85.5%", "IQ1_M"),
+    "ds41-gsq-iq2_xs.gguf": ("GSQ IQ2_XS", 159, "38 / 26 / - / -", "90.0%", "IQ2_XS"),
+    "ds41-gsq-iq2_xxs.gguf": ("GSQ IQ2_XXS", 142, "41 / 32 / - / -", "87.8%", "IQ2_XXS"),
+    "ds41-gsq-iq1_m.gguf": ("GSQ IQ1_M", 125, "42 / 37.5 / 34 / 28", "85.5%", "IQ1_M"),
 }
 UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreement, its Engram tables
-    "UD-IQ1_S": (233, "40 / 37.5", "89.3%", "IQ4_NL"),   # measured 2026-10-26 (rounds 167, 170)
+    "UD-IQ1_S": (233, "40 / 37.5 / 30 / 25.5", "89.3%", "IQ4_NL"),   # rounds 167, 170, 227
     "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
     "UD-IQ2_XXS": (301, "-", "-", "IQ4_NL"),
     "UD-Q2_K_XL": (335, "-", "-", "IQ4_NL"),
@@ -40,6 +45,24 @@ UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreemen
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
     "UD-Q8_K_XL": (508, "-", "-", "exact"),
 }
+
+
+def ram_gb():
+    """this PC's RAM in GB (DS41_RAM_GB overrides: tests), or None"""
+    v = os.environ.get("DS41_RAM_GB", "")
+    if v.isdigit():
+        return int(v)
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class MS(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                    ("avail", ctypes.c_ulonglong), ("tpage", ctypes.c_ulonglong), ("apage", ctypes.c_ulonglong),
+                    ("tvirt", ctypes.c_ulonglong), ("avirt", ctypes.c_ulonglong), ("aext", ctypes.c_ulonglong)]
+    m = MS()
+    m.len = ctypes.sizeof(MS)
+    return round(m.total / GB) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
 
 
 def models_dir():
@@ -86,22 +109,50 @@ def download_unsloth(m, q):
         sys.exit("A file differs from its published SHA-256 (above): delete it and start Choose Model.bat again.")
 
 
+def get(q):
+    """--get QUANT (first-start's low-RAM offer): download an Unsloth quant, SHA-256 check it, make it the choice"""
+    if q not in UNSLOTH_Q:
+        sys.exit(f"pick_model.py --get: {q} is not one of {', '.join(UNSLOTH_Q)}")
+    m = models_dir()
+    os.makedirs(m, exist_ok=True)
+    f = unsloth_first(m, q)
+    if not f:
+        gb = UNSLOTH_Q[q][0]
+        free = shutil.disk_usage(m).free
+        if free < (gb + 5) * GB:
+            sys.exit(f"Not enough space for Unsloth {q}: it needs ~{gb + 5} GB free in {m}, there are {free / GB:.0f} GB.")
+        print(f"Downloading Unsloth {q} (~{gb} GB) into {os.path.join(m, 'unsloth', q)} - if it stops, start again: it resumes.")
+        download_unsloth(m, q)
+        f = unsloth_first(m, q)
+        if not f:
+            sys.exit("The download finished but its first file is not there.")
+    with open(CHOICE, "w", encoding="utf-8") as fo:
+        fo.write(f + "\n")
+    print(f"Saved: Start DeepSeek.bat loads {f} (model-choice.txt).")
+    return 0
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--get":
+        return get(sys.argv[2])
     m = models_dir()
     if not os.path.isdir(m):
         sys.exit(f"No model folder at {m} yet - run Start DeepSeek.bat first: it sets up the default model.")
     base = Q2 if os.path.exists(os.path.join(m, Q2)) else SLIM if os.path.exists(os.path.join(m, SLIM)) else None
     cur = current()
     now = cur if cur and os.path.exists(cur if os.path.isabs(cur) else os.path.join(m, cur)) else base
-    print(f"Model folder: {m}\n")
-    print("     model                          disk     writing tok/s    agreement with")
-    print("                                             (192 / 128 GB)   DeepSeek's API")
+    ram = ram_gb()
+    low = ram is not None and ram < LOW_RAM_GB
+    print(f"Model folder: {m}" + (f"   (this PC: {ram} GB of RAM)" if ram else "") + "\n")
+    print("     model                          disk     writing tok/s at             agreement with")
+    print("                                             192 / 128 / 96 / 64 GB RAM   DeepSeek's API")
     menu = []
 
     def row(kind, path, name, gb, tps, agr, note=""):
         menu.append((kind, path))
         mark = "  <- now" if kind == "use" and path == now else ""
-        print(f"  {len(menu):>2}. {name:<28} {gb:>4} GB   {tps:<16} {agr:<8}{note}{mark}")
+        rec = "  <- recommended for this PC" if low and LOW_RAM_PICK in name else ""
+        print(f"  {len(menu):>2}. {name:<28} {gb:>4} GB   {tps:<28} {agr:<8}{note}{mark}{rec}")
 
     if base:
         row("use", base, *DEFAULT)
@@ -129,8 +180,9 @@ def main():
             gb, tps, agr, eng = UNSLOTH_Q[q]
             row("download", q, "download Unsloth " + q, gb, tps, agr, f"  ({eng} Engram){room(gb)}")
     print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, exact routing.  On 192 GB of RAM")
-    print("  the default writes as fast as any and agrees best; on 128 GB a smaller file writes faster (more of it fits).")
-    print("  A model bigger than your RAM reads the rest from the SSD on every token: slower.\n")
+    print("  the default writes as fast as any and agrees best; with less RAM a smaller file writes faster (more of it")
+    print("  fits; the rest is read from the SSD on every token).  Under 110 GB: Unsloth UD-IQ1_S, 30 / 25.5 tok/s at")
+    print("  96 / 64 GB against the default's 22 / 16, one point lower agreement.  (Measured on an RTX 3090.)\n")
     if not menu:
         sys.exit("No model yet - run Start DeepSeek.bat first: it downloads the default one.")
     pick = input(f"Number to use (1-{len(menu)}), Enter = keep the current one: ").strip()

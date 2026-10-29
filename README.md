@@ -61,6 +61,26 @@ The 128 GB column is the same PC with the expert memory a 128 GB PC gets.
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
 long prompts, but the output is the same.
 
+### 96 GB and 64 GB of RAM
+
+Measured on the same PC with the RAM a 96 or 64 GB PC would not have locked away (so neither Windows' file cache nor
+the pagefile could use it). Writing speed through the server; agreement = how often the next token matches DeepSeek's
+own model:
+
+| Model | Agreement | 192 GB | 128 GB | **96 GB** | **64 GB** |
+|---|---|---|---|---|---|
+| ds4 Q2 (the default) | 91.5% | 41 | 33 | 22 | 16 |
+| **Unsloth UD-IQ1_S** | 89.3% | 40 | 37.5 | **30** | **25.5** |
+| GSQ IQ1_M | 85.5% | 42 | 37.5 | **34** | **28** |
+
+- **Under ~110 GB of RAM, use Unsloth's UD-IQ1_S**: one point less agreement, a lot faster, and new prompts read in
+  about half the time (a ~180-token prompt: 11-13 s at 96 GB vs 20-27 s for the default). The first start offers it
+  instead of the default on such a PC; `Choose Model.bat` downloads it on an existing install.
+- These runs gave the expert memory 58 GiB (96 GB) and 26 GiB (64 GB); on a real PC of that size the launcher gives
+  about 51 and 21 GiB today, so expect a little less. The SSD matters most here: the small quants were read from a
+  PCIe 4.0 NVMe (~3.5 GiB/s).
+- Below 56 GB of RAM it will probably not start.
+
 On the 192 GB PC, a new 6k-token prompt takes about 18 s and a 25k-token prompt about 42 s. Writing is fastest on
 maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the prompt and the thinking, a client sees
 ~39 tok/s.
