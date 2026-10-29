@@ -28,7 +28,7 @@ GB = 1e9
 LOW_RAM_GB = 110
 LOW_RAM_PICK = "UD-IQ1_S"
 # (menu name, GB on disk, writing tok/s, top-1 agreement with DeepSeek's API)
-DEFAULT = ("ds4 Q2 (the default)", 366, "41 / 33 / 22 / 16", "91.5%")
+DEFAULT = ("ds4 Q2 (the default)", 366, "41 / 33 / 27 / 20", "91.5%")   # 96 / 64: rounds 234 (reserve 28 + read-ahead 8)
 GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
     "ds41-gsq-iq2_xs.gguf": ("GSQ IQ2_XS", 159, "38 / 26 / - / -", "90.0%", "IQ2_XS"),
     "ds41-gsq-iq2_xxs.gguf": ("GSQ IQ2_XXS", 142, "41 / 32 / - / -", "87.8%", "IQ2_XXS"),

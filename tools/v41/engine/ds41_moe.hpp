@@ -502,12 +502,25 @@ public:
     /// run_multi writing the nt * n_embd sums to device memory `out_dev` instead of the host (D3: the verify pass's
     /// per-token routed rows, one call per layer).  nt*top_k token-major ids/w, x nt*n_embd.  GPU tier only.
     bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// The kernel replay bench (round 231).  STRATA_TIER_RECORD=<file> [STRATA_TIER_RECORD_MAX=N calls, default 2000]
+    /// makes run_multi_to_dev append each call's {layer, nt, ids, w, x, out} (out read back after the call: the
+    /// recording run is slower, its text unchanged).  `tier_replay` runs such a file through this tier `reps` times:
+    /// the last rep compares every output with the recorded one (bitwise and max |diff|) and reports ms per call and
+    /// the tier counters.  Record with the build before a kernel change, replay with the build after it.
+    bool tier_replay(const std::string& path, int reps, std::string& err);
     /// Measurement only (session 13): open a binary routing trace.  Writes a header snapshot (per (layer, expert):
     /// class, VRAM-resident, in arena), then one record per run_multi_to_dev call (the verify path): its distinct
     /// experts with the first pass row routing each and the class the call served it as.  `trace_mark` appends a
     /// caller record (the pass's acceptance).  Replayed by tools/v41/sim/route_sim.py.
+    /// Round 231 (the offline placement simulator, tools/v41/sim/place_sim.py): `trace_snapshot` writes an 'S'
+    /// record shaped like the header (the server re-seeds per request); `trace_rec` a generic {tag, n, n ints}
+    /// record - 'V' per pass (the pass's timing and tier counters, ds41_generate's pass_v) and 'R' per predicted
+    /// layer (the ranked prediction the prefetch / read-ahead would act on).  `tracing`: a trace is open.
     void trace_open(const std::string& path);
+    void trace_snapshot();
     void trace_mark(const float* v, int n);
+    void trace_rec(int32_t tag, const int32_t* v, int n);
+    bool tracing() const;
     /// cudaProfilerStart / Stop (nsys --capture-range=cudaProfilerApi); a no-op without CUDA.
     static void profiler(bool on);
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU

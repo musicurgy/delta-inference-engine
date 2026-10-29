@@ -44,6 +44,10 @@ set STRATA_DENSE_ASYNC=1
 set STRATA_PASS_NOSYNC=1
 rem the next layer's attention is queued before the prediction readback (exact; server +2.2 percent, round 224)
 set STRATA_D3_PF_ASYNC=1
+rem SSD read-ahead: the experts the next layers will need that live only on the SSD are read into a pinned stash
+rem while the current layers run (exact; +22% writing speed on a 64 GB PC).  The engine skips it when every expert
+rem is in RAM (128 GB and up), so it costs nothing there.
+set STRATA_D3_SPEC=8
 set "STRATA_SERVE_DSPARK=%DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf"
 if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" set STRATA_SERVE_DSPARK=
 rem the card's VRAM (README.md, "What you need"):

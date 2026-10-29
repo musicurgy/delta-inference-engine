@@ -2088,21 +2088,40 @@ void Ds41MoeTier::advise_file(int64_t layer, const int32_t* ids, int n) {
     }
 }
 
-void Ds41MoeTier::trace_open(const std::string& path) {
-    if (im_->trace) std::fclose(im_->trace);
-    im_->trace = std::fopen(path.c_str(), "wb");
-    if (!im_->trace) return;
-    const int64_t L = im_->g.n_layers, X = im_->g.n_experts;
-    const int32_t hdr[3] = { 'H', (int32_t) L, (int32_t) X };
-    std::fwrite(hdr, 4, 3, im_->trace);
+// the 'H' header and the 'S' snapshots (trace_snapshot: the server re-seeds the VRAM cache per request, so the
+// replay restarts its state from the snapshot the request's decode began with) share one body
+static void trace_write_snapshot(Ds41MoeTier& t, Ds41MoeImpl& im, int32_t tag) {
+    const int64_t L = im.g.n_layers, X = im.g.n_experts;
+    const int32_t hdr[3] = { tag, (int32_t) L, (int32_t) X };
+    std::fwrite(hdr, 4, 3, im.trace);
     std::vector<int32_t> v((size_t) (L * X * 3));
     for (int64_t l = 0; l < L; ++l)
         for (int64_t e = 0; e < X; ++e) {
             int32_t* r = v.data() + (size_t) (l * X + e) * 3;
-            r[0] = im_->g.cls(l, e); r[1] = resident(l, e) ? 1 : 0; r[2] = in_arena(l, e) ? 1 : 0;
+            r[0] = im.g.cls(l, e); r[1] = t.resident(l, e) ? 1 : 0; r[2] = t.in_arena(l, e) ? 1 : 0;
         }
-    std::fwrite(v.data(), 4, v.size(), im_->trace);
+    std::fwrite(v.data(), 4, v.size(), im.trace);
+    // 'B' n, then n x bytes per class: what an arena / VRAM budget in GiB holds (place_sim.py's --arena-gib / --slots)
+    std::vector<int32_t> b;
+    b.push_back('B'); b.push_back((int32_t) im.bl.size());
+    for (int64_t x : im.bl) b.push_back((int32_t) x);
+    std::fwrite(b.data(), 4, b.size(), im.trace);
+    std::fflush(im.trace);
 }
+
+void Ds41MoeTier::trace_open(const std::string& path) {
+    if (im_->trace) std::fclose(im_->trace);
+    im_->trace = std::fopen(path.c_str(), "wb");
+    if (!im_->trace) return;
+    trace_write_snapshot(*this, *im_, 'H');
+}
+
+void Ds41MoeTier::trace_snapshot() {
+    if (!im_->trace) return;
+    trace_write_snapshot(*this, *im_, 'S');
+}
+
+bool Ds41MoeTier::tracing() const { return im_ && im_->trace; }
 
 void Ds41MoeTier::trace_mark(const float* v, int n) {
     if (!im_->trace) return;
@@ -2110,6 +2129,13 @@ void Ds41MoeTier::trace_mark(const float* v, int n) {
     std::fwrite(hdr, 4, 2, im_->trace);
     std::fwrite(v, 4, (size_t) n, im_->trace);
     std::fflush(im_->trace);
+}
+
+void Ds41MoeTier::trace_rec(int32_t tag, const int32_t* v, int n) {
+    if (!im_->trace) return;
+    const int32_t hdr[2] = { tag, n };
+    std::fwrite(hdr, 4, 2, im_->trace);
+    std::fwrite(v, 4, (size_t) n, im_->trace);
 }
 
 #if defined(DS4_MOE_CUDA)
@@ -5455,7 +5481,32 @@ bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, co
     if (!im_->cfg.cpu_only) {
         const int64_t K = im_->g.top_k, H = im_->g.n_embd;
         if (im_->g.per_expert()) {
-            if (gpu_run_n_ex(*im_, layer, nt, ids, w, x, nullptr, out_dev)) return true;
+            if (gpu_run_n_ex(*im_, layer, nt, ids, w, x, nullptr, out_dev)) {
+                // STRATA_TIER_RECORD=<file> (the kernel replay bench, tier_replay below): the call's inputs and its
+                // output.  'T' K H once, then per call 'c' layer nt, nt*K ids, nt*K w, nt*H x, nt*H out (floats).
+                // The device sync and the readback make the recording run slower; its text is unchanged.
+                static FILE* rec = [&]() -> FILE* {
+                    const char* p = std::getenv("STRATA_TIER_RECORD");
+                    FILE* f = p ? std::fopen(p, "wb") : nullptr;
+                    if (f) { const int32_t h[3] = { 'T', (int32_t) K, (int32_t) H }; std::fwrite(h, 4, 3, f); }
+                    return f;
+                }();
+                static const long rec_max = std::getenv("STRATA_TIER_RECORD_MAX") ? std::atol(std::getenv("STRATA_TIER_RECORD_MAX")) : 2000;
+                static long rec_n = 0;
+                if (rec && rec_n < rec_max) {
+                    ck(cudaDeviceSynchronize(), "tier record sync");
+                    std::vector<float> out((size_t) nt * (size_t) H);
+                    ck(cudaMemcpy(out.data(), out_dev, out.size() * 4, cudaMemcpyDeviceToHost), "tier record d2h");
+                    const int32_t h[3] = { 'c', (int32_t) layer, nt };
+                    std::fwrite(h, 4, 3, rec);
+                    std::fwrite(ids, 4, (size_t) nt * (size_t) K, rec);
+                    std::fwrite(w, 4, (size_t) nt * (size_t) K, rec);
+                    std::fwrite(x, 4, (size_t) nt * (size_t) H, rec);
+                    std::fwrite(out.data(), 4, out.size(), rec);
+                    if (++rec_n == rec_max) { std::fflush(rec); std::fprintf(stderr, "STRATA_TIER_RECORD: %ld calls recorded\n", rec_n); }
+                }
+                return true;
+            }
             for (int t = 0; t < nt; ++t)   // per-expert fallback (a q2 class): per-token run_to_dev, NOT gpu_run_n
                 if (!run_to_dev(layer, ids + t * K, w + t * K, x + (size_t) t * H,
                                 (uint8_t*) out_dev + (size_t) t * (size_t) H * 4)) return false;
@@ -5471,6 +5522,85 @@ bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, co
     (void) layer; (void) nt; (void) ids; (void) w; (void) x; (void) out_dev;
 #endif
     return false;
+}
+
+bool Ds41MoeTier::tier_replay(const std::string& path, int reps, std::string& err) {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->inited || !im_->gpu || im_->cfg.cpu_only || !im_->g.per_expert()) { err = "needs the CUDA per-expert tier"; return false; }
+    const int64_t K = im_->g.top_k, H = im_->g.n_embd;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open " + path; return false; }
+    int32_t hdr[3] = {};
+    if (std::fread(hdr, 4, 3, f) != 3 || hdr[0] != 'T') { std::fclose(f); err = "not a STRATA_TIER_RECORD file"; return false; }
+    if (hdr[1] != K || hdr[2] != H) { std::fclose(f); err = "recorded for another geometry (top_k / n_embd differ)"; return false; }
+    struct Rec { int32_t layer, nt; std::vector<int32_t> ids; std::vector<float> w, x, out; };
+    std::vector<Rec> recs;
+    for (;;) {
+        int32_t h[3];
+        if (std::fread(h, 4, 3, f) != 3) break;
+        if (h[0] != 'c' || h[2] < 1 || h[2] > kMaxTok) { std::fclose(f); err = "bad record"; return false; }
+        Rec r; r.layer = h[1]; r.nt = h[2];
+        r.ids.resize((size_t) r.nt * (size_t) K); r.w.resize(r.ids.size());
+        r.x.resize((size_t) r.nt * (size_t) H); r.out.resize(r.x.size());
+        if (std::fread(r.ids.data(), 4, r.ids.size(), f) != r.ids.size() || std::fread(r.w.data(), 4, r.w.size(), f) != r.w.size() ||
+            std::fread(r.x.data(), 4, r.x.size(), f) != r.x.size() || std::fread(r.out.data(), 4, r.out.size(), f) != r.out.size()) {
+            std::fclose(f); err = "truncated record"; return false;
+        }
+        recs.push_back(std::move(r));
+    }
+    std::fclose(f);
+    if (recs.empty()) { err = "no calls in " + path; return false; }
+    void* d_out = nullptr;
+    ck(cudaMalloc(&d_out, (size_t) kMaxTok * (size_t) H * 4), "tier_replay out");
+    std::vector<float> got((size_t) kMaxTok * (size_t) H);
+    size_t rows = 0;
+    for (const Rec& r : recs) rows += (size_t) r.nt;
+    std::fprintf(stderr, "tier_replay: %zu calls, %zu rows from %s; %d rep(s), the last one compared (bitwise needs STRATA_BALANCE=0: "
+                 "the CPU pool's experts are not the GPU's bits)\n", recs.size(), rows, path.c_str(), reps);
+    for (int rep = 0; rep < std::max(1, reps); ++rep) {
+        const bool last = rep == std::max(1, reps) - 1;
+        const Ds41MoeStats s0 = stats();
+        size_t same_calls = 0, same_floats = 0, floats = 0;
+        double maxd = 0, maxrel = 0, t_calls = 0;
+        const double t0 = now_ms();
+        for (const Rec& r : recs) {
+            const double tc = now_ms();
+            if (!run_multi_to_dev(r.layer, r.nt, r.ids.data(), r.w.data(), r.x.data(), d_out)) { err = "run_multi_to_dev failed"; cudaFree(d_out); return false; }
+            ck(cudaDeviceSynchronize(), "tier_replay sync");
+            t_calls += now_ms() - tc;
+            if (!last) continue;
+            const size_t n = (size_t) r.nt * (size_t) H;
+            ck(cudaMemcpy(got.data(), d_out, n * 4, cudaMemcpyDeviceToHost), "tier_replay d2h");
+            size_t eq = 0;
+            for (size_t i = 0; i < n; ++i) {
+                uint32_t a, b;
+                std::memcpy(&a, &got[i], 4); std::memcpy(&b, &r.out[i], 4);
+                if (a == b) { ++eq; continue; }
+                const double d = std::fabs((double) got[i] - (double) r.out[i]);
+                maxd = std::max(maxd, d);
+                maxrel = std::max(maxrel, d / std::max(1e-12, std::fabs((double) r.out[i])));
+            }
+            same_floats += eq; floats += n;
+            if (eq == n) ++same_calls;
+        }
+        const double ms = now_ms() - t0;
+        const Ds41MoeStats s = stats();
+        const double nc = (double) recs.size();
+        std::fprintf(stderr, "tier_replay rep %d: %.1f ms total, %.3f ms/call (%.3f inside the calls); per call hit %.1f cpu %.1f pcie %.1f file %.1f "
+                     "spec %.1f pf %.1f\n", rep + 1, ms, ms / nc, t_calls / nc, (double) (s.hits - s0.hits) / nc, (double) (s.cpu - s0.cpu) / nc,
+                     (double) (s.pcie - s0.pcie) / nc, (double) (s.file_tier - s0.file_tier) / nc, (double) (s.spec_hits - s0.spec_hits) / nc,
+                     (double) (s.prefetched_useful - s0.prefetched_useful) / nc);
+        if (last)
+            std::fprintf(stderr, "tier_replay exact: %zu of %zu calls bitwise identical, %.4f%% of floats; max |diff| %.3g (max rel %.3g)\n",
+                         same_calls, recs.size(), 100.0 * (double) same_floats / (double) std::max<size_t>(1, floats), maxd, maxrel);
+    }
+    cudaFree(d_out);
+    return true;
+#else
+    (void) path; (void) reps;
+    err = "the kernel replay bench needs the CUDA tier (compiled without DS4_MOE_CUDA)";
+    return false;
+#endif
 }
 
 bool Ds41MoeTier::build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err) {

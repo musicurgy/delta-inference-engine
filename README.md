@@ -69,16 +69,18 @@ own model:
 
 | Model | Agreement | 192 GB | 128 GB | **96 GB** | **64 GB** |
 |---|---|---|---|---|---|
-| ds4 Q2 (the default) | 91.5% | 41 | 33 | 22 | 16 |
+| ds4 Q2 (the default) | 91.5% | 41 | 33 | 27 | 20 |
 | **Unsloth UD-IQ1_S** | 89.3% | 40 | 37.5 | **30** | **25.5** |
 | GSQ IQ1_M | 85.5% | 42 | 37.5 | **34** | **28** |
 
-- **Under ~110 GB of RAM, use Unsloth's UD-IQ1_S**: one point less agreement, a lot faster, and new prompts read in
+- **Under ~110 GB of RAM, use Unsloth's UD-IQ1_S**: one point less agreement, faster, and new prompts read in
   about half the time (a ~180-token prompt: 11-13 s at 96 GB vs 20-27 s for the default). The first start offers it
   instead of the default on such a PC; `Choose Model.bat` downloads it on an existing install.
-- These runs gave the expert memory 58 GiB (96 GB) and 26 GiB (64 GB); on a real PC of that size the launcher gives
-  about 51 and 21 GiB today, so expect a little less. The SSD matters most here: the small quants were read from a
-  PCIe 4.0 NVMe (~3.5 GiB/s).
+- The default's 96 / 64 GB numbers are this release's launcher as it ships: the expert memory it gives such a PC
+  (61 and 31 GiB; it was 51 and 21) and the SSD read-ahead (`STRATA_D3_SPEC=8`, which reads the experts the next
+  layers will need while the current ones run - exact, +22% at 64 GB).  Before those two changes the same rows were
+  22 and 16.  The small quants were measured with 58 and 26 GiB, so expect a little more from them now.  The SSD
+  matters most here: the small quants were read from a PCIe 4.0 NVMe (~3.5 GiB/s).
 - Below 56 GB of RAM it will probably not start.
 
 On the 192 GB PC, a new 6k-token prompt takes about 18 s and a 25k-token prompt about 42 s. Writing is fastest on

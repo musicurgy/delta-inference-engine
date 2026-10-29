@@ -63,6 +63,8 @@ struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last, dump_topk, kl_ref;
     std::string score_cases, score_out;   // --score-cases / --score-out: teacher-forced continuations (official_score.py)
     std::string build_mirror;      // --build-mirror F [--mirror-gib N]: write the blob mirror (coldest experts by --rank) and exit
+    std::string tier_replay;       // --tier-replay F [--tier-replay-reps N]: replay a STRATA_TIER_RECORD file through the
+    int tier_replay_reps = 3;      //   tier after the seed (exact old-vs-new kernel check + timing, no decode) and exit
     double mirror_gib = 85.0;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
@@ -181,6 +183,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--rank") a.rank = next();
         else if (k == "--build-mirror") a.build_mirror = next();
+        else if (k == "--tier-replay") a.tier_replay = next();
+        else if (k == "--tier-replay-reps") a.tier_replay_reps = std::atoi(next().c_str());
         else if (k == "--check-mirror") { a.build_mirror = next(); a.mirror_gib = -1; }
         else if (k == "--mirror-gib") a.mirror_gib = std::atof(next().c_str());
         else if (k == "--vram-lru") a.vram_lru = true;
@@ -229,7 +233,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--vision") a.vision = true;
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
-    return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
+    return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty() ||
+                                !a.tier_replay.empty());
 }
 
 double now_ms() {
@@ -577,6 +582,20 @@ int main(int argc, char ** argv) {
                      (long long) tier.resident(), (long long) tier.arena_experts(), tier.arena_gib(), (long long) tier.file_tier(),
                      (now_ms() - t0) / 1000.0);
     }
+    // STRATA_ROUTE_TRACE=<file> (measurement only, both modes): the routing trace tools/v41/sim/route_sim.py and
+    // place_sim.py replay.  Opened here (round 231) so the server's passes are in it too; each decode start adds an
+    // 'S' snapshot of the VRAM / arena sets (trace_snapshot), which is where the replay's state restarts.
+    if (const char * rt = std::getenv("STRATA_ROUTE_TRACE")) tier.trace_open(rt);
+    // --tier-replay F: the kernel replay bench (round 231).  A STRATA_TIER_RECORD file holds real verify-pass tier
+    // calls (ids, weights, activations, the outputs the recording build produced); replay them through THIS build's
+    // tier right after the seed - bitwise comparison of the outputs (the per-token sums are in double in a fixed
+    // order, so a correct kernel change gives identical bytes whatever tier served each expert) and the time per
+    // call - and exit.  No prompt, no decode: one model load instead of one per one-shot.
+    if (!a.tier_replay.empty()) {
+        const bool ok = tier.tier_replay(a.tier_replay, a.tier_replay_reps, err);
+        if (!ok) std::fprintf(stderr, "ds41_generate: --tier-replay: %s\n", err.c_str());
+        return ok ? 0 : 1;
+    }
     // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now
     std::vector<char> proxy_res;   // --bias-prompt: the would-be VRAM set (first N ranked) until the real seed
     if (a.bias_prompt > 0) {
@@ -874,19 +893,37 @@ int main(int argc, char ** argv) {
         // STRATA_PASS_LOG=<file>: one line per pass (rows, wall / dense / tier ms, the tier's hits / cpu / pcie / file
         // for the pass) - the cost model behind batched decoding: what a pass costs per pass, per row and per miss
         static std::FILE * pass_log = std::getenv("STRATA_PASS_LOG") ? std::fopen(std::getenv("STRATA_PASS_LOG"), "w") : nullptr;
+        // STRATA_ROUTE_TRACE (round 231): the same per-pass numbers as a 'V' record of the trace - {m, wall us, dense
+        // us, tier us, hits, cpu, pcie, file, spec hits, spec issued, prefetch useful, prefetch issued, trace us} -
+        // the last being the time the trace's own extra predictions took ('R' records below: in the wall and the
+        // dense time, never the tier's; the replay subtracts it)
+        const bool tracing = tier.tracing();
+        double tr_extra_ms = 0;
         const double pl_t0 = tq, pl_d0 = pv_ms[0], pl_t1 = pv_ms[1];
-        const Ds41MoeStats pl_s0 = pass_log ? tier.stats() : Ds41MoeStats{};
+        const Ds41MoeStats pl_s0 = (pass_log || tracing) ? tier.stats() : Ds41MoeStats{};
         struct PassLogLine {
             std::FILE * f; int m; double t0, d0, k0; const double * ms; const Ds41MoeStats * s0; Ds41MoeTier * tr;
+            bool trace; const double * extra;
             ~PassLogLine() {
-                if (!f) return;
+                if (!f && !trace) return;
                 const Ds41MoeStats s = tr->stats();
-                std::fprintf(f, "%d %.3f %.3f %.3f %lld %lld %lld %lld\n", m, now_ms() - t0, ms[0] - d0, ms[1] - k0,
-                             (long long) (s.hits - s0->hits), (long long) (s.cpu - s0->cpu), (long long) (s.pcie - s0->pcie),
-                             (long long) (s.file_tier - s0->file_tier));
-                std::fflush(f);
+                if (f) {
+                    std::fprintf(f, "%d %.3f %.3f %.3f %lld %lld %lld %lld\n", m, now_ms() - t0, ms[0] - d0, ms[1] - k0,
+                                 (long long) (s.hits - s0->hits), (long long) (s.cpu - s0->cpu), (long long) (s.pcie - s0->pcie),
+                                 (long long) (s.file_tier - s0->file_tier));
+                    std::fflush(f);
+                }
+                if (trace) {
+                    const int32_t v[13] = { m, (int32_t) ((now_ms() - t0) * 1000.0), (int32_t) ((ms[0] - d0) * 1000.0),
+                                            (int32_t) ((ms[1] - k0) * 1000.0), (int32_t) (s.hits - s0->hits), (int32_t) (s.cpu - s0->cpu),
+                                            (int32_t) (s.pcie - s0->pcie), (int32_t) (s.file_tier - s0->file_tier),
+                                            (int32_t) (s.spec_hits - s0->spec_hits), (int32_t) (s.spec_issued - s0->spec_issued),
+                                            (int32_t) (s.prefetched_useful - s0->prefetched_useful),
+                                            (int32_t) (s.prefetch_issued - s0->prefetch_issued), (int32_t) (*extra * 1000.0) };
+                    tr->trace_rec('V', v, 13);
+                }
             }
-        } pass_log_line { pass_log, m, pl_t0, pl_d0, pl_t1, pv_ms, &pl_s0, &tier };
+        } pass_log_line { pass_log, m, pl_t0, pl_d0, pl_t1, pv_ms, &pl_s0, &tier, tracing, &tr_extra_ms };
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
         vh.assign((size_t) m * 3 * n_embd, 0.0f);
@@ -993,6 +1030,41 @@ int main(int argc, char ** argv) {
                     }
                 }
             }
+            // STRATA_ROUTE_TRACE (round 231): the ranked prediction for layers l + a, a in STRATA_ROUTE_TRACE_AHEAD
+            // (default "0,2": the prefetch's own layer and the read-ahead's), as an 'R' record {l, l + a, n, n x
+            // {expert, score}} - score = P(routed) x 1e6 under noisy-OR (every candidate, before STRATA_D3_PF_P),
+            // else the summed 16 - rank - so place_sim.py can act on the prediction the engine would have had at
+            // any prefetch / read-ahead setting.  These predict_multi calls are the trace's own: their time goes to
+            // the 'V' record's last field, and the real prefetch / read-ahead below predict again as they always did.
+            static const std::vector<int> tr_aheads = [] {
+                std::vector<int> v;
+                const char * s = std::getenv("STRATA_ROUTE_TRACE_AHEAD");
+                for (const char * p = s ? s : "0,2"; *p; ) {
+                    char * e = nullptr;
+                    const long a = std::strtol(p, &e, 10);
+                    if (e == p) break;
+                    v.push_back((int) a);
+                    p = *e ? e + 1 : e;
+                }
+                return v;
+            }();
+            if (tracing && rdev1 && !no_tier_batch && m <= Ds41MoeTier::kMaxMulti) {
+                const double t_tr = now_ms();
+                pv_pred.resize((size_t) m * 16);
+                std::vector<int32_t> rec;
+                for (int a : tr_aheads) {
+                    if (a < 0 || l + a >= n_layer || !dense.predict_multi(l + a, pv_pred.data())) continue;
+                    rank_union(l + a);
+                    rec.assign({ l, l + a, 0 });
+                    if (pf_noisyor)
+                        for (const auto & q : pv_noq) { rec.push_back(q.first); rec.push_back((int32_t) ((1.0f - q.second) * 1e6f)); }
+                    else
+                        for (const auto & q : pv_score) { rec.push_back(q.first); rec.push_back(q.second); }
+                    rec[2] = (int32_t) ((rec.size() - 3) / 2);
+                    tier.trace_rec('R', rec.data(), (int) rec.size());
+                }
+                tr_extra_ms += now_ms() - t_tr;
+            }
             // D3 speculative NVMe reads (STRATA_D3_SPEC=n, default 0 = off; STRATA_D3_SPEC_AHEAD=k, default 2): the
             // pass's routing for layer l+k predicted from the state entering l (predict_multi, bias included), its
             // union ranked as above, and the NVMe-tier experts among the top n read into the stash by background
@@ -1000,7 +1072,10 @@ int main(int argc, char ** argv) {
             // 7.9 ms/token on the decode thread).  A wrong guess costs SSD bandwidth only.
             static const int d3_spec = std::getenv("STRATA_D3_SPEC") ? std::atoi(std::getenv("STRATA_D3_SPEC")) : 0;
             static const int d3_spec_ahead = std::getenv("STRATA_D3_SPEC_AHEAD") ? std::atoi(std::getenv("STRATA_D3_SPEC_AHEAD")) : 2;
-            if (rdev1 && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + d3_spec_ahead < n_layer) {
+            // (round 229 / A7: the launcher can set STRATA_D3_SPEC=8 for every PC - with no file tier (the arena holds
+            // every expert: 128 GB and up) the extra prediction per layer buys nothing, so it is skipped)
+            if (rdev1 && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + d3_spec_ahead < n_layer &&
+                tier.file_tier() > 0) {
                 pv_pred.resize((size_t) m * 16);
                 if (dense.predict_multi(l + d3_spec_ahead, pv_pred.data())) {
                     rank_union(l + d3_spec_ahead);
@@ -2198,6 +2273,7 @@ int main(int argc, char ** argv) {
             // ---- DSpark speculative sampling (as the one-shot loop: P = last fed position, t = the token for P+1,
             // sp_ids = drafts for P+2..; each verify row's distribution is sample_p's, spec_accept keeps it exact)
             long rq_pass = 0, rq_acc = 0;
+            tier.trace_snapshot();   // STRATA_ROUTE_TRACE: the VRAM / arena sets this request's decode starts from
             if (!dsp) sp_t = -1;   // the drafter failed to load during this request: the plain decode below (from lg)
             if (sp_t >= 0) {
                 int P = total - 1, t = sp_t, prev = ids.back();
@@ -2302,6 +2378,10 @@ int main(int argc, char ** argv) {
                     }
                     if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
                     ++rq_pass; rq_acc += acc;
+                    if (tier.tracing()) {   // STRATA_ROUTE_TRACE: 'P' {m, k, acc, refeed, 0} - the server's passes (timing is in 'V')
+                        const float pm[5] = { (float) vt.size(), (float) k, (float) acc, refeed ? 1.0f : 0.0f, 0.0f };
+                        tier.trace_mark(pm, 5);
+                    }
                     if (is_lk) {
                         ++lk_pass; lk_dr += k; lk_acc += acc;
                         if (2 * acc < k) { lk_cool = lk_back; lk_back = std::min(64, lk_back * 2); }
@@ -2677,8 +2757,9 @@ int main(int argc, char ** argv) {
     // rejection a pass that starts at an odd position re-feeds the last accepted token (its group's state then comes
     // from inside the pass).
     // STRATA_ROUTE_TRACE=<file> (measurement only): the verify passes' routing + acceptance, for
-    // tools/v41/sim/route_sim.py (session 13: in-pass draft pruning and the VRAM replacement policy, replayed offline)
-    if (const char * rt = std::getenv("STRATA_ROUTE_TRACE")) tier.trace_open(rt);
+    // tools/v41/sim/route_sim.py (session 13: in-pass draft pruning and the VRAM replacement policy, replayed offline).
+    // Opened after the seed (round 231); this is the decode-start snapshot (the prompt may have re-seeded the cache)
+    tier.trace_snapshot();
     long sp_pass = 0, sp_acc = 0, sp_refeed = 0, sp_full = 0;
     const bool sp_noacc = std::getenv("STRATA_DSPARK_NOACC") != nullptr;
     double sp_vms = 0, sp_dms = 0;
