@@ -53,3 +53,14 @@ Decode speed on one RTX 3090. The measurement is `bench_server`: 6 chats of up t
 | UD-IQ1_S | 96 GB | 30 |
 | UD-IQ1_S | 64 GB | 25.5 |
 | EXL3 2.5 bpw (opt-in quality mode) | 192 GB | 25.4 |
+
+### Same PC, same file: llama.cpp
+
+Mainline llama.cpp (commit 36a0e2f of 2026-10-29, built with CUDA for the 3090) and this engine, on the same PC, the same Unsloth UD-IQ1_S model file, the same 6 chats of up to 1,500 tokens with thinking on, full RAM, two interleaved runs each. llama.cpp was run the usual way for a model this size: `-ngl 99 -ot exps=CPU -t 14 -c 8192` (the routed experts in RAM on the CPU, everything else on the card). It has no speculative decoding for DeepSeek V4.
+
+| Engine | Decode tok/s (server) | Decode tok/s (what the client sees) | Prompt tok/s |
+|---|---|---|---|
+| llama.cpp mainline | 7.7 | 7.4 | ~35 |
+| this release | 37.5 | 34 | ~45 |
+
+The difference is where the experts run: llama.cpp computes every routed expert on the CPU for every token, which is bound by RAM bandwidth; this engine keeps most expert reads on the card (a VRAM cache plus a pinned RAM arena over PCIe) and drafts about 3 tokens per pass.
