@@ -147,7 +147,13 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
   they change during an answer (`STRATA_BIAS_REFRESH=1` in the launcher), which made it both faster and closer to
   DeepSeek's own model (at 0.3: 89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with
   the refresh).  The test moves by about 0.2 points between identical runs.
-- For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`.
+- On agentic, tool-calling text (53 transcripts with tools, tool calls and tool results, 46K tokens) the bias costs the
+  same as on prose: exact routing agrees with DeepSeek's own model on 95.98% of next tokens, the default 0.28 on
+  94.83%; inside the tool-call JSON itself the cost is 0.4 points, in the prose between calls 2.9.  There is no
+  collapse at this setting (reports of collapse come from a bias of 1.0, which this launcher does not use).
+- `--kv-fp4` (the compressed KV cache, on by default) is exact: the logits are bit-identical with and without it.
+- For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`, or
+  per request with `"strata_tune": {"route_bias": 0, "route_bias_file": 0}` - about 20% slower.
 
 ## Other quants: ISTA-DASLab's GSQ-RCO, Unsloth, and the EXL3 quality mode
 
