@@ -95,7 +95,9 @@ rem            the answer's start): 40% fewer expert misses, ~12% faster writing
 rem   keep cache - a follow-up of up to 2048 new tokens borrows only part of the GPU's expert cache and gets exactly
 rem            those experts back after, instead of emptying and refilling it: such turns 0.6-0.9 s faster
 set STRATA_SERVE_ROLLBACK=8
-set STRATA_SERVE_BATCH_MIN=256
+rem            turns of 64+ new tokens take the batch path (was 256): a ~190-token turn reads 12% faster and the
+rem            chat as a whole ~4% at the client (round 246, 10-30); turns under 64 still run token by token
+set STRATA_SERVE_BATCH_MIN=64
 set STRATA_PASS_CAP_MIN=4096
 set STRATA_ENGRAM_THREADS=64
 set STRATA_KGATHER=1
