@@ -369,6 +369,12 @@ struct Gpu {
     std::unique_ptr<RemoteHelper> helper;   ///< STRATA_DS41_REMOTE (null = off)
     std::unique_ptr<SpecStash> spec;   ///< spec_read's stash (opened on first use)
     std::unique_ptr<ReadPool> rpool;   ///< D3's file-tier readers (persistent; created on first use)
+    /// STRATA_FG_PART_DMA: per (read blob, part) 1 once the part is home, then per read blob the parts home so far
+    std::unique_ptr<std::atomic<int>[]> fg_pd;
+    size_t fg_pd_n = 0;
+    /// STRATA_WAVE_MERGE: the merged prompt reader's aligned bounces (one per reader thread, wm_bytes each, kept)
+    std::vector<uint8_t*> wm_buf;
+    size_t wm_bytes = 0;
     std::unique_ptr<ReadPool> stpool;  ///< STRATA_PAGEABLE_STAGE: copies pageable arena blobs into h_fstage (persistent)
     std::unique_ptr<strata::core::ExpertCache> cache;
     strata::kernels::NativeExpertLayout gl;
@@ -490,6 +496,7 @@ struct Gpu {
                         d_stage, d_pf, d_pf_next, d_meta, d_hsum};
         if (h_meta) cudaFreeHost(h_meta);
         if (h_fstage) cudaFreeHost(h_fstage);
+        for (uint8_t* p : wm_buf) ds41_sys::aligned_free(p);
         for (void* p : bufs)
             if (p) cudaFree(p);
         if (ev_pf) cudaEventDestroy(ev_pf);
@@ -4025,14 +4032,41 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         if (gp.s_dn) ck(cudaStreamSynchronize(gp.s_dn), "d3 arena-adapt dn sync");   // idle between calls; cheap
     }
     const double tfg = nfg > 0 ? now_ms() : 0;
+    // STRATA_FG_PART_DMA=1 (IDEAS A11, Maya #570): a read blob's parts are DMA'd as they come home (the parts home so
+    // far in one copy each run) instead of the whole blob after the pool's last part - the copy overlaps the rest of
+    // the read, and the arena misses queued ahead of a file-tier one no longer wait for every read of the call.  The
+    // same bytes into the same slot, in the same launches: exact.
+    static const bool part_dma = std::getenv("STRATA_FG_PART_DMA") && std::getenv("STRATA_FG_PART_DMA")[0] == '1';
+    int fg_parts = 0;
+    int fg_ri[kMaxFg];   // blob b -> its index among the read blobs (-1 = stashed: nothing to wait for)
+    std::atomic<int>* fg_pd = nullptr;   // [nfr * fg_parts] part home, then [nfr] parts home per read blob
     if (nfr > 0) {
         if (!gp.rpool) gp.rpool = std::make_unique<ReadPool>();
         // STRATA_D3_PARTS: a call's read budget in parts (default 32 = the readers, split over its blobs)
         static const int d3_parts = std::getenv("STRATA_D3_PARTS") ? std::max(1, std::atoi(std::getenv("STRATA_D3_PARTS"))) : 32;
         const int parts = std::max(1, std::min(d3_parts, d3_parts / nfr));
+        uint64_t lo, hi;
+        if (part_dma && parts <= 64 && im.blobs->part_range(layer, ue[fg_u[fread_b[0]]], 0, parts, lo, hi)) {
+            const size_t need = (size_t) nfr * (size_t) (parts + 1);
+            if (gp.fg_pd_n < need) {
+                gp.fg_pd.reset(new std::atomic<int>[need]);
+                gp.fg_pd_n = need;
+            }
+            fg_pd = gp.fg_pd.get();
+            for (size_t i = 0; i < need; ++i) fg_pd[i].store(0, std::memory_order_relaxed);
+            fg_parts = parts;
+            for (int b = 0; b < nfg; ++b) fg_ri[b] = -1;
+            for (int i = 0; i < nfr; ++i) fg_ri[fread_b[i]] = i;
+        }
         gp.rpool->start((size_t) nfr * (size_t) parts, [&, parts](size_t r) {
             const int b = fread_b[r / (size_t) parts];
             im.blobs->read_part(layer, ue[fg_u[b]], (int) (r % (size_t) parts), parts, (uint8_t*) fg_src[b]);
+            if (fg_pd) {
+                std::atomic<int>& home = fg_pd[(size_t) nfr * (size_t) parts + r / (size_t) parts];
+                fg_pd[r].store(1, std::memory_order_release);
+                home.fetch_add(1, std::memory_order_release);
+                home.notify_one();
+            }
         });
     }
     xmark(0);
@@ -4150,6 +4184,37 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             bank_read[bank] = true;
         }
     };
+    // STRATA_FG_PART_DMA: read blob `ri` (expert e) into `to` - each run of parts that came home since the last look
+    // in one copy (any order: the ranges are disjoint), the last byte range out to BL as the whole-blob copy had it
+    double fg_home = tfg;   // when the call's last file-tier part came home (its file_ms)
+    auto fg_part_copy = [&](uint8_t* to, const uint8_t* src, int32_t e, int ri, int64_t BL) {
+        const int P = fg_parts;
+        std::atomic<int>* pd = fg_pd + (size_t) ri * (size_t) P;
+        std::atomic<int>& home = fg_pd[(size_t) nfr * (size_t) P + (size_t) ri];
+        uint64_t sent = 0;   // bit p: part p copied
+        int seen = 0;
+        while (seen < P) {
+            const int now = home.load(std::memory_order_acquire);
+            if (now == seen) {
+                home.wait(seen, std::memory_order_acquire);
+                continue;
+            }
+            seen = now;
+            for (int p = 0; p < P;) {
+                if ((sent >> p & 1) || !pd[p].load(std::memory_order_acquire)) { ++p; continue; }
+                int q = p;
+                while (q < P && !(sent >> q & 1) && pd[q].load(std::memory_order_acquire)) sent |= 1ull << q++;
+                uint64_t lo, hi, lo2, hi2;
+                im.blobs->part_range(layer, e, p, P, lo, hi);
+                im.blobs->part_range(layer, e, q - 1, P, lo2, hi2);
+                if (q == P) hi2 = (uint64_t) BL;
+                ck(cudaMemcpyAsync(to + lo, src + lo, (size_t) (hi2 - lo), cudaMemcpyHostToDevice, cs), "pcie part dma");
+                p = q;
+            }
+            wddm_flush(cs);   // WDDM queues copies until something submits them: this one must start now
+        }
+        fg_home = std::max(fg_home, now_ms());
+    };
     auto launch_site = [&](int want, int pf_sel = -1) {   // pf_sel (HIT): 0 resident hits only, 1 prefetched only, -1 both
         bool used[kMaxEnt] = {};
         auto in_site = [&](int u) {
@@ -4172,10 +4237,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                     const int32_t e = ue[u];
                     const int64_t BL = BLX(e);
                     const uint8_t* src = gp.arena.ptr(layer, e);
+                    int fri = -1;   // STRATA_FG_PART_DMA: its index among the read blobs (its parts land one by one)
                     if (cls[u] == FILEG) {   // its staging (or arena_adapt victim) slot = its index in fg_u
                         int b = 0;
                         while (fg_u[b] != u) ++b;
                         src = fg_src[b];
+                        if (fg_pd) fri = fg_ri[b];
                     }
                     // LRU admission (arena-held PCIe misses only, as gpu_run)
                     int32_t v = (lru && cls[u] == PCIE && admit_ok(e)) ? lru_victim(e) : -1;
@@ -4192,7 +4259,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                             }
                         }
                         uint8_t* to = (uint8_t*) gp.d_stage + (size_t) (bank * bank_w + si) * (size_t) B;
-                        ck(cudaMemcpyAsync(to, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+                        if (fri >= 0) fg_part_copy(to, src, e, fri, BL);
+                        else ck(cudaMemcpyAsync(to, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
                         dptr[u] = (unsigned long long) to;
                         ++si;
                     }
@@ -4251,12 +4319,17 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             lru_old[n_lru] = v; lru_dem[n_lru] = dem; lru_new[n_lru++] = e;
         }
     }
-    if (nfg > 0) {   // the file-tier blobs must be home before their DMAs are queued
+    if (nfg > 0 && !fg_pd) {   // the file-tier blobs must be home before their DMAs are queued
         if (nfr > 0) gp.rpool->wait();
         im.st.file_tier += nfg;
         im.st.file_ms += now_ms() - tfg;
     }
     launch_site(PCIE);
+    if (fg_pd) {   // STRATA_FG_PART_DMA: launch_site waited for every part (as it queued its copy); the pool is done
+        gp.rpool->wait();
+        im.st.file_tier += nfg;
+        im.st.file_ms += fg_home - tfg;
+    }
     if (dn) {   // belt and braces: `s` has waited on every PCIe-site copy, so the sync that ends this call covers s_dn
         ck(cudaEventRecord(gp.dn_ev[1], gp.s_dn), "d3 dn tail record");
         ck(cudaStreamWaitEvent(gp.s, gp.dn_ev[1], 0), "d3 dn tail wait");
@@ -5318,6 +5391,11 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     size_t wave_end = 0;   // reads issued for file blobs [0, wave_end)
     std::vector<std::thread> readers;
     double t_file = 0, t_rd0 = 0;
+    struct WmSeg { uint64_t off, len; uint8_t* dst; size_t q; };   // STRATA_WAVE_MERGE: one file span -> blob q's slot
+    struct WmPiece { uint64_t a, b; size_t s0, s1; };              // one read: file bytes [a, b) of the run wm_seg[s0, s1)
+    std::vector<WmSeg> wm_seg;
+    std::vector<WmPiece> wm_piece;
+    std::vector<int64_t> wm_tot;   // per file blob: its bytes (published when pdone reaches them)
     auto start_wave = [&]() {   // the next `cap` file blobs (their slots must be free: the caller made sure)
         for (auto& t : readers) t.join();
         readers.clear();
@@ -5337,6 +5415,86 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         // the source's own note puts the whole scattered-vs-dd gap at ~9% (4.65 vs 5.1 GB/s), and at PROMPT size the
         // two orderable knobs (STRATA_WAVE_PARTS 4 / 16) measured 0% (320.9 / 316.5 / 320.9 tok/s), i.e. inside the
         // 1.5-4.3% noise.  The prefill lever is the batch width (fewer whole-file-tier sweeps), not read order.
+        // STRATA_WAVE_MERGE=G (IDEAS A10, antirez-ds4 10-21; default 16 since round 256, 0 = the parts reader above): the wave's reads in
+        // FILE-OFFSET order with touching spans merged.  The ids ascend, so each tensor's spans already do - but a blob is
+        // three spans in three tensors (gate | up | down), read as P parts each, so the queue hops between the tensors
+        // and never reads across an expert boundary.  Here each group of G consecutive blobs has its spans sorted by
+        // offset, every run of touching spans (neighbouring file-tier experts) is read as pieces of
+        // STRATA_WAVE_MERGE_KB (default 2048) through one O_DIRECT bounce each, and the bytes are copied out to the
+        // blobs' slots.  A blob is published when all its bytes are in; a group's blobs land together, so G bounds how
+        // late the first does (the wave is ~a layer: whole-wave order would hold every blob until the down tensor).
+        // Same bytes into the same slots: exact.  Round 256 (64 GB, arena 31): expert phase -18% on a ~330-token prompt
+        // and -20% at 20.6K tokens (file tier 2.66 -> 3.71 GB/s of reader time); 4K md5 unchanged at arena 140 and 31.
+        static const int wave_merge = std::getenv("STRATA_WAVE_MERGE") ? std::max(0, std::min(4096, std::atoi(std::getenv("STRATA_WAVE_MERGE")))) : 16;
+        static const uint64_t piece = (uint64_t) (std::getenv("STRATA_WAVE_MERGE_KB") ? std::max(64, std::min(65536, std::atoi(std::getenv("STRATA_WAVE_MERGE_KB")))) : 2048) * 1024;
+        if (wave_merge > 0) {
+            wm_seg.clear();
+            wm_piece.clear();
+            if (wm_tot.size() < nF) wm_tot.assign(nF, 0);
+            bool ok = true;
+            for (size_t g0 = w0; g0 < w1 && ok; g0 += (size_t) wave_merge) {
+                const size_t g1 = std::min(w1, g0 + (size_t) wave_merge), sb = wm_seg.size();
+                for (size_t q = g0; q < g1 && ok; ++q) {
+                    uint64_t off[3], by[3], at = 0;
+                    ok = im.blobs->file_spans(layer, order[2][q], off, by);
+                    for (int r = 0; r < 3 && ok; ++r) {
+                        if (by[r]) wm_seg.push_back({off[r], by[r], slot_ptr(q) + at, q});
+                        at += by[r];
+                    }
+                    wm_tot[q] = (int64_t) at;
+                }
+                if (!ok) break;
+                std::sort(wm_seg.begin() + (std::ptrdiff_t) sb, wm_seg.end(), [](const WmSeg& x, const WmSeg& y) { return x.off < y.off; });
+                for (size_t i = sb; i < wm_seg.size();) {   // runs of touching spans, cut at 4 KiB-aligned piece ends
+                    size_t j = i + 1;
+                    uint64_t end = wm_seg[i].off + wm_seg[i].len;
+                    while (j < wm_seg.size() && wm_seg[j].off == end) end += wm_seg[j++].len;
+                    for (uint64_t a = wm_seg[i].off; a < end;) {
+                        const uint64_t b = std::min(end, (a & ~(uint64_t) 4095) + piece);
+                        wm_piece.push_back({a, b, i, j});
+                        a = b;
+                    }
+                    i = j;
+                }
+            }
+            if (ok) {
+                const size_t np = wm_piece.size(), nb = (size_t) piece + 8192;
+                const int nth = (int) std::min<size_t>((size_t) wave_threads, np);
+                if (gp.wm_bytes != nb) {
+                    for (uint8_t* p : gp.wm_buf) ds41_sys::aligned_free(p);
+                    gp.wm_buf.clear();
+                    gp.wm_bytes = nb;
+                }
+                while ((int) gp.wm_buf.size() < nth) gp.wm_buf.push_back((uint8_t*) ds41_sys::aligned_alloc(4096, nb));
+                rnext.store(0);
+                for (int k = 0; k < nth; ++k)
+                    readers.emplace_back([&, np, k]() {
+                        uint8_t* sc = gp.wm_buf[(size_t) k];
+                        for (size_t x; (x = rnext.fetch_add(1)) < np;) {
+                            const WmPiece& pc = wm_piece[x];
+                            const uint8_t* src = im.blobs->read_span_direct(pc.a, (size_t) (pc.b - pc.a), sc, gp.wm_bytes);
+                            if (!src) {
+                                std::fprintf(stderr, "ds4_moe: merged wave read of %llu bytes refused\n", (unsigned long long) (pc.b - pc.a));
+                                std::abort();
+                            }
+                            for (size_t s = pc.s0; s < pc.s1; ++s) {
+                                const WmSeg& sg = wm_seg[s];
+                                const uint64_t lo = std::max(pc.a, sg.off), hi = std::min(pc.b, sg.off + sg.len);
+                                if (lo >= hi) continue;
+                                std::memcpy(sg.dst + (lo - sg.off), src + (lo - pc.a), (size_t) (hi - lo));
+                                if (pdone[sg.q].fetch_add((int) (hi - lo), std::memory_order_acq_rel) + (int64_t) (hi - lo) == wm_tot[sg.q]) {
+                                    ready[sg.q].store(1, std::memory_order_release);
+                                    ready[sg.q].notify_one();
+                                    if (prof && rdone.fetch_add(1) + 1 == nF) t_rd_last.store(now_ms());
+                                }
+                            }
+                        }
+                    });
+                return;
+            }
+            wm_seg.clear();   // a blob without a file layout: this wave reads in parts
+            wm_piece.clear();
+        }
         rnext.store(w0 * P);
         const int nth = (int) std::min<size_t>((size_t) wave_threads, (w1 - w0) * P);
         for (int k = 0; k < nth; ++k)
@@ -7156,14 +7314,53 @@ void Ds41FileBlobs::read(int64_t layer, int64_t expert, uint8_t* dst) const {
     }
 }
 
-void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const {
+bool Ds41FileBlobs::file_spans(int64_t layer, int64_t expert, uint64_t off[3], uint64_t bytes[3]) const {
+    if (!direct_ok_ || mfd_ >= 0) return false;   // the merged reader reads O_DIRECT, and only the model file
     Span s[3];
     spans(layer, expert, s);
-    const uint64_t total = s[0].bytes + s[1].bytes + s[2].bytes;
-    uint64_t lo = total * (uint64_t) part / (uint64_t) nparts, hi = total * (uint64_t) (part + 1) / (uint64_t) nparts;
+    for (int r = 0; r < 3; ++r) {
+        off[r] = s[r].off;
+        bytes[r] = s[r].bytes;
+    }
+    return true;
+}
+
+const uint8_t* Ds41FileBlobs::read_span_direct(uint64_t off, size_t n, uint8_t* scratch, size_t scratch_bytes) const {
+    if (!direct_ok_ || !scratch || !n) return nullptr;
+    const int fd = sdfd(off);
+    const uint64_t at = sloc(off);
+    constexpr uint64_t A = 4096;
+    const uint64_t a0 = at & ~(A - 1), a1 = (at + n + A - 1) & ~(A - 1);
+    const size_t span = (size_t) (a1 - a0);
+    if (fd < 0 || span > scratch_bytes) return nullptr;
+    size_t got = 0;
+    while (got < span) {
+        const ssize_t k = ds41_sys::pread(fd, scratch + got, span - got, (int64_t) (a0 + got));
+        if (k <= 0) break;
+        got += (size_t) k;
+    }
+    if (got < (size_t) (at + n - a0)) {   // short of the bytes asked for (the file's tail page may be short: fine)
+        std::fprintf(stderr, "Ds41FileBlobs: O_DIRECT read failed at %llu\n", (unsigned long long) at);
+        std::abort();
+    }
+    return scratch + (at - a0);
+}
+
+bool Ds41FileBlobs::part_range(int64_t layer, int64_t expert, int part, int nparts, uint64_t& lo, uint64_t& hi) const {
+    const uint64_t total = (uint64_t) expert_bytes(layer, expert);
+    lo = total * (uint64_t) part / (uint64_t) nparts;
+    hi = total * (uint64_t) (part + 1) / (uint64_t) nparts;
     lo &= ~(uint64_t) 4095;
     if (part + 1 < nparts) hi &= ~(uint64_t) 4095;
     else hi = total;
+    return true;
+}
+
+void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const {
+    Span s[3];
+    spans(layer, expert, s);
+    uint64_t lo = 0, hi = 0;
+    part_range(layer, expert, part, nparts, lo, hi);
     uint64_t at = 0;
     uint8_t* bb = part_direct_ && direct_ok_ ? take_bounce() : nullptr;
     // the mirror's share of the parts: part p goes there when floor((p+1)*share) > floor(p*share) - spread evenly,

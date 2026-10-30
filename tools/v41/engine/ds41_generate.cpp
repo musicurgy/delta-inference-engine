@@ -2553,9 +2553,9 @@ int main(int argc, char ** argv) {
             }
             const Ds41MoeStats pst = stats_all();
             std::fprintf(stderr, "serve: prompt %d tokens (%d reused, %s) in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / "
-                                 "%lld pcie / %lld file)\n", total, reused, by_step ? (exact_pass ? "exact passes" : "passes") : "batch", prompt_ms / 1000.0,
+                                 "%lld pcie / %lld file, file wait %.0f ms)\n", total, reused, by_step ? (exact_pass ? "exact passes" : "passes") : "batch", prompt_ms / 1000.0,
                          1000.0 * (total - reused) / std::max(prompt_ms, 1e-9), (long long) pst.hits, (long long) pst.cpu,
-                         (long long) pst.pcie, (long long) pst.file_tier);
+                         (long long) pst.pcie, (long long) pst.file_tier, pst.file_ms);
             if (defer_vram && !cache_open) {   // decode next: the VRAM cache opens into what the prompt freed
                 if (!open_cache()) {
                     std::printf("ERR VRAM seed failed: %s\n", err.c_str());
@@ -2743,9 +2743,11 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
                 finish = "length";
             }
-            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
+            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file "
+                                 "(%.0f ms; %lld read ahead)\n",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
-                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier, st.file_ms,
+                         (long long) st.spec_hits);
             if (st.remote > 0) std::fprintf(stderr, "serve: experts on the STRATA_DS41_REMOTE helper's card: %lld\n", (long long) st.remote);
             if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
                 size_t tf = 0, tt = 0;

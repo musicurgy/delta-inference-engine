@@ -143,6 +143,25 @@ public:
         if (part == 0) read(layer, expert, dst);
         (void) nparts;
     }
+    /// The bytes [lo, hi) of the blob that `read_part(layer, expert, part, nparts, ...)` writes - so a caller can use a
+    /// part as soon as its read returns.  False when the source does not say (use the blob only after every part).
+    virtual bool part_range(int64_t layer, int64_t expert, int part, int nparts, uint64_t& lo, uint64_t& hi) const {
+        (void) layer; (void) expert; (void) part; (void) nparts; (void) lo; (void) hi;
+        return false;
+    }
+    /// The blob's three file spans [gate | up | down] as (offset, bytes) - adjacent bytes of the file have adjacent
+    /// offsets, so a reader can merge neighbouring experts' spans into one read (read_span_direct).  False when the
+    /// source has no such layout (or reads it some other way: a mirror, no O_DIRECT).
+    virtual bool file_spans(int64_t layer, int64_t expert, uint64_t off[3], uint64_t bytes[3]) const {
+        (void) layer; (void) expert; (void) off; (void) bytes;
+        return false;
+    }
+    /// One aligned O_DIRECT read covering file bytes [off, off + n) (offsets from file_spans; [off, off + n) within one
+    /// file) into `scratch`; returns where byte `off` landed in it.  Null: the span does not fit `scratch_bytes`.
+    virtual const uint8_t* read_span_direct(uint64_t off, size_t n, uint8_t* scratch, size_t scratch_bytes) const {
+        (void) off; (void) n; (void) scratch; (void) scratch_bytes;
+        return nullptr;
+    }
     /// The chunk-prefetch reader pool's read: the same bytes as `read`, through the fastest path the source has.  A
     /// source with a raw file layout overrides this to pread through an `O_DIRECT` twin fd via the aligned `scratch`
     /// bounce (`read_staged_scratch()` bytes per thread, 4096-aligned).  Measured on the V41-GSQ GGUF: the scattered
@@ -226,6 +245,9 @@ public:
     size_t blob_bytes(int64_t l) const override;
     void read(int64_t layer, int64_t expert, uint8_t* dst) const override;
     void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override;
+    bool part_range(int64_t layer, int64_t expert, int part, int nparts, uint64_t& lo, uint64_t& hi) const override;
+    bool file_spans(int64_t layer, int64_t expert, uint64_t off[3], uint64_t bytes[3]) const override;
+    const uint8_t* read_span_direct(uint64_t off, size_t n, uint8_t* scratch, size_t scratch_bytes) const override;
     void read_staged(int64_t layer, int64_t expert, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const override;
     size_t read_staged_scratch() const override { return scratch_; }
     void advise(int64_t layer, int64_t expert) const override;

@@ -88,9 +88,9 @@ cmake -G Ninja -S "%ROOT%." -B "%ROOT%%OUT%" -DCMAKE_BUILD_TYPE=Release -DCMAKE_
   -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON -DSTRATA_MMQ_KQUANTS=ON "-DCMAKE_CUDA_ARCHITECTURES=%ARCH%" ^
   -DSTRATA_PORTABLE=%PORTABLE% "-DSTRATA_ISA_FLOOR=%FLOOR%" %RTL% -DSTRATA_GGML_DIR="%LLAMA:\=/%" ^
   -DSTRATA_DSV41_FQ_OP=ON -DSTRATA_DSV41_HC_MIX=ON -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_STANDARD=17 || exit /b 1
-cmake --build "%ROOT%%OUT%" --target ds41_generate v41_sidecar_requant ds41_engram_hot && goto built
+cmake --build "%ROOT%%OUT%" --target ds41_generate ds41_helper v41_sidecar_requant ds41_engram_hot && goto built
 echo   (the build stopped - trying it once more)
-cmake --build "%ROOT%%OUT%" --target ds41_generate v41_sidecar_requant ds41_engram_hot || exit /b 1
+cmake --build "%ROOT%%OUT%" --target ds41_generate ds41_helper v41_sidecar_requant ds41_engram_hot || exit /b 1
 :built
 rem the CUDA runtime DLLs next to the exe: it then runs without the toolkit on PATH, and the folder can be copied to
 rem another PC (which needs only an NVIDIA driver recent enough for this CUDA version)
