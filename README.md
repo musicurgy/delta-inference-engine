@@ -141,9 +141,10 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 | | General | Code + maths |
 |---|---|---|
 | Exact routing | 91.4% | 92.1% |
-| Route bias 0.28 (the default) | 90.2% | 92.4% |
+| Route bias 0.28 (the default before 0.93) | 90.2% | 92.4% |
+| Route bias 0.10 (the default from 0.93) | measured against exact routing of this build: 94.5% of next tokens agree, vs 90.8% at 0.28 (7,066 held-out tokens); the vs-API row is re-measured for 0.93 | |
 
-- Route bias prefers experts that are already on the GPU. It is roughly 20% faster. It follows the GPU's experts as
+- Route bias prefers experts that are already on the GPU. The dial is smooth: 0.10 (the default) gives up about 8% of speed against 0.28, exact routing about 25% (0.28: 90.8% / ~43 tok/s, 0.15: 93.5% / ~41, 0.10: 94.5% / ~40, 0.05: 95.3% / ~36.5, exact: 96.5% / ~32, all agreement with exact routing of the same build). It follows the GPU's experts as
   they change during an answer (`STRATA_BIAS_REFRESH=1` in the launcher), which made it both faster and closer to
   DeepSeek's own model (at 0.3: 89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with
   the refresh).  The test moves by about 0.2 points between identical runs.
