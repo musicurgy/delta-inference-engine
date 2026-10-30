@@ -27,6 +27,7 @@ constexpr int kThreads = 256, kWarps = 8;
 constexpr int kCols = 128;   // outputs per block: 8 tiles, one rotation block
 constexpr int kTok = 8;      // activations a block takes at once (the MMA's n)
 constexpr float kHad = 0.088388347648f;   // 1 / sqrt(128)
+constexpr int kRow = kCols + 16;   // Delta (C2): a staged activation's row in shared memory, padded (see block_gemv)
 
 struct Q81 {   // ggml block_q8_1 (the engine's activation): d, sum, 32 int8
     __half2 ds;
@@ -106,6 +107,45 @@ __device__ __forceinline__ void frag8_any(const uint32_t* w, int lane, uint32_t 
     decode_states(s, f);
 }
 
+// Delta (C2): frag8_any's states from two of the tile's words a lane takes once.  Step p's window ends at bit
+// floor((8 lane + j + 1) K2 / 2) + 128 K2 = 4 lane K2 + c_j + 128 K2 (c_j = floor((j + 1) K2 / 2), the same for every
+// lane), so a lane's 8 windows span a fixed run of bits; where it lies in two consecutive words for every lane (K2 5:
+// the run is 34 bits and starts at most 30 bits into its first word), the lane shuffles those two words in and each
+// step is one funnel shift by an amount fixed per lane - the same 16 bits frag8_any takes, in place of its staging
+// in shared memory, two loads and the index arithmetic a step.
+template <int K2>
+__host__ __device__ constexpr int odd_win_end(int lane, int j) { return ((lane * 8 + j + 1) * K2) / 2 + 128 * K2; }
+template <int K2>
+__host__ __device__ constexpr int odd_first_word(int lane) { return (odd_win_end<K2>(lane, 0) - 16) >> 5; }
+template <int K2>
+__host__ __device__ constexpr bool odd_two_words() {
+    if (K2 % 2 == 0) return false;
+    for (int lane = 0; lane < 32; ++lane)
+        if (odd_win_end<K2>(lane, 7) - 32 * odd_first_word<K2>(lane) > 64) return false;
+    return true;
+}
+template <int K2>
+struct OddLane {   // a lane's two source lanes (the words' holders) and its 8 right shifts of (word0 : word1)
+    int src0, src1;
+    uint32_t sh[8];
+    __device__ __forceinline__ explicit OddLane(int lane) {
+        constexpr int W = 4 * K2;
+        const int i0 = odd_first_word<K2>(lane);
+        src0 = i0 % W;
+        src1 = (i0 + 1) % W;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sh[j] = (uint32_t) (64 - (odd_win_end<K2>(lane, j) - 32 * i0));
+    }
+};
+template <int K2>
+__device__ __forceinline__ void frag8_two(uint32_t w, const OddLane<K2>& ol, uint32_t (&f)[4]) {
+    const uint32_t a = __shfl_sync(0xffffffffu, w, ol.src0), b = __shfl_sync(0xffffffffu, w, ol.src1);
+    uint32_t s[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[j] = fsh(b, a, (int) ol.sh[j]);
+    decode_states(s, f);
+}
+
 // ---------------------------------------------------------------- the rotation (Maya)
 __device__ __forceinline__ void had128(float* v, int lane) {
     const float s0 = v[0] + v[1], d0 = v[0] - v[1], s1 = v[2] + v[3], d1 = v[2] - v[3];
@@ -149,9 +189,12 @@ __device__ __forceinline__ void chunk_store(float (&v)[4], const float (&s)[4], 
 #pragma unroll
     for (int i = 0; i < 4; ++i) v[i] *= s[i];
     had128(v, lane);
-    __half2* d = reinterpret_cast<__half2*>(dst + lane * 4);
-    d[0] = __floats2half2_rn(v[0], v[1]);
-    d[1] = __floats2half2_rn(v[2], v[3]);
+    // Delta (C2): in each 16 values, the pairs (2t, 2t + 1) and (2t + 8, 2t + 9) side by side - the MMA's two B registers
+    // for lane t in one 64-bit load; pair p of the 16 sits at (p % 4) * 2 + p / 4
+    __half2* d = reinterpret_cast<__half2*>(dst + (lane >> 2) * 16);
+    const int p = 2 * (lane & 3);
+    d[(p & 3) * 2 + (p >> 2)] = __floats2half2_rn(v[0], v[1]);
+    d[((p + 1) & 3) * 2 + ((p + 1) >> 2)] = __floats2half2_rn(v[2], v[3]);
 }
 
 // ---------------------------------------------------------------- the block GEMV (Maya)
@@ -189,6 +232,18 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
             w[s][r] = (W % 32 == 0 || i < W) ? __ldg(tile0 + (size_t) s * sstride + i) : 0u;
         }
 }
+// Delta (C2): the same loads from a lane's word pointer and 32-bit word offsets (a part is < 2^32 words), one add and
+// one wide multiply-add a tile in place of the 64-bit index products
+template <int K2>
+__device__ __forceinline__ void load_tiles_off(const uint32_t* __restrict__ tp, uint32_t off, uint32_t sst, bool live,
+                                               uint32_t (&w)[8][Words<K2>::R]) {
+    static_assert(Words<K2>::R == 1, "a tile in one word a lane");
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        w[s][0] = live ? __ldg(tp + off) : 0u;
+        off += sst;
+    }
+}
 template <int K2>
 __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], uint32_t* st, int lane, uint32_t (&f)[4]) {
     if constexpr (K2 == 8) {
@@ -215,7 +270,7 @@ constexpr int kMinBlocks = 2;
 
 template <int K2>
 struct BlockSmem {
-    __half xb[2 * kTok * kCols];
+    __half xb[2 * kTok * kRow];
     uint32_t stage[kWarps * 4 * K2];
     float out[kTok * kCols];
 };
@@ -233,7 +288,15 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[4], xs4[4];
-    load_tiles<K2>(tile, sstride, lane, wc);
+    constexpr bool two = odd_two_words<K2>();   // Delta (C2)
+    const OddLane<K2> ol(lane);
+    const uint32_t* tp = tile + lane;
+    const uint32_t sst = (uint32_t) sstride;
+    const bool live = W % 32 == 0 || lane < W;
+    // Delta (C2): lane (g, t)'s B registers, rows g >= nc reading row 0 (their columns of the MMA are not kept): no
+    // predicate, and the padded rows (kRow) put a half-warp's four rows in different banks
+    const int xoff = (g < nc ? g : 0) * kRow + 4 * t;
+    load_tiles_off<K2>(tp, 0u, sst, live, wc);
     if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -243,25 +306,21 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     for (int cc = 0; cc < kTok; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
 #endif
     for (int q = 0; q < nq; ++q) {
-        __half* xq = sm.xb + (q & 1) * (kTok * kCols);
-        if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
+        __half* xq = sm.xb + (q & 1) * (kTok * kRow);
+        if (rot) chunk_store(xv, xs4, lane, xq + warp * kRow);
         __syncthreads();
         if (q + 1 < nq) {
-            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
+            load_tiles_off<K2>(tp, (uint32_t) (q + 1) * 8u * sst, sst, live, wn);
             if (rot) chunk_load(x, suh, k0 + (q + 1) * kCols, lane, xv, xs4);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2>(wc[s], st, lane, f);
+            if constexpr (two) frag8_two<K2>(wc[s][0], ol, f);
+            else slice_frags<K2>(wc[s], st, lane, f);
 #if defined(EXL3_TC)
-            uint32_t b0 = 0u, b1 = 0u;
-            if (g < nc) {
-                const __half* xr = xq + g * kCols + s * 16 + 2 * t;
-                b0 = *reinterpret_cast<const uint32_t*>(xr);
-                b1 = *reinterpret_cast<const uint32_t*>(xr + 8);
-            }
-            mma_f32(c, f[0], f[2], f[1], f[3], b0, b1);
+            const uint2 b = *reinterpret_cast<const uint2*>(xq + xoff + s * 16);
+            mma_f32(c, f[0], f[2], f[1], f[3], b.x, b.y);
 #else
             float v[8];
 #pragma unroll
@@ -273,9 +332,9 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
             for (int cc = 0; cc < kTok; ++cc)
                 if (cc < nc) {
-                    const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
+                    const __half* xr = xq + cc * kRow + s * 16 + 4 * t;
                     const float x0 = __half2float(xr[0]), x1 = __half2float(xr[1]);
-                    const float x2 = __half2float(xr[8]), x3 = __half2float(xr[9]);
+                    const float x2 = __half2float(xr[2]), x3 = __half2float(xr[3]);
                     acc[cc][0] = dot4_acc(acc[cc][0], v, x0, x1, x2, x3);
                     acc[cc][1] = dot4_acc(acc[cc][1], v + 4, x0, x1, x2, x3);
                 }

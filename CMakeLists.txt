@@ -1279,6 +1279,7 @@ else()
   set(_strata_avxvnni STRATA_AVXVNNI=0)
 endif()
 set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
+set_property(SOURCE src/kernels/cpu/exl3_cpu.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})   # Delta (C2): the EXL3 band kernels' VNNI byte sums
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 

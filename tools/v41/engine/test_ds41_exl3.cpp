@@ -280,9 +280,41 @@ int gpu_parity() {
     return bad ? 1 : 0;
 }
 #endif
+// --dump FILE: the band kernels' raw sums (every band, 1..4 activations, K2 4 / 5 / 6 / 8, gate and down shapes) - run
+// twice with STRATA_EXL3_VNNI=0 / 1 and compare the files: the VNNI byte sums must give the same bits (C2)
+int dump(const char* path) {
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) return 1;
+    std::mt19937 rng(11);
+    for (int k2 : {4, 5, 6, 8})
+        for (int role = 0; role < 2; ++role) {
+            const int k = role == 0 ? 5120 : 2304, n = role == 0 ? 2304 : 5120;
+            const Mat m = make(k, n, k2, rng);
+            std::normal_distribution<float> nd(0.f, 1.f);
+            std::vector<std::vector<float>> xh(4, std::vector<float>((size_t) k)), acc(4, std::vector<float>((size_t) n));
+            for (auto& v : xh)
+                for (auto& x : v) x = nd(rng);
+            for (int nt = 1; nt <= 4; ++nt) {
+                const float* xp[4];
+                float* ap[4];
+                for (int i = 0; i < nt; ++i) xp[i] = xh[(size_t) i].data();
+                for (int c0 = 0; c0 < n; c0 += 128) {
+                    for (int i = 0; i < nt; ++i) ap[i] = acc[(size_t) i].data() + c0;
+                    if (nt == 1) kc::exl3_cpu_band_acc(m.part(), xp[0], c0, 0, k / 16, ap[0]);
+                    else kc::exl3_cpu_band_acc_n(m.part(), xp, nt, c0, 0, k / 16, ap);
+                }
+                for (int i = 0; i < nt; ++i) std::fwrite(acc[(size_t) i].data(), 4, (size_t) n, f);
+            }
+        }
+    std::fclose(f);
+    std::printf("dumped %s (tier %d)\n", path, kc::exl3_cpu_tier());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc >= 3 && std::strcmp(argv[1], "--dump") == 0) return dump(argv[2]);
     if (argc >= 3 && std::strcmp(argv[1], "--bench") == 0) {
         const int T = std::atoi(argv[2]);
         const size_t mb = argc >= 4 ? (size_t) std::atoll(argv[3]) : 2048;

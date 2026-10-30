@@ -46,6 +46,14 @@
 #define EXL3_AVX2_INLINE inline
 #endif
 
+// Delta (C2): the AVX2 tier's byte sums with AVX-VNNI's vpdpbusd (one instruction for maddubs + madd: the same
+// integers, so the same bits) - MSVC only (it takes the intrinsic in an /arch:AVX2 file; GCC / Clang would need the
+// target attribute on every function it reaches), STRATA_AVXVNNI from CMake as for q2_avx2.cpp, run where
+// cpu_avxvnni_ok()
+#if defined(EXL3_X86) && defined(_MSC_VER) && !defined(__clang__) && defined(STRATA_AVXVNNI) && STRATA_AVXVNNI
+#define EXL3_VNNI 1
+#endif
+
 namespace strata::kernels::cpu {
 namespace {
 
@@ -633,16 +641,28 @@ EXL3_AVX2_INLINE __m256i avx2_gather(const __m256i (&C)[K]) {
     }
 }
 
-struct Avx2Consts {
+template <bool V>
+struct Avx2ConstsT {
+    static constexpr bool vnni = V;   // Delta (C2): the byte sums by vpdpbusd
     __m256i mult, ones8, ones16, low16;
 };
-EXL3_AVX2_INLINE Avx2Consts avx2_consts() {
+using Avx2Consts = Avx2ConstsT<false>;
+template <bool V = false>
+EXL3_AVX2_INLINE Avx2ConstsT<V> avx2_consts() {
     return {_mm256_set1_epi32((int) kMul1), _mm256_set1_epi8(1), _mm256_set1_epi16(1), _mm256_set1_epi32(0xffff)};
+}
+// the codebook products' byte sums (p: 8 states times the multiplier) as F32
+template <class KC>
+EXL3_AVX2_INLINE __m256 avx2_bsum(__m256i p, const KC& k) {
+#if defined(EXL3_VNNI)
+    if constexpr (KC::vnni) return _mm256_cvtepi32_ps(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), p, k.ones8));
+#endif
+    return _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(p, k.ones8), k.ones16));
 }
 
 // row R's half H: its 8 states, and their codebook byte sums as F32
-template <int K, int R, int H>
-EXL3_AVX2_INLINE __m256 avx2_sums(const __m256i (&C)[K], const Avx2Consts& k) {
+template <int K, int R, int H, class KC>
+EXL3_AVX2_INLINE __m256 avx2_sums(const __m256i (&C)[K], const KC& k) {
     constexpr const Avx2Tab<K>& T = kAvx2Tab<K>;
     constexpr int sh = T.sh[R][H];
     const __m256i b = avx2_gather<K, R, H, 1>(C);
@@ -655,8 +675,7 @@ EXL3_AVX2_INLINE __m256 avx2_sums(const __m256i (&C)[K], const Avx2Consts& k) {
         const __m256i a = avx2_gather<K, R, H, 0>(C);
         st = _mm256_and_si256(_mm256_or_si256(_mm256_srli_epi32(b, sh), _mm256_slli_epi32(a, 32 - sh)), k.low16);
     }
-    return _mm256_cvtepi32_ps(
-        _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_mullo_epi32(st, k.mult), k.ones8), k.ones16));
+    return avx2_bsum(_mm256_mullo_epi32(st, k.mult), k);
 }
 
 // A tile as the row kernels below read it: load() once a tile, then sums<R, H>() - row R's half H as 8 F32 byte sums,
@@ -666,8 +685,8 @@ struct Avx2TileInt {
     static_assert(kAvx2Tab<K>.ok, "EXL3 tile layout: a half row's words must share a residue class and a shift");
     __m256i C[K];
     EXL3_AVX2_INLINE void load(const uint32_t* w) { avx2_classes<K>(w, C); }
-    template <int R, int H>
-    EXL3_AVX2_INLINE __m256 sums(const Avx2Consts& k) const { return avx2_sums<K, R, H>(C, k); }
+    template <int R, int H, class KC>
+    EXL3_AVX2_INLINE __m256 sums(const KC& k) const { return avx2_sums<K, R, H>(C, k); }
 };
 
 // A half-integer K (K2 = 2 KA + 1 odd: exllamav3 1.6's 1.5 / 2.5 / 3.5).  The integer path's invariant - a half row's
@@ -797,15 +816,14 @@ struct Avx2TileHalf {
         half_pairs<K2>(w, P);
         spans(P, std::make_integer_sequence<int, 8>{});
     }
-    template <int R, int H>
-    EXL3_AVX2_INLINE __m256 sums(const Avx2Consts& k) const {
+    template <int R, int H, class KC>
+    EXL3_AVX2_INLINE __m256 sums(const KC& k) const {
         constexpr int G = 2 * ((R & 7) >> 1) + H, JJ = (R & 1) + 2 * (R >> 3);
         constexpr int sh = kHalfTab<K2>.dsh[JJ];
         __m256i st;
         if constexpr (sh == 0) st = _mm256_and_si256(X[G], k.low16);
         else st = _mm256_and_si256(_mm256_srli_epi32(X[G], sh), k.low16);
-        return _mm256_cvtepi32_ps(
-            _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_mullo_epi32(st, k.mult), k.ones8), k.ones16));
+        return avx2_bsum(_mm256_mullo_epi32(st, k.mult), k);
     }
 };
 
@@ -820,8 +838,8 @@ struct Avx2TileSel<K2, true> {
 template <int K2>
 using Avx2Tile = typename Avx2TileSel<K2>::type;
 
-template <class Tile, int R>
-EXL3_AVX2_INLINE void avx2_rows(const Tile& T, const float* xk, __m256& lo, __m256& hi, const Avx2Consts& k) {
+template <class Tile, int R, class KC>
+EXL3_AVX2_INLINE void avx2_rows(const Tile& T, const float* xk, __m256& lo, __m256& hi, const KC& k) {
     if constexpr (R < 16) {
         const __m256 xv = _mm256_broadcast_ss(xk + R);
         lo = _mm256_fmadd_ps(T.template sums<R, 0>(k), xv, lo);
@@ -830,13 +848,13 @@ EXL3_AVX2_INLINE void avx2_rows(const Tile& T, const float* xk, __m256& lo, __m2
     }
 }
 
-template <int K2>
+template <int K2, bool V = false>
 EXL3_AVX2 void band_avx2(const Exl3Part& m, const float* xh, int tc0, int ks0, int ks1, float* out /* 128 */) {
     using Tile = Avx2Tile<K2>;
     constexpr int W = 4 * K2;
     const int ld = m.n / 16;
     const size_t row_words = (size_t) ld * W;
-    const Avx2Consts k = avx2_consts();
+    const auto k = avx2_consts<V>();
     __m256 acc[8][2];   // the band's 8 tiles (16 registers: in memory, a tile's two taken at a time)
     for (int t = 0; t < 8; ++t) acc[t][0] = acc[t][1] = _mm256_setzero_ps();
     const uint32_t* row = m.trellis + (size_t) ks0 * row_words + (size_t) tc0 * W;
@@ -870,8 +888,8 @@ EXL3_AVX2_INLINE void avx2_fma_n(__m256 f, const float* const (&xk)[N], int r, _
                                  std::integer_sequence<int, I...>) {
     ((a[I] = _mm256_fmadd_ps(f, _mm256_broadcast_ss(xk[I] + r), a[I])), ...);
 }
-template <class Tile, int N, int H, int R>
-EXL3_AVX2_INLINE void avx2_rows_n(const Tile& T, const float* const (&xk)[N], __m256 (&a)[N], const Avx2Consts& k) {
+template <class Tile, int N, int H, int R, class KC>
+EXL3_AVX2_INLINE void avx2_rows_n(const Tile& T, const float* const (&xk)[N], __m256 (&a)[N], const KC& k) {
     if constexpr (R < 16) {
         avx2_fma_n<N>(T.template sums<R, H>(k), xk, R, a, std::make_integer_sequence<int, N>{});
         avx2_rows_n<Tile, N, H, R + 1>(T, xk, a, k);
@@ -884,23 +902,23 @@ EXL3_AVX2_INLINE void avx2_fma_n2(__m256 f0, __m256 f1, const float* const (&xk)
       hi[I] = _mm256_fmadd_ps(f1, _mm256_broadcast_ss(xk[I] + r), hi[I])),
      ...);
 }
-template <class Tile, int N, int R>
+template <class Tile, int N, int R, class KC>
 EXL3_AVX2_INLINE void avx2_rows_n2(const Tile& T, const float* const (&xk)[N], __m256 (&lo)[N], __m256 (&hi)[N],
-                                   const Avx2Consts& k) {
+                                   const KC& k) {
     if constexpr (R < 16) {
         avx2_fma_n2<N>(T.template sums<R, 0>(k), T.template sums<R, 1>(k), xk, R, lo, hi,
                        std::make_integer_sequence<int, N>{});
         avx2_rows_n2<Tile, N, R + 1>(T, xk, lo, hi, k);
     }
 }
-template <int K2, int N>
+template <int K2, int N, bool V = false>
 EXL3_AVX2 void band_avx2_n(const Exl3Part& m, const float* const* xh, int tc0, int ks0, int ks1,
                            float* const* out /* N x 128 */) {
     using Tile = Avx2Tile<K2>;
     constexpr int W = 4 * K2;
     const int ld = m.n / 16;
     const size_t row_words = (size_t) ld * W;
-    const Avx2Consts k = avx2_consts();
+    const auto k = avx2_consts<V>();
     __m256 acc[8][2][N];
     for (int t = 0; t < 8; ++t)
         for (int h = 0; h < 2; ++h)
@@ -1189,6 +1207,14 @@ constexpr bool avx512_takes() {
     return (K2 & 1) == 0;
 }
 
+#if defined(EXL3_VNNI)
+// AVX-VNNI here, unless STRATA_EXL3_VNNI=0 (to compare: the same bits either way)
+bool vnni_ok() {
+    static const bool on = cpu_avxvnni_ok() && !(std::getenv("STRATA_EXL3_VNNI") && std::getenv("STRATA_EXL3_VNNI")[0] == '0');
+    return on;
+}
+#endif
+
 template <int K2>
 void band_on(int tier, const Exl3Part& m, const float* xh, int tc0, int ks0, int ks1, float* acc) {
 #if defined(EXL3_X86)
@@ -1199,6 +1225,12 @@ void band_on(int tier, const Exl3Part& m, const float* xh, int tc0, int ks0, int
         }
     }
     if (tier >= 1) {
+#if defined(EXL3_VNNI)
+        if (vnni_ok()) {
+            band_avx2<K2, true>(m, xh, tc0, ks0, ks1, acc);
+            return;
+        }
+#endif
         band_avx2<K2>(m, xh, tc0, ks0, ks1, acc);
         return;
     }
@@ -1224,6 +1256,19 @@ void band_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int t
             }
         }
     }
+#if defined(EXL3_VNNI)
+    if (tier >= 1 && n > 1 && vnni_ok()) {
+        switch (n) {
+            case 2: band_avx2_n<K2, 2, true>(m, xh, tc0, ks0, ks1, acc); return;
+            case 3: band_avx2_n<K2, 3, true>(m, xh, tc0, ks0, ks1, acc); return;
+            case 4: band_avx2_n<K2, 4, true>(m, xh, tc0, ks0, ks1, acc); return;
+            case 5: band_avx2_n<K2, 5, true>(m, xh, tc0, ks0, ks1, acc); return;
+            case 6: band_avx2_n<K2, 6, true>(m, xh, tc0, ks0, ks1, acc); return;
+            case 7: band_avx2_n<K2, 7, true>(m, xh, tc0, ks0, ks1, acc); return;
+            default: band_avx2_n<K2, 8, true>(m, xh, tc0, ks0, ks1, acc); return;
+        }
+    }
+#endif
     if (tier >= 1 && n > 1) {
         switch (n) {
             case 2: band_avx2_n<K2, 2>(m, xh, tc0, ks0, ks1, acc); return;
