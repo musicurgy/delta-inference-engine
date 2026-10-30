@@ -102,6 +102,11 @@ three together +12% writing speed (21.7 -> 24.3 tok/s at the time), the RAM spee
 4. **The RAM at its rated speed.** Boards often run four large sticks below their rating: set XMP / EXPO, or the speed
    by hand, in the BIOS (here four 48 GB DDR5 sticks went from 4000 to 5600 MT/s: +3%).  Check stability afterwards.
 5. Optional: NVIDIA Control Panel > Manage 3D settings > Power management mode > Prefer maximum performance.
+6. **A Microsoft Defender exclusion for the model folder and the engine.**  Windows Security > Virus & threat protection >
+   Manage settings > Exclusions: add the `models\` folder (or wherever the model files are) and `ds41_generate.exe`.  Every
+   read of an expert from the SSD otherwise passes through the scanner: measured here, expert-sized random reads from
+   the model drive went from 5.35 to 6.43 GB/s (+20%), which is model loading on every PC and the writing speed on 64
+   and 96 GB PCs, where part of the model is read from the SSD while it writes.
 
 While it writes, a busy browser or game on the same PC can slow the CPU side down a lot; the engine already runs above
 normal priority.
