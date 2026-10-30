@@ -68,6 +68,11 @@ def env_gib(name, default):
     return f
 
 
+def out_bias(args):
+    """The --route-bias the expanded args carry (for the startup line)."""
+    return args[args.index("--route-bias") + 1] if "--route-bias" in args else "-"
+
+
 def arena_gib():
     fixed = env_gib("DS41_ARENA_GIB", None)
     if fixed is not None:
@@ -137,6 +142,21 @@ def expand(cfg):
     for i, x in enumerate(a[:-1]):
         if x == "--arena-gib" and a[i + 1] == "auto":
             a[i + 1] = f"{arena_gib():g}"
+    # the route bias by installed RAM (round 250d, 2026-10-30): at 192 GB the 0.10 bias costs ~4-10% of speed for +1.6
+    # points of agreement with DeepSeek's API (91.8 / 92.8% vs 90.2 / 92.4% at 0.28); with less RAM more experts come
+    # from the SSD / CPU and the stronger bias pays: 0.10 cost -12..-14% at 96 GB and -26% at 64 GB.  Below 120 GiB
+    # installed (64 / 96 GB PCs) the launcher uses 0.28; DS41_ROUTE_BIAS overrides (0 = exact routing).
+    rb = os.environ.get("DS41_ROUTE_BIAS", "").strip()
+    for i, x in enumerate(a[:-1]):
+        if x == "--route-bias":
+            if rb:
+                try:
+                    float(rb)
+                except ValueError:
+                    sys.exit(f"ds41_local: DS41_ROUTE_BIAS={rb!r} is not a number (ds41-paths.bat)")
+                a[i + 1] = rb
+            elif total_ram_gib() < 120:
+                a[i + 1] = "0.28"
     x3 = os.environ.get("DS41_EXL3", "").strip().replace("\\", "/")
     if x3 and "--exl3" not in a:
         a += ["--exl3", x3]
@@ -271,7 +291,7 @@ def main():
     missing = list(dict.fromkeys(p for p in paths if p and not os.path.exists(p)))   # (the model may be its Engram too)
     model = a[a.index("-m") + 1] if "-m" in a else "?"
     x3 = a[a.index("--exl3") + 1] if "--exl3" in a[:-1] else ""
-    print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB; model {os.path.basename(model)}"
+    print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB, route bias {out_bias(args)}; model {os.path.basename(model)}"
           + (f" with the EXL3 experts in {os.path.basename(x3)}" if x3 else "")
           + f" (Choose Model.bat picks another); models in {os.environ['DS41_MODELS']}")
     # under ~110 GB of RAM the default reads most experts from the SSD (rounds 220 / 225 / 227, an RTX 3090): one line

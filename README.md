@@ -147,8 +147,11 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 |---|---|---|
 | Exact routing | 91.4% | 92.1% |
 | Route bias 0.28 (the default before 0.93) | 90.2% | 92.4% |
-| **Route bias 0.10 (the default from 0.93)** | **91.8%** | **92.8%** |
+| **Route bias 0.10 (the default from 0.93, 128 GB of RAM and up)** | **91.8%** | **92.8%** |
 
+- **The launcher picks the bias by installed RAM:** 0.10 from 128 GB up; 0.28 on 64 and 96 GB PCs, where more experts
+  come from the SSD and the CPU and the stronger bias is worth 12-14% (96 GB) to 26% (64 GB) of writing speed.  Set
+  `DS41_ROUTE_BIAS` in `ds41-paths.bat` to choose yourself (`0` = exact routing).  The startup line shows the one in use.
 - At 0.10 the bias costs nothing measurable in agreement: 91.8% / 92.8% is within the test's ~0.3-point noise of exact
   routing (and above it on code + maths), where 0.28 gave up 1.2 points on general text.
 - Route bias prefers experts that are already on the GPU. The dial is smooth: 0.10 (the default) gives up about 8% of speed against 0.28, exact routing about 25% (0.28: 90.8% / ~43 tok/s, 0.15: 93.5% / ~41, 0.10: 94.5% / ~40, 0.05: 95.3% / ~36.5, exact: 96.5% / ~32, all agreement with exact routing of the same build). It follows the GPU's experts as
