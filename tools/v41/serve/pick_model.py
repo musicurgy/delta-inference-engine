@@ -24,6 +24,9 @@ CHOICE = os.path.join(ROOT, "model-choice.txt")
 Q2 = "DeepSeek-V4.1-Flash-1017-Q2.gguf"
 SLIM = "ds4-q2-slim.gguf"   # an install from before 2026-10-27: the same model without its inline Engram tables
 UNSLOTH = "unsloth/DeepSeek-V4.1-Flash-1017-GGUF"
+# the revision our numbers were measured on (2026-10-20): Unsloth re-made UD-IQ1_S / UD-IQ1_M / UD-Q2_K_XL on 10-28 with
+# the same sizes and new content - pinned until the new files are measured
+UNSLOTH_REV = "60ad3651"
 GB = 1e9
 # Writing tok/s through the server at 192 / 128 / 96 / 64 GB of RAM (the 96 / 64 GB columns: 2026-10-28/29, a PC with
 # that much RAM simulated by locking the rest away, so neither Windows' file cache nor the pagefile could use it; "-" =
@@ -132,18 +135,18 @@ def download_exl3(m, d):
 def download_unsloth(m, q):
     """hf download unsloth/... --include q/* into <models>/unsloth, then every shard's SHA-256 (hf_verify.py)"""
     from huggingface_hub import HfApi
-    files = [f for f in HfApi().list_repo_files(UNSLOTH) if f.startswith(q + "/") and f.endswith(".gguf")]
+    files = [f for f in HfApi().list_repo_files(UNSLOTH, revision=UNSLOTH_REV) if f.startswith(q + "/") and f.endswith(".gguf")]
     if not files:
         sys.exit(f"{UNSLOTH} has no {q} files")
     hf = os.path.join(ROOT, ".venv", "Scripts", "hf.exe")
     py = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
     dst = os.path.join(m, "unsloth")
     os.makedirs(dst, exist_ok=True)
-    r = subprocess.call([hf if os.path.exists(hf) else "hf", "download", UNSLOTH, "--include", q + "/*", "--local-dir", dst])
+    r = subprocess.call([hf if os.path.exists(hf) else "hf", "download", UNSLOTH, "--revision", UNSLOTH_REV, "--include", q + "/*", "--local-dir", dst])
     if r != 0:
         sys.exit("The download stopped (above) - start Choose Model.bat again to go on where it was.")
     r = subprocess.call([py if os.path.exists(py) else sys.executable, os.path.join(ROOT, "tools", "v41", "hf_verify.py"),
-                         "--repo", UNSLOTH, "--dir", dst] + files)
+                         "--repo", UNSLOTH, "--revision", UNSLOTH_REV, "--dir", dst] + files)
     if r != 0:
         sys.exit("A file differs from its published SHA-256 (above): delete it and start Choose Model.bat again.")
 

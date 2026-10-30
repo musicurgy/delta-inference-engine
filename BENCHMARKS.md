@@ -56,7 +56,7 @@ Decode speed on one RTX 3090. The measurement is `bench_server`: 6 chats of up t
 
 ### Same PC, same file: llama.cpp
 
-Mainline llama.cpp (commit 36a0e2f of 2026-10-29, built with CUDA for the 3090) and this engine, on the same PC, the same Unsloth UD-IQ1_S model file, the same 6 chats of up to 1,500 tokens with thinking on, full RAM, two interleaved runs each. llama.cpp was run the usual way for a model this size: `-ngl 99 -ot exps=CPU -t 14 -c 8192` (the routed experts in RAM on the CPU, everything else on the card). It has no speculative decoding for DeepSeek V4.
+Mainline llama.cpp (commit 36a0e2f of 2026-10-29, built with CUDA for the 3090) and this engine, on the same PC, the same Unsloth UD-IQ1_S model file, the same 6 chats of up to 1,500 tokens with thinking on, full RAM, two interleaved runs each. llama.cpp was run the usual way for a model this size: `-ngl 99 -ot exps=CPU -t 14 -c 8192` (the routed experts in RAM on the CPU, everything else on the card). This comparison ran llama.cpp WITHOUT its speculative decoding: llama.cpp does support a DSpark drafter for DeepSeek V4.1 (`--spec-type draft-dspark`, the drafter Unsloth ships), and a re-run with it is in progress; this row will be updated.
 
 | Engine | Decode tok/s (server) | Decode tok/s (what the client sees) | Prompt tok/s |
 |---|---|---|---|
