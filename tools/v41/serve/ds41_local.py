@@ -142,10 +142,9 @@ def expand(cfg):
     for i, x in enumerate(a[:-1]):
         if x == "--arena-gib" and a[i + 1] == "auto":
             a[i + 1] = f"{arena_gib():g}"
-    # the route bias by installed RAM (round 250d, 2026-10-30): at 192 GB the 0.10 bias costs ~4-10% of speed for +1.6
-    # points of agreement with DeepSeek's API (91.8 / 92.8% vs 90.2 / 92.4% at 0.28); with less RAM more experts come
-    # from the SSD / CPU and the stronger bias pays: 0.10 cost -12..-14% at 96 GB and -26% at 64 GB.  Below 120 GiB
-    # installed (64 / 96 GB PCs) the launcher uses 0.28; DS41_ROUTE_BIAS overrides (0 = exact routing).
+    # the route bias: the config's 0.28 on every PC; DS41_ROUTE_BIAS overrides it (0 = exact routing, 0.10 = the
+    # high-agreement setting: 91.8 / 92.8% next-token agreement with DeepSeek's API vs 90.2 / 92.4% at 0.28, for about
+    # 18% of writing speed at 192 GB and 12-26% on 96 / 64 GB PCs - rounds 249, 250d, 250e, 250g, 2026-10-30 / 31)
     rb = os.environ.get("DS41_ROUTE_BIAS", "").strip()
     for i, x in enumerate(a[:-1]):
         if x == "--route-bias":
@@ -155,8 +154,6 @@ def expand(cfg):
                 except ValueError:
                     sys.exit(f"ds41_local: DS41_ROUTE_BIAS={rb!r} is not a number (ds41-paths.bat)")
                 a[i + 1] = rb
-            elif total_ram_gib() < 120:
-                a[i + 1] = "0.28"
     x3 = os.environ.get("DS41_EXL3", "").strip().replace("\\", "/")
     if x3 and "--exl3" not in a:
         a += ["--exl3", x3]
