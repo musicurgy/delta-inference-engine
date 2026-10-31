@@ -1525,7 +1525,11 @@ class StrataEngine:
                     turn = False                        # the lines: not the engine this request was meant for
                 if not turn:
                     with self.slot_cv:
-                        self.slot_cv.wait(timeout=0.5)
+                        # The epoch or waiter count may have changed after the earlier check: test again under the
+                        # condition lock before waiting, or a notify_all sent in between is lost (upstream Xolotl #79)
+                        eligible = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
+                        if not eligible or not self.alive():
+                            self.slot_cv.wait(timeout=0.5)
                 if cancel.is_set():
                     return False
                 if time.monotonic() - beat >= 10.0:     # a heartbeat every 10 s, as the engine's own wait
@@ -1533,9 +1537,12 @@ class StrataEngine:
                     yield None
         finally:
             with self.slot_cv:
+                previous_waiting = self.waiting
                 self.waiting = max(0, self.waiting - 1)
                 if entry in self.wait_lens:
                     self.wait_lens.remove(entry)
+                if previous_waiting > 1 and self.waiting <= 1:
+                    self.slot_cv.notify_all()   # the remaining fairness waiter is eligible now
         with self.slot_cv:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
@@ -3209,6 +3216,14 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # the end of thinking as one special token (DeepSeek's), else None: then only that token ends the thinking
+        # (OutputParser.end_tokens); a template that spells the end as text keeps the text rule
+        try:
+            ids = tokenizer.encode(THINK_END, parse_special=True)
+            plain = tokenizer.encode(THINK_END, parse_special=False)
+            self.think_end_id = ids[0] if len(ids) == 1 and plain != ids else None
+        except Exception:
+            self.think_end_id = None
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -4253,6 +4268,15 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        think_end_id = getattr(self, "think_end_id", None)
+        if think_end_id is not None:
+            parser.end_tokens = 0       # token mode: only the end-of-thinking token closes the reasoning
+
+        def feed_token(t):
+            """detok.push(t) for the parser, counting the end-of-thinking token first (token mode)."""
+            if t == think_end_id and parser.end_tokens is not None:
+                parser.end_tokens += 1
+            return detok.push(t)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -4412,7 +4436,7 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
-                                piece = detok.push(t)
+                                piece = feed_token(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
@@ -4539,7 +4563,7 @@ class Service:
                                     n += 1
                                     raw_ids.append(t)
                                     thinking_n += parser.state in ("reasoning", "rcall")
-                                    evs = cut(parser.feed(detok.push(t)))
+                                    evs = cut(parser.feed(feed_token(t)))
                                     self._note(n, evs, st, rate)
                                     for ev in evs:
                                         yield "event", ev
@@ -4569,7 +4593,7 @@ class Service:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
-                            evs = cut(parser.feed(detok.push(t)))
+                            evs = cut(parser.feed(feed_token(t)))
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev
@@ -5968,6 +5992,13 @@ def make_handler(svc: Service):
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
         def _sse(self):
+            # token frames are small and flushed as they come; Nagle would hold one for the peer's delayed ACK
+            # (~40 ms) on its way to the client (Project Maya #626)
+            try:
+                import socket
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             self._note(http_status=200)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")

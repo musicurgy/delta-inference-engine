@@ -518,6 +518,14 @@ def tool_arguments(raw) -> dict:
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
 
 
+def reasoning_given(text) -> bool:
+    """Replayed reasoning that counts: a non-blank string.  A must-echo client replays a turn that had no reasoning as
+    a single space (a hosted API rejects an empty string); rendered, that puts a token between <think> and </think> the
+    model never sampled, the replayed prompt no longer tokenizes to the cached prefix, and the whole conversation is
+    read again.  A blank body renders exactly like an absent one (antirez/ds4 a8ce74a)."""
+    return isinstance(text, str) and bool(text.strip())
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -530,7 +538,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         content = _check_parts(m.get("content"), f"messages[{i}].content",
                                TEXT_PARTS + IMAGE_PARTS if images else TEXT_PARTS)
         out = {"role": role, "content": _parts_of(content) if images else _text_of(content)}
-        if m.get("reasoning_content"):
+        if reasoning_given(m.get("reasoning_content")):
             out["reasoning_content"] = m["reasoning_content"]
         if m.get("tool_calls"):
             calls = []
@@ -625,7 +633,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
-            if reasoning:
+            if reasoning_given("".join(reasoning)):
                 out["reasoning_content"] = "".join(reasoning)
             if calls:
                 out["tool_calls"] = calls
@@ -890,6 +898,11 @@ class OutputParser:
         # reasoning text before them is tracked (code fence, inline code, current line) to tell an act from a quote.
         self.pending: list[list] = []
         self.rescued = 0             # calls delivered from the reasoning
+        # end_tokens: None = the text `</think>` ends the thinking (#537's quote rule decides).  A number = token mode
+        # (the server sets 0 when the vocabulary has DeepSeek's end-of-thinking token): only that token ends the
+        # thinking - the server counts each one it feeds - and a `</think>` the model writes as text, quoted or in
+        # prose ("the tag </think> closes it"), stays reasoning text (Project Maya 4dd2892).
+        self.end_tokens = None
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self.fence, self.line, self.ticks = "", "", 0
         # recover (opt-in, the config's "tool_call_recovery"): a declared tool's call written next to the template's
@@ -1206,7 +1219,7 @@ class OutputParser:
                         return out
                     if self.buf.startswith(CALL_START):
                         self.state = "rcall"
-                    elif self.buf.startswith(THINK_END):
+                    elif self.buf.startswith(THINK_END) and self.end_tokens != 0:
                         out += self._release(True)
                     elif CALL_START.startswith(self.buf) or THINK_END.startswith(self.buf):
                         return out
@@ -1232,6 +1245,11 @@ class OutputParser:
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
                 quoted = self._quoted_think_end(i)
+                if self.end_tokens is not None:  # token mode: the model's own token decides, not the text around it
+                    if self.end_tokens <= 0:
+                        quoted = True
+                    else:
+                        quoted = None if not self.buf[i + len(THINK_END):] else False
                 if quoted is None:                   # held like a partial tag until the character after it is here
                     if i:
                         out.append(Event("reasoning", self._track(self.buf[:i])))
@@ -1244,6 +1262,8 @@ class OutputParser:
                 if i:
                     out.append(Event("reasoning", self._track(self.buf[:i])))
                 self.buf = self.buf[i + len(THINK_END):]
+                if self.end_tokens:
+                    self.end_tokens -= 1
                 self.state, self.lead = "content", True
                 self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
             elif self.state == "content":
