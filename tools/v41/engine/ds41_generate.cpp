@@ -322,6 +322,37 @@ bool spec_accept(const std::vector<std::pair<int, double>> & dist, int d, std::m
     return false;
 }
 
+// Speculative sampling with a SAMPLED draft d ~ q (STRATA_DSPARK_SAMPLE: Ds41DSpark::step_sampled; q(x) = cdf[x] -
+// cdf[x - 1] over the vocabulary, the last token taking the rest up to 1, exactly the intervals the device's inverse-CDF
+// draw used): accept with min(1, p(d) / q(d)); on rejection sample from norm(max(0, p - q)).  The emitted token is
+// distributed exactly as p (Leviathan / Chen), the same as plain sampling; a draft that matches a flat p is kept with
+// probability sum min(p, q) instead of the argmax draft's p(d).
+bool spec_accept_q(const std::vector<std::pair<int, double>> & dist, int d, const float * cdf, int64_t V,
+                   std::mt19937_64 & rng, int & out) {
+    auto q = [&](int x) -> double {
+        if (x < 0 || x >= V) return 0.0;
+        const double hi = x == V - 1 ? 1.0 : std::min(1.0, (double) cdf[x]);
+        const double lo = x == 0 ? 0.0 : std::min(1.0, (double) cdf[x - 1]);
+        return std::max(0.0, hi - lo);
+    };
+    double pd = 0;
+    for (const auto & c : dist) if (c.first == d) pd = c.second;
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    if (pd > 0 && u(rng) * q(d) < pd) return true;
+    double z = 0;
+    for (const auto & c : dist) z += std::max(0.0, c.second - q(c.first));
+    double r = u(rng) * (z > 0 ? z : 1.0);
+    int last = d;
+    for (const auto & c : dist) {
+        const double w = z > 0 ? std::max(0.0, c.second - q(c.first)) : c.second;   // z = 0: p <= q everywhere (p = q up to rounding)
+        if (w <= 0) continue;
+        last = c.first;
+        if ((r -= w) <= 0) break;
+    }
+    out = last;
+    return false;
+}
+
 double log_softmax_at(const float * lg, int nv, int tok) {
     const float mx = *std::max_element(lg, lg + nv);
     double z = 0;
@@ -2408,6 +2439,26 @@ int main(int argc, char ** argv) {
             int sp_ids[5] = {0}, sp_tmp[5];
             float sp_conf[5];
 #if defined(DS41_HAVE_DSPARK)
+            // STRATA_DSPARK_SAMPLE=1 (opt-in, S1, 2026-10-31): at temperature > 0 the drafter SAMPLES its drafts from its
+            // own distribution q (step_sampled) and the verifier accepts with min(1, p / q) (spec_accept_q) - the output
+            // is still distributed as p, but more drafts survive a flat p than the argmax draft's p(d).  Lookup drafts
+            // stay deterministic (spec_accept).  STRATA_DSPARK_SAMPLE_T=f: q's temperature = f x the request's (default 1).
+            static const bool dsp_sample = [] { const char * e = std::getenv("STRATA_DSPARK_SAMPLE"); return e && e[0] && e[0] != '0'; }();
+            static const float dsp_qt = std::getenv("STRATA_DSPARK_SAMPLE_T") ? std::max(0.05f, (float) std::atof(std::getenv("STRATA_DSPARK_SAMPLE_T"))) : 1.0f;
+            bool sp_sampled = false;   // sp_ids came from step_sampled: their q rows are in sp_cdf
+            std::vector<float> sp_cdf;
+            auto dstep = [&](const float * mh, const int * pos, int m, int bonus, int * dids, float * dconf) -> bool {
+                if (bonus < 0) return dsp->step(mh, pos, m, bonus, dids, dconf);
+                sp_sampled = false;
+                if (!dsp_sample || temp <= 0.0f) return dsp->step(mh, pos, m, bonus, dids, dconf);
+                float u[5];
+                std::uniform_real_distribution<float> U(0.0f, 1.0f);
+                for (float & x : u) { x = U(rng); if (!(x < 1.0f)) x = std::nextafter(1.0f, 0.0f); }
+                sp_cdf.resize((size_t) 5 * (size_t) dsp->vocab());
+                if (!dsp->step_sampled(mh, pos, m, bonus, dids, dconf, u, 1.0f / (temp * dsp_qt), sp_cdf.data())) return false;
+                sp_sampled = true;
+                return true;
+            };
             if (ok && sp_tail > 0) {   // the tail through pass_v (chunks of <= 16), the cache open; routing as the passes
                 const double to0 = now_ms();
                 if (defer_vram && !cache_open) {
@@ -2438,8 +2489,8 @@ int main(int argc, char ** argv) {
                                     cur_seed.data() + (size_t) cur_seed_n * 3 * n_embd);
                         cur_seed_n += m;
                         // dsp null: the drafter failed to load at this cache open (off for the run, see open_cache)
-                        if (dsp && !dsp->step(bcap_vh.data() + (vh0 + (size_t) (i0 - c0s)) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
-                                              last ? sp_ids : sp_tmp, sp_conf)) {
+                        if (dsp && !dstep(bcap_vh.data() + (vh0 + (size_t) (i0 - c0s)) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
+                                          last ? sp_ids : sp_tmp, sp_conf)) {
                             ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
                         }
                     }
@@ -2460,7 +2511,7 @@ int main(int argc, char ** argv) {
                     cur_seed.resize((size_t) (cur_seed_n + m) * 3 * n_embd);
                     std::copy_n(vh.data(), (size_t) m * 3 * n_embd, cur_seed.data() + (size_t) cur_seed_n * 3 * n_embd);
                     cur_seed_n += m;
-                    if (dsp && !dsp->step(vh.data(), spos.data(), m, last ? sp_t : -1, last ? sp_ids : sp_tmp, sp_conf)) {
+                    if (dsp && !dstep(vh.data(), spos.data(), m, last ? sp_t : -1, last ? sp_ids : sp_tmp, sp_conf)) {
                         ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
                     }
                 }
@@ -2478,8 +2529,8 @@ int main(int argc, char ** argv) {
                     for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
                     const bool last = i0 + m == total;
                     if (last) sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);
-                    if (!dsp->step(snap_seed.data() + (size_t) (i0 - s0) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
-                                   last ? sp_ids : sp_tmp, sp_conf)) {
+                    if (!dstep(snap_seed.data() + (size_t) (i0 - s0) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
+                               last ? sp_ids : sp_tmp, sp_conf)) {
                         std::fprintf(stderr, "serve: DSpark re-seed: %s (decoding without drafts)\n", dsp->last_error().c_str());
                         dsp->reset();
                         sp_t = -1;
@@ -2680,9 +2731,11 @@ int main(int argc, char ** argv) {
                     if (bias_refresh > 0 && bias_now && bias_set && rq_pass > 0 && rq_pass % bias_refresh == 0) apply_bias(true);
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
                     int acc = 0, tn = -1;
+                    const bool q_on = sp_sampled && !is_lk;   // DSpark's sampled drafts: accept against their q rows
                     for (; acc < k; ++acc) {
                         sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
-                        if (!spec_accept(dist, dr[acc], rng, tn)) break;
+                        if (q_on ? !spec_accept_q(dist, dr[acc], sp_cdf.data() + (size_t) acc * (size_t) dsp->vocab(), dsp->vocab(), rng, tn)
+                                 : !spec_accept(dist, dr[acc], rng, tn)) break;
                     }
                     if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
                     ++rq_pass; rq_acc += acc;
@@ -2699,7 +2752,7 @@ int main(int argc, char ** argv) {
                     for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
                     int drafts[kVerify];
                     for (int i = 0; i < k; ++i) drafts[i] = dr[i];
-                    if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
+                    if (!dstep(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
                         ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
                     }
                     hist.push_back(t);

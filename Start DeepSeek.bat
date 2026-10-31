@@ -73,6 +73,11 @@ if not defined SMALLCARD if not defined STRATA_SERVE_DSPARK echo No DSpark draft
 set STRATA_DSPARK_KEEP=tools/v41/serve/dspark_expert_counts.txt:64
 set STRATA_DSPARK_DEPTH=5
 set STRATA_DSPARK_CONF=0.6
+rem sampled drafts (exact): at temperature > 0 the drafter samples its drafts from its own sharpened distribution
+rem and the check accepts each with min(1, p/q) - the answers are distributed exactly as before, ~4-6% faster at the
+rem default sampling (rounds 271-273); greedy (temperature 0) requests are unchanged
+set STRATA_DSPARK_SAMPLE=1
+set STRATA_DSPARK_SAMPLE_T=0.5
 set STRATA_DENSE_REQUANT=q6_K
 rem serving and prompt switches (all exact; README.md, "Settings"):
 rem   rollback 8 - an answer forced after the thinking budget resumes from the live state in ~0.4 s instead of
