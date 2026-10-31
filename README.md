@@ -293,5 +293,8 @@ bias are bit-identical to the default file's (GSQ-RCO only changes the routed ex
 - nazeshinjite: the ds4 Q2 GGUF.
 - ISTA-DASLab: the GSQ-RCO quants.
 - DeepSeek: the model, and the MTP heads the drafter is built from.
+- [Project Maya](https://github.com/mw00/project-maya) and [antirez/ds4](https://github.com/antirez/ds4): server fixes
+  ported in 0.93 (the end of thinking by its token, TCP_NODELAY; a blank replayed reasoning read as absent); the
+  EXL3 CPU / CUDA kernels started from Project Maya's port of exllamav3's (MIT).
 
 MIT license: [LICENSE](LICENSE).
