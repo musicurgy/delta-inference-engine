@@ -117,6 +117,29 @@ def expand(cfg):
         # on another drive).  A GSQ build has none: the ds4 Q2 GGUF's (or an old install's shards).
         g = os.environ["DS41_GGUF"]
         own = "-00001-of-" in os.path.basename(g)
+        if own:
+            # the engine's Engram row reader handles IQ4_NL (20) and MXFP8 (43) tables; Unsloth's Dynamic V3.1 files
+            # (UD-IQ2_XXS, UD-Q2_K_XL, rev 60ad3651) store theirs as Q6_K, so those take the default's exact FP8 tables
+            # (what the README's numbers for them were measured with) - the default model must be installed too
+            try:
+                import gguf_head
+                tt = gguf_head.tensor_types(g)   # the tables: per_layer_token_embd (Xolotl's name) or blk.N.engram_kv (llama.cpp's)
+                t = tt.get("per_layer_token_embd.weight")
+                if t is None:
+                    t = next((v for k, v in tt.items() if k.endswith(".engram_kv.weight")), None)
+            except Exception as e:   # unreadable header: let the engine decide
+                print(f"ds41_local: could not read {os.path.basename(g)}'s header ({e}); trying its own Engram tables")
+                t = 20
+            if t is not None and t not in (20, 43):
+                alt = m + "/engram" if old else full
+                if os.path.exists(alt):
+                    print(f"ds41_local: {os.path.basename(g)} stores its Engram tables as "
+                          f"{gguf_head.GGML_TYPE_NAMES.get(t, t)} - using the default model's exact FP8 tables ({alt})")
+                    own = False
+                else:
+                    sys.exit(f"ds41_local: {os.path.basename(g)} stores its Engram tables as "
+                             f"{gguf_head.GGML_TYPE_NAMES.get(t, t)}, which this build cannot read, and the default model "
+                             f"(its Engram tables) is not in {m}.  Install the default with Start DeepSeek.bat first.")
         os.environ["DS41_ENGRAM"] = g if own else m + "/engram" if old else full
     # ${DS41_BUILD}: the first build this CPU can run - this PC's own (build-ds41.bat), the portable one (AVX2), the one
     # for older CPUs (cpu_level.py)
