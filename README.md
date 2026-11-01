@@ -170,7 +170,7 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 - For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`, or
   per request with `"strata_tune": {"route_bias": 0, "route_bias_file": 0}` - about 25% slower.
 
-## Other quants: ISTA-DASLab's GSQ-RCO, Unsloth, and the EXL3 quality mode
+## Other quants: Unsloth (the quality mode and the middle option), ISTA-DASLab's GSQ-RCO, EXL3
 
 Besides the default, the engine runs the two other most-downloaded quant families of 1017, and EXL3 experts.
 **`Choose Model.bat`** lists the models in your model folder and the ones you can add, builds or downloads the one you
@@ -188,7 +188,12 @@ pick and saves your choice (`model-choice.txt`); the next start loads it.
   exact FP8 from UD-Q3_K_XL), so they need no other file.  To install an Unsloth quant INSTEAD of the default: answer N
   when `Start DeepSeek.bat` offers the default model's download, run `Choose Model.bat`, pick the download, then start
   `Start DeepSeek.bat` again.
-- **The quality mode: EXL3 2.5 bpw** ([bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw](https://huggingface.co/bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw)):
+- **The quality mode: Unsloth UD-Q2_K_XL** (Choose Model, 335 GB): 95.0% / 96.8% agreement at 32 tok/s on 192 GB of
+  RAM - more than EXL3 2.5 bpw (94.4 / 95.6) and 27% faster, with Unsloth's own Q6_K Engram tables (no other file
+  needed).  **The middle option: Unsloth UD-IQ2_XXS** (301 GB): 92.5% / 95.9% at 37 tok/s - a point more than the
+  default on general text and three more on code and maths, 10% slower.  Both measured on revision 60ad3651 (Unsloth's
+  Dynamic V3.1 files of 10-30), the one Choose Model downloads.
+- **EXL3 2.5 bpw** ([bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw](https://huggingface.co/bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw)):
   routed experts in exllamav3's trellis format (EXL3, 2.5 bits a weight), run by the engine's own EXL3 kernels on the
   GPU and CPU, with the default file's dense layers and Engram tables (keep it).  Downloaded as they are into
   `models\exl3\` (185 GB, every shard SHA-256-checked).  It agrees more with DeepSeek's own model than the default
@@ -208,8 +213,10 @@ Measured here, exact routing, top-1 agreement with DeepSeek's own model (teacher
 | GSQ IQ2_XXS | 142 GB + the default | 87.8% | 89.5% | 41 / 32 tok/s | fewer knowledge questions right; long prompts slower |
 | GSQ IQ1_M | 125 GB + the default | 85.5% | - | 42 / 37.5 tok/s | long prompts slower (no fast prompt kernel for IQ1_M) |
 | Unsloth UD-IQ1_S | 233 GB | 89.3% | 91.1% | 40 / **37.5** tok/s | the pick for 128 GB: IQ1_M's speed, 4 points more agreement |
-| Unsloth UD-IQ1_M ... UD-Q8_K_XL | 250-508 GB | - | - | - | load and run (every expert type checked on real weights); not measured |
-| EXL3 2.5 bpw (quality mode) | 185 GB + the default | 94.4% | 95.6% | 25 / - tok/s | agrees best; slower; 192 GB of RAM and an internal NVMe |
+| **Unsloth UD-IQ2_XXS** (the middle option) | 301 GB | **92.5%** | **95.9%** | 37 / - tok/s | +1 point general, +3 on code and maths, 10% slower than the default |
+| **Unsloth UD-Q2_K_XL** (the quality mode) | 335 GB | **95.0%** | **96.8%** | 32 / - tok/s | agrees best of everything measured here; 27% faster than EXL3 2.5 |
+| Unsloth UD-IQ1_M, UD-IQ3_XXS ... UD-Q8_K_XL | 250-508 GB | - | - | - | load and run (every expert type checked on real weights); not measured |
+| EXL3 2.5 bpw | 185 GB + the default | 94.4% | 95.6% | 25 / - tok/s | below UD-Q2_K_XL on both counts; 192 GB of RAM and an internal NVMe |
 
 On 192 GB of RAM the default and UD-IQ1_S write about as fast as anything, and the default agrees best with DeepSeek.
 Speed falls once a model's experts (its file without the Engram table) outgrow the RAM (~150 GB of them fit at 192 GB):

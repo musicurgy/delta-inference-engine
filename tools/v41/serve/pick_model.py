@@ -43,16 +43,17 @@ GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
 UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreement, its Engram tables
     "UD-IQ1_S": (233, "40 / 37.5 / 30 / 25.5", "89.3%", "IQ4_NL"),   # rounds 167, 170, 227
     "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
-    "UD-IQ2_XXS": (301, "-", "-", "IQ4_NL"),
-    "UD-Q2_K_XL": (335, "-", "-", "IQ4_NL"),
+    "UD-IQ2_XXS": (301, "37 / - / - / -", "92.5%", "Q6_K"),    # round 266b: 36.8 tok/s, 92.5% / 95.9% (code + maths)
+    "UD-Q2_K_XL": (335, "32 / - / - / -", "95.0%", "Q6_K"),    # round 267: 32.2 tok/s, 95.0% / 96.8% - the quality pick
     "UD-IQ3_XXS": (395, "-", "-", "IQ4_NL"),
     "UD-IQ3_S": (424, "-", "-", "IQ4_NL"),
     "UD-Q3_K_XL": (485, "-", "-", "exact"),
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
     "UD-Q8_K_XL": (508, "-", "-", "exact"),
 }
+TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ2_XXS": " (middle)"}   # the picks the menu text below explains
 EXL3 = {   # folder in exl3/ -> name, GB to download, speed, agreement, Hugging Face repo
-    "DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw": ("EXL3 2.5 bpw (quality)", 185, "25 / - / - / -", "94.4%",
+    "DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw": ("EXL3 2.5 bpw", 185, "25 / - / - / -", "94.4%",
                                              "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw"),   # round 238
 }
 EXL3_MIN_RAM_GB = 180   # its experts are 159 GiB: below ~192 GB of RAM most of them would come from the SSD (not measured)
@@ -204,7 +205,7 @@ def main():
     for q, (gb, tps, agr, eng) in UNSLOTH_Q.items():
         p = unsloth_first(m, q)
         if p:
-            row("use", p, "Unsloth " + q, gb, tps, agr)
+            row("use", p, "Unsloth " + q + TAG.get(q, ""), gb, tps, agr)
     for d, (name, gb, tps, agr, _) in EXL3.items():
         p = exl3_ready(m, d)
         if p and base:
@@ -224,21 +225,23 @@ def main():
         print("\n  Download (Unsloth's GGUFs as they are, SHA-256 checked; 100 MB/s = ~40-90 min):")
         for q in uns_todo:
             gb, tps, agr, eng = UNSLOTH_Q[q]
-            row("download", q, "download Unsloth " + q, gb, tps, agr, f"  ({eng} Engram){room(gb)}")
+            row("download", q, "download Unsloth " + q + TAG.get(q, ""), gb, tps, agr, f"  ({eng} Engram){room(gb)}")
     x3_todo = [d for d in EXL3 if not exl3_ready(m, d)]
     if x3_todo and base:
-        print("\n  Download the quality mode (EXL3 experts on the default; 100 MB/s = ~30 min; for 192 GB of RAM and an")
-        print("  internal NVMe drive - its experts outgrow the RAM, so some are read from the drive on every token):")
+        print("\n  Download EXL3 2.5 bpw (exllamav3's format on the default's dense layers; 100 MB/s = ~30 min; 192 GB of RAM")
+        print("  and an internal NVMe drive).  Unsloth UD-Q2_K_XL above agrees more AND writes faster - prefer it:")
         for d in x3_todo:
             name, gb, tps, agr, _ = EXL3[d]
             small = ram is not None and ram < EXL3_MIN_RAM_GB
             row("download", d, "download " + name.split(" (")[0], gb, tps, agr,
                 ("  - needs ~192 GB of RAM" if small else "") + room(gb))
-    print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, exact routing.  On 192 GB of RAM")
-    print("  the default writes as fast as any and agrees best; with less RAM a smaller file writes faster (more of it")
-    print("  fits; the rest is read from the SSD on every token).  Under 110 GB: Unsloth UD-IQ1_S, 30 / 25.5 tok/s at")
-    print("  96 / 64 GB against the default's 22 / 16, one point lower agreement.  The EXL3 quality mode: 94.4% agreement")
-    print("  (the default 91.5%) at 25 tok/s (the default 41), with 192 GB of RAM.  (Measured on an RTX 3090.)\n")
+    print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, exact routing (code + maths in the")
+    print("  README).  On 192 GB of RAM: the default writes fastest (41 tok/s, 91.5%); Unsloth UD-IQ2_XXS is the middle")
+    print("  option (37 tok/s, 92.5% - and 95.9% on code + maths against the default's 93.0%); Unsloth UD-Q2_K_XL is the")
+    print("  quality pick (32 tok/s, 95.0% / 96.8%) - it agrees more than EXL3 2.5 bpw and writes 27% faster.  With less")
+    print("  RAM a smaller file writes faster (more of it fits; the rest is read from the SSD on every token): under")
+    print("  110 GB, Unsloth UD-IQ1_S, 30 / 25.5 tok/s at 96 / 64 GB against the default's 22 / 16, one point lower")
+    print("  agreement.  (Measured on an RTX 3090.)\n")
     if not menu:
         sys.exit("No model yet - run Start DeepSeek.bat first: it downloads the default one.")
     pick = input(f"Number to use (1-{len(menu)}), Enter = keep the current one: ").strip()
