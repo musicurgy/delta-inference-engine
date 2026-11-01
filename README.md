@@ -59,7 +59,9 @@ These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 
 The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  Greedy means temperature 0 in the
 request; the default sampling is what a client gets when it sends no temperature.  Sampling accepts fewer of the
-drafter's guesses, so it writes ~7% slower (0.93 narrowed this from ~12% with sampled drafts, see below).
+drafter's guesses, so it writes ~7% slower.  0.93 narrowed that gap from ~12%: the drafter's guesses are now
+sampled instead of taken as its top pick (`STRATA_DSPARK_SAMPLE` in `Start DeepSeek.bat`); the answers'
+distribution is unchanged.
 
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
 long prompts, but the output is the same.
