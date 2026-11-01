@@ -53,10 +53,13 @@ These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 
 | | 192 GB RAM | 128 GB RAM |
 |---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on) | **41 tok/s** | **33 tok/s** |
+| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **41 tok/s** | **33 tok/s** |
+| Writing, the default sampling (temperature 1, top-p 0.95) | **38 tok/s** | - |
 | Reading a long prompt (25-64k tokens) | **610 tok/s** | **410 tok/s** |
 
-The 128 GB column is the same PC with the expert memory a 128 GB PC gets.
+The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  Greedy means temperature 0 in the
+request; the default sampling is what a client gets when it sends no temperature.  Sampling accepts fewer of the
+drafter's guesses, so it writes ~7% slower (0.93 narrowed this from ~12% with sampled drafts, see below).
 
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
 long prompts, but the output is the same.
