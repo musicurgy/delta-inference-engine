@@ -189,10 +189,12 @@ pick and saves your choice (`model-choice.txt`); the next start loads it.
   when `Start DeepSeek.bat` offers the default model's download, run `Choose Model.bat`, pick the download, then start
   `Start DeepSeek.bat` again.
 - **The quality mode: Unsloth UD-Q2_K_XL** (Choose Model, 335 GB): 95.0% / 96.8% agreement at 32 tok/s on 192 GB of
-  RAM - more than EXL3 2.5 bpw (94.4 / 95.6) and 27% faster, with Unsloth's own Q6_K Engram tables (no other file
-  needed).  **The middle option: Unsloth UD-IQ2_XXS** (301 GB): 92.5% / 95.9% at 37 tok/s - a point more than the
-  default on general text and three more on code and maths, 10% slower.  Both measured on revision 60ad3651 (Unsloth's
-  Dynamic V3.1 files of 10-30), the one Choose Model downloads.
+  RAM - more than EXL3 2.5 bpw (94.4 / 95.6) and 27% faster.  **The middle option: Unsloth UD-IQ2_XXS** (301 GB):
+  92.5% / 95.9% at 37 tok/s - a point more than the
+  default on general text and three more on code and maths, 10% slower at greedy and ~3% at the default sampling.
+  Both measured on revision 60ad3651 (Unsloth's Dynamic V3.1 files of 10-30), the one Choose Model downloads.  These
+  two files store their Engram tables in a type this build does not read (Q5_K / Q6_K), so the launcher gives them
+  the default model's exact FP8 tables - which is how the numbers above were measured: keep the default installed.
 - **EXL3 2.5 bpw** ([bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw](https://huggingface.co/bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw)):
   routed experts in exllamav3's trellis format (EXL3, 2.5 bits a weight), run by the engine's own EXL3 kernels on the
   GPU and CPU, with the default file's dense layers and Engram tables (keep it).  Downloaded as they are into
