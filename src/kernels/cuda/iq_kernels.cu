@@ -974,6 +974,7 @@ template<> struct Split<23> {   // IQ4_XS
         return d * sumi;
     }
 };
+#include "fork/fork_split.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 template<> inline constexpr bool kSplit<42> = true;
 template<> struct Split<42> {   // Q2_0
     struct W { int qx[4], qy[4]; float d2; };
