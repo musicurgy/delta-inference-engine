@@ -98,3 +98,28 @@ if __name__ == "__main__":
         for name, typ in tt.items():
             if "embd" in name or name.startswith("output") or "engram" in name:
                 print(f"  {name:<36} {GGML_TYPE_NAMES.get(typ, typ)}")
+
+
+# bytes a block / elements a block of the ggml types a routed-expert tensor can have (for expert_gib below)
+_BLOCK = {0: (4, 1), 1: (2, 1), 30: (2, 1), 2: (18, 32), 8: (34, 32), 10: (84, 256), 11: (110, 256), 12: (144, 256),
+          13: (176, 256), 14: (210, 256), 16: (66, 256), 17: (74, 256), 18: (98, 256), 19: (50, 256), 20: (18, 32),
+          21: (110, 256), 22: (82, 256), 23: (136, 256), 39: (17, 32)}
+
+
+def expert_gib(path):
+    """the routed experts' size in GiB over every shard (from the tensor table: dims x the type's block size), or None
+    when a type is unknown"""
+    total = 0
+    for p in split_paths(path):
+        _, tensors = read_header(p)
+        for name, dims, typ, _ in tensors:
+            if "_exps" not in name and "experts" not in name:
+                continue
+            if typ not in _BLOCK:
+                return None
+            n = 1
+            for d in dims:
+                n *= d
+            bb, be = _BLOCK[typ]
+            total += n // be * bb
+    return total / 1073741824.0
