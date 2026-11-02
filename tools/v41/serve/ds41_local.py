@@ -39,6 +39,7 @@ import cpu_level  # noqa: E402  (same folder)
 
 ROOT =os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 ARENA_CAP_GIB = 140
+BIG_ARENA_CAP_GIB, BIG_RAM_RESERVE_GIB = 158, 20.0   # files with bigger experts (below: round 294)
 
 
 def total_ram_gib():
@@ -117,6 +118,7 @@ def expand(cfg):
         # on another drive).  A GSQ build has none: the ds4 Q2 GGUF's (or an old install's shards).
         g = os.environ["DS41_GGUF"]
         own = "-00001-of-" in os.path.basename(g)
+        t = None
         if own:
             # the engine's Engram row reader handles Q5_K (13), IQ4_NL (20) and MXFP8 (43) tables - Unsloth's Dynamic
             # V3.1 UD-IQ2_XXS / UD-Q2_K_XL (rev 60ad3651) store theirs as Q5_K: their own tables, measured as good as the
@@ -142,6 +144,8 @@ def expand(cfg):
                              f"{gguf_head.GGML_TYPE_NAMES.get(t, t)}, which this build cannot read, and the default model "
                              f"(its Engram tables) is not in {m}.  Install the default with Start DeepSeek.bat first.")
         os.environ["DS41_ENGRAM"] = g if own else m + "/engram" if old else full
+        if own and t != 43:   # the Engram hot set holds FP8 rows: a file with other tables would only log "SKIPPED"
+            os.environ.pop("STRATA_ENGRAM_HOT", None)
     # ${DS41_BUILD}: the first build this CPU can run - this PC's own (build-ds41.bat), the portable one (AVX2), the one
     # for older CPUs (cpu_level.py)
     if "DS41_BUILD" not in os.environ:
@@ -195,8 +199,20 @@ def expand(cfg):
                 a[a.index("--prompt-batch") + 1] = "4096"
             if "DS41_VRAM_MARGIN" not in os.environ:
                 os.environ["DS41_VRAM_MARGIN"] = "2"
-            print(f"ds41_local: {os.path.basename(os.environ['DS41_GGUF'])} has {', '.join(names)} experts (bigger than the "
-                  f"default's): prompt batch 4096, 2 GiB of VRAM kept free")
+            # their experts outgrow the 140 GiB arena (UD-Q2_K_XL: ~177 GiB): on 192 GB of RAM the arena goes to
+            # 158 GiB with 20 GiB kept back instead of 28 (round 294: half the file tier, +2% +- 1.9%; ran clean on an
+            # idle PC - other programs get ~8 GB).  Only where it is larger than the usual arena; DS41_ARENA_GIB /
+            # DS41_RAM_RESERVE_GIB still win.
+            if "DS41_ARENA_GIB" not in os.environ and "DS41_RAM_RESERVE_GIB" not in os.environ and "--arena-gib" in a[:-1]:
+                i = a.index("--arena-gib")
+                bigger = min(BIG_ARENA_CAP_GIB, int(total_ram_gib() - BIG_RAM_RESERVE_GIB))
+                if bigger > float(a[i + 1]):
+                    a[i + 1] = f"{bigger:g}"
+                    names.append(f"arena {bigger:g} GiB")
+            print(f"ds41_local: {os.path.basename(os.environ['DS41_GGUF'])} has "
+                  f"{', '.join(n for n in names if not n.startswith('arena'))} experts (bigger than the "
+                  f"default's): prompt batch 4096, 2 GiB of VRAM kept free" +
+                  "".join(f", {n}" for n in names if n.startswith("arena")))
     except Exception as e:
         print(f"ds41_local: expert-type check skipped ({e})")
     # DS41_GPU (ds41-paths.bat: the card with the most VRAM unless set): the server starts the engine on the config's

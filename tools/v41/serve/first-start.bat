@@ -198,6 +198,19 @@ if defined NEEDMAIN if defined RAM_GB if %RAM_GB% LSS 110 if %RAM_GB% GEQ 56 (
     set "NEEDMAIN="
   )
 )
+rem 180 GB and up: Unsloth's UD-IQ2_XXS is the default for this PC (0.93, round 290b: as fast as the ds4 Q2 GGUF at the
+rem shipped sampling, 37.3 vs 37.6 tok/s on an RTX 3090 + 192 GB; agrees more, 92.5 / 95.9%% vs 91.5 / 93.0%%; 301 GB)
+if defined NEEDMAIN if defined RAM_GB if %RAM_GB% GEQ 180 (
+  echo.
+  echo   With %RAM_GB% GB of RAM, Unsloth's UD-IQ2_XXS is the default for this PC: measured on an RTX 3090 it writes
+  echo   as fast as the ds4 Q2 GGUF ^(37.3 vs 37.6 tok/s^), agrees with DeepSeek's API more often ^(92.5%% vs 91.5%%;
+  echo   95.9%% vs 93.0%% on code and maths^) and is a 301 GB download ^(the ds4 Q2 GGUF: ~375 GB^).  N keeps the ds4 Q2.
+  choice /c YN /m "Download UD-IQ2_XXS (recommended)"
+  if not errorlevel 2 (
+    ".venv\Scripts\python.exe" tools\v41\serve\pick_model.py --get UD-IQ2_XXS || exit /b 1
+    set "NEEDMAIN="
+  )
+)
 echo The model files above go to %M%
 echo   ^(DS41_MODELS in ds41-paths.bat - put it on your fastest NVMe drive^).  They come from Hugging Face: DeepSeek's
 echo   official repository and a Q2 GGUF of it; every large file is checked against its published SHA-256.

@@ -33,6 +33,10 @@ GB = 1e9
 # not measured).  The model to recommend on a PC with less than LOW_RAM_GB of RAM:
 LOW_RAM_GB = 110
 LOW_RAM_PICK = "UD-IQ1_S"
+# ... and on one with HIGH_RAM_GB or more (round 290b, 0.93: UD-IQ2_XXS writes as fast as the default at the shipped
+# sampling - 37.3 vs 37.6 tok/s - agrees more, 92.5 / 95.9% vs 91.5 / 93.0%, and is 65 GB smaller; measured at 192 GB only)
+HIGH_RAM_GB = 180
+HIGH_RAM_PICK = "UD-IQ2_XXS"
 # (menu name, GB on disk, writing tok/s, top-1 agreement with DeepSeek's API)
 DEFAULT = ("ds4 Q2 (the default)", 366, "41 / 33 / 27 / 20", "91.5%")   # 96 / 64: rounds 234 (reserve 28 + read-ahead 8)
 GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
@@ -51,7 +55,7 @@ UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreemen
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
     "UD-Q8_K_XL": (508, "-", "-", "exact"),
 }
-TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ2_XXS": " (middle)"}   # the picks the menu text below explains
+TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ2_XXS": " (192 GB pick)"}   # the picks the menu text below explains
 EXL3 = {   # folder in exl3/ -> name, GB to download, speed, agreement, Hugging Face repo
     "DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw": ("EXL3 2.5 bpw", 185, "25 / - / - / -", "94.4%",
                                              "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw"),   # round 238
@@ -186,6 +190,7 @@ def main():
     now = cur if cur and os.path.exists(cur if os.path.isabs(cur) else os.path.join(m, cur)) else base
     ram = ram_gb()
     low = ram is not None and ram < LOW_RAM_GB
+    high = ram is not None and ram >= HIGH_RAM_GB
     print(f"Model folder: {m}" + (f"   (this PC: {ram} GB of RAM)" if ram else "") + "\n")
     print("     model                          disk     writing tok/s at             agreement with")
     print("                                             192 / 128 / 96 / 64 GB RAM   DeepSeek's API")
@@ -194,7 +199,7 @@ def main():
     def row(kind, path, name, gb, tps, agr, note=""):
         menu.append((kind, path))
         mark = "  <- now" if kind == "use" and path == now else ""
-        rec = "  <- recommended for this PC" if low and LOW_RAM_PICK in name else ""
+        rec = "  <- recommended for this PC" if (low and LOW_RAM_PICK in name) or (high and HIGH_RAM_PICK in name) else ""
         print(f"  {len(menu):>2}. {name:<28} {gb:>4} GB   {tps:<28} {agr:<8}{note}{mark}{rec}")
 
     if base:
@@ -236,8 +241,9 @@ def main():
             row("download", d, "download " + name.split(" (")[0], gb, tps, agr,
                 ("  - needs ~192 GB of RAM" if small else "") + room(gb))
     print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, exact routing (code + maths in the")
-    print("  README).  On 192 GB of RAM: the default writes fastest (41 tok/s, 91.5%); Unsloth UD-IQ2_XXS is the middle")
-    print("  option (37 tok/s, 92.5% - and 95.9% on code + maths against the default's 93.0%); Unsloth UD-Q2_K_XL is the")
+    print("  README).  On 192 GB of RAM: Unsloth UD-IQ2_XXS is the pick - at the shipped sampling it writes as fast as the")
+    print("  default (37.3 vs 37.6 tok/s; the default is faster only at temperature 0: 41 vs 37) and agrees more (92.5%, and")
+    print("  95.9% on code + maths against the default's 91.5 / 93.0%), from 65 GB less disk; Unsloth UD-Q2_K_XL is the")
     print("  quality pick (32 tok/s, 95.0% / 96.8%) - it agrees more than EXL3 2.5 bpw and writes 27% faster.  With less")
     print("  RAM a smaller file writes faster (more of it fits; the rest is read from the SSD on every token): under")
     print("  110 GB, Unsloth UD-IQ1_S, 30 / 25.5 tok/s at 96 / 64 GB against the default's 22 / 16, one point lower")
