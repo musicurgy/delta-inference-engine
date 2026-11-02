@@ -180,6 +180,24 @@ def expand(cfg):
     x3 = os.environ.get("DS41_EXL3", "").strip().replace("\\", "/")
     if x3 and "--exl3" not in a:
         a += ["--exl3", x3]
+    # Bigger experts than the default's (MXFP4 / IQ3_S / Q3_K / 4-bit rows: Unsloth UD-Q2_K_XL and up): the batch
+    # prompt path sizes its buffers and the kept cache for the default's ~10 MB experts and ran out of VRAM on
+    # UD-Q2_K_XL (round 287b: a 7K-token batch, then the cache regrow / c_bounce out of memory) - cap the prompt batch
+    # at 4096 tokens and keep 2 GiB of VRAM free unless the user set DS41_VRAM_MARGIN
+    try:
+        import gguf_head
+        big = {39, 21, 11, 12, 20, 23}   # MXFP4, IQ3_S, Q3_K, Q4_K, IQ4_NL, IQ4_XS
+        ex = {v for k, v in gguf_head.tensor_types(os.environ["DS41_GGUF"]).items() if "_exps" in k or "experts" in k}
+        if ex & big:
+            names = sorted(gguf_head.GGML_TYPE_NAMES.get(t, str(t)) for t in ex & big)
+            if "--prompt-batch" in a[:-1] and int(float(a[a.index("--prompt-batch") + 1])) > 4096:
+                a[a.index("--prompt-batch") + 1] = "4096"
+            if "DS41_VRAM_MARGIN" not in os.environ:
+                os.environ["DS41_VRAM_MARGIN"] = "2"
+            print(f"ds41_local: {os.path.basename(os.environ['DS41_GGUF'])} has {', '.join(names)} experts (bigger than the "
+                  f"default's): prompt batch 4096, 2 GiB of VRAM kept free")
+    except Exception as e:
+        print(f"ds41_local: expert-type check skipped ({e})")
     # DS41_GPU (ds41-paths.bat: the card with the most VRAM unless set): the server starts the engine on the config's
     # "gpu" (it sets CUDA_VISIBLE_DEVICES from it, nvidia-smi's numbering), not on the launcher's environment
     g = os.environ.get("DS41_GPU", "").strip()
