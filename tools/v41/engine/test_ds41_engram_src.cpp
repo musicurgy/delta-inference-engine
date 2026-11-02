@@ -3,6 +3,13 @@
 //
 //   test_ds41_engram_src --gguf MODEL.gguf --a SRC --b SRC --seq tokens.i32 [--rows 20000] [--threads 16] [--approx TOL]
 //
+// --dump FILE: also write --b's dequantized batch rows for positions 0..63 as records (u32 slot, u64 row of the slot's
+// table, u64 row of the combined per_layer_token_embd tensor, then dim f32), for an outside decoder to compare bit for
+// bit (tools/v41/engram_q5k_check.py: gguf-py's reference Q5_K dequantizer on the same blocks).
+// --time K: then K decode-sized batches (3 tokens at random positions, no row cache, no hot set) through --a and --b,
+// interleaved, start + wait timed: the read + dequantize cost a pass waits on.  --unmap: drop the backbone GGUF's mappings
+// first (the engine keeps every shard mapped - a table inside a model shard is read while its file is mapped).
+// --time-seq FILE: time positions after the checks' tokens, from another token file - rows the checks did not read (cold).
 // --approx TOL: the sources hold different formats (DeepSeek's FP8 vs a re-quantized IQ4_NL table): no raw check; the
 // batch rows of --b against --a's as relative L2 error per row (median / p99 / max printed, max must stay under TOL),
 // and --b's own paths (batch reader, row cache, reference reader) still byte for byte against each other.
@@ -24,6 +31,8 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <chrono>
+#include <memory>
 #include <vector>
 
 using namespace strata;
@@ -71,8 +80,9 @@ void row_errs(const std::vector<std::vector<float>> & x, const std::vector<std::
 }  // namespace
 
 int main(int argc, char ** argv) {
-    std::string gguf, a_src, b_src, seq;
-    int rows_n = 20000, threads = 16;
+    std::string gguf, a_src, b_src, seq, dump, time_seq;
+    int rows_n = 20000, threads = 16, time_k = 0;
+    bool unmap = false;
     double tol = -1;   // --approx
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
@@ -84,13 +94,18 @@ int main(int argc, char ** argv) {
         else if (k == "--rows") rows_n = std::atoi(nxt().c_str());
         else if (k == "--threads") threads = std::atoi(nxt().c_str());
         else if (k == "--approx") tol = std::atof(nxt().c_str());
+        else if (k == "--dump") dump = nxt();
+        else if (k == "--time") time_k = std::atoi(nxt().c_str());
+        else if (k == "--unmap") unmap = true;
+        else if (k == "--time-seq") time_seq = nxt();
         else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); return 2; }
     }
     if (gguf.empty() || a_src.empty() || b_src.empty() || seq.empty()) {
         std::fprintf(stderr, "usage: test_ds41_engram_src --gguf MODEL.gguf --a SRC --b SRC --seq tokens.i32\n");
         return 2;
     }
-    GgufModel m = GgufModel::open(gguf);
+    auto mp = std::make_unique<GgufModel>(GgufModel::open(gguf));
+    GgufModel & m = *mp;
     Ds41Geometry G;
     const std::string ge = ds41_read_geometry(m, G);
     if (!ge.empty()) { std::fprintf(stderr, "geometry: %s\n", ge.c_str()); return 1; }
@@ -178,6 +193,74 @@ int main(int argc, char ** argv) {
         std::sort(errs.begin(), errs.end());
         std::printf("   --b vs --a, relative L2 error per row over %zu rows: median %.4f, p99 %.4f, max %.4f (tolerance %.3f)\n",
                     errs.size(), errs[errs.size() / 2], errs[errs.size() * 99 / 100], errs.back(), tol);
+    }
+    if (!dump.empty()) {   // --b's batch rows of positions 0..63 with their row ids
+        const int n = 64;
+        auto bd = B.start(0, n, ob, err);
+        if (!bd || !B.wait(bd, err)) { std::fprintf(stderr, "dump batch: %s\n", err.c_str()); return 1; }
+        std::FILE * f = std::fopen(dump.c_str(), "wb");
+        if (!f) { std::fprintf(stderr, "cannot write %s\n", dump.c_str()); return 1; }
+        const int64_t cols = B.n_cols(), dim = B.row_dim();
+        std::vector<int64_t> ids((size_t) cols);
+        int64_t recs = 0;
+        uint64_t base = 0;
+        for (size_t e = 0; e < G.engram_layers.size(); ++e) {
+            for (int i = 0; i < n; ++i) {
+                B.hash(i, (int) e, ids.data());
+                for (int64_t c = 0; c < cols; ++c) {
+                    if (ids[(size_t) c] < 0) continue;
+                    const uint32_t slot = (uint32_t) e;
+                    const uint64_t row = (uint64_t) ids[(size_t) c], abs = base + row;
+                    std::fwrite(&slot, 4, 1, f);
+                    std::fwrite(&row, 8, 1, f);
+                    std::fwrite(&abs, 8, 1, f);
+                    std::fwrite(&ob[e][(size_t) ((i * cols + c) * dim)], 4, (size_t) dim, f);
+                    ++recs;
+                }
+            }
+            base += (uint64_t) G.engram_rows[e];
+        }
+        std::fclose(f);
+        std::printf("dump: %" PRId64 " rows of --b to %s\n", recs, dump.c_str());
+    }
+    if (time_k > 0) {
+        if (unmap) mp.reset();   // m is not used below
+        std::mt19937_64 tr(99);
+        int64_t base = 16, span = (int64_t) toks.size() - 20;
+        if (!time_seq.empty()) {   // fresh positions: tokens from another file, after the checks' range
+            std::ifstream f2(time_seq, std::ios::binary);
+            std::vector<int32_t> t2;
+            int32_t x2;
+            while (f2.read(reinterpret_cast<char *>(&x2), 4)) if (x2 >= 0) t2.push_back(x2);
+            const int64_t b0 = (int64_t) toks.size();
+            for (size_t q = 0; q < t2.size(); ++q) { A.set_token(b0 + (int64_t) q, t2[q]); B.set_token(b0 + (int64_t) q, t2[q]); }
+            base = b0 + 16;
+            span = (int64_t) t2.size() - 20;
+        }
+        std::vector<double> ta, tb;
+        std::vector<std::vector<float>> o;
+        for (int k = 0; k < time_k; ++k) {
+            const int64_t p0 = base + (int64_t) (tr() % (uint64_t) span);
+            for (int s2 = 0; s2 < 2; ++s2) {
+                Ds41Engram & X = s2 ? B : A;
+                const auto t0 = std::chrono::steady_clock::now();
+                auto bt = X.start(p0, 3, o, err);
+                if (!bt || !X.wait(bt, err)) { std::fprintf(stderr, "time batch: %s\n", err.c_str()); return 1; }
+                (s2 ? tb : ta).push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            }
+        }
+        auto stat = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            double sum = 0;
+            for (double x : v) sum += x;
+            std::printf("mean %.3f ms, median %.3f, p90 %.3f", sum / (double) v.size(), v[v.size() / 2], v[v.size() * 9 / 10]);
+        };
+        std::printf("time: %d batches of 3 tokens, threads %d, STRATA_ENGRAM_DIRECT=%s, backbone %s\n  --a: ", time_k, threads,
+                    std::getenv("STRATA_ENGRAM_DIRECT") ? std::getenv("STRATA_ENGRAM_DIRECT") : "unset", unmap ? "unmapped" : "mapped");
+        stat(ta);
+        std::printf("\n  --b: ");
+        stat(tb);
+        std::printf("\n");
     }
     if (fails || bfail) { std::printf("DIFFERENT\n"); return 1; }
     std::printf(tol < 0 ? "IDENTICAL\n" : "CLOSE (within tolerance; --b's own paths identical)\n");

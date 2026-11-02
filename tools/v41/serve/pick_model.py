@@ -43,8 +43,8 @@ GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
 UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreement, its Engram tables
     "UD-IQ1_S": (233, "40 / 37.5 / 30 / 25.5", "89.3%", "IQ4_NL"),   # rounds 167, 170, 227
     "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
-    "UD-IQ2_XXS": (301, "37 / - / - / -", "92.5%", "Q6_K"),    # round 266b: 36.8 tok/s, 92.5% / 95.9% (code + maths)
-    "UD-Q2_K_XL": (335, "32 / - / - / -", "95.0%", "Q6_K"),    # round 267: 32.2 tok/s, 95.0% / 96.8% - the quality pick
+    "UD-IQ2_XXS": (301, "37 / - / - / -", "92.5%", "Q5_K"),    # round 266b: 36.8 tok/s, 92.5% / 95.9% (code + maths)
+    "UD-Q2_K_XL": (335, "32 / - / - / -", "95.0%", "Q5_K"),    # round 267: 32.2 tok/s, 95.0% / 96.8% - the quality pick
     "UD-IQ3_XXS": (395, "-", "-", "IQ4_NL"),
     "UD-IQ3_S": (424, "-", "-", "IQ4_NL"),
     "UD-Q3_K_XL": (485, "-", "-", "exact"),

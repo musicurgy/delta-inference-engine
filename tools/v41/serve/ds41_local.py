@@ -118,9 +118,10 @@ def expand(cfg):
         g = os.environ["DS41_GGUF"]
         own = "-00001-of-" in os.path.basename(g)
         if own:
-            # the engine's Engram row reader handles IQ4_NL (20) and MXFP8 (43) tables; Unsloth's Dynamic V3.1 files
-            # (UD-IQ2_XXS, UD-Q2_K_XL, rev 60ad3651) store theirs as Q6_K, so those take the default's exact FP8 tables
-            # (what the README's numbers for them were measured with) - the default model must be installed too
+            # the engine's Engram row reader handles Q5_K (13), IQ4_NL (20) and MXFP8 (43) tables - Unsloth's Dynamic
+            # V3.1 UD-IQ2_XXS / UD-Q2_K_XL (rev 60ad3651) store theirs as Q5_K: their own tables, measured as good as the
+            # default's exact FP8 ones (93.14 vs 92.94% top-1, the same speed).  Any other type takes the default's FP8
+            # tables - the default model must be installed then
             try:
                 import gguf_head
                 tt = gguf_head.tensor_types(g)   # the tables: per_layer_token_embd (Xolotl's name) or blk.N.engram_kv (llama.cpp's)
@@ -130,7 +131,7 @@ def expand(cfg):
             except Exception as e:   # unreadable header: let the engine decide
                 print(f"ds41_local: could not read {os.path.basename(g)}'s header ({e}); trying its own Engram tables")
                 t = 20
-            if t is not None and t not in (20, 43):
+            if t is not None and t not in (13, 20, 43):
                 alt = m + "/engram" if old else full
                 if os.path.exists(alt):
                     print(f"ds41_local: {os.path.basename(g)} stores its Engram tables as "

@@ -39,6 +39,9 @@ set STRATA_ENGRAM_HOT=
 if exist "%DS41_MODELS_W%\engram-hot-2g.bin" set "STRATA_ENGRAM_HOT=%DS41_MODELS%/engram-hot-2g.bin"
 set STRATA_POOL_TASKS=256
 set STRATA_ENGRAM_ASYNC=1
+rem Engram rows: 1 = unbuffered reads of DeepSeek's safetensors tables (engram/); tables inside a GGUF (the full
+rem model file's own, an Unsloth file's) stay buffered - unbuffered reads of a model file are ~10x slower on
+rem Windows.  2 = unbuffered for those too.  Exact either way.
 set STRATA_ENGRAM_DIRECT=1
 set STRATA_DENSE_ASYNC=1
 set STRATA_PASS_NOSYNC=1

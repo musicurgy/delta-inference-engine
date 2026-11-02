@@ -192,9 +192,9 @@ pick and saves your choice (`model-choice.txt`); the next start loads it.
   RAM - more than EXL3 2.5 bpw (94.4 / 95.6) and 27% faster.  **The middle option: Unsloth UD-IQ2_XXS** (301 GB):
   92.5% / 95.9% at 37 tok/s - a point more than the
   default on general text and three more on code and maths, 10% slower at greedy and ~3% at the default sampling.
-  Both measured on revision 60ad3651 (Unsloth's Dynamic V3.1 files of 10-30), the one Choose Model downloads.  These
-  two files store their Engram tables in a type this build does not read (Q5_K / Q6_K), so the launcher gives them
-  the default model's exact FP8 tables - which is how the numbers above were measured: keep the default installed.
+  Both measured on revision 60ad3651 (Unsloth's Dynamic V3.1 files of 10-30), the one Choose Model downloads, with
+  the default model's exact FP8 Engram tables.  They carry their own (Q5_K, in the last file), which the engine reads:
+  as good as the FP8 ones (UD-IQ2_XXS 93.1 vs 92.9% top-1, the same speed), so they need no other file.
 - **EXL3 2.5 bpw** ([bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw](https://huggingface.co/bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw)):
   routed experts in exllamav3's trellis format (EXL3, 2.5 bits a weight), run by the engine's own EXL3 kernels on the
   GPU and CPU, with the default file's dense layers and Engram tables (keep it).  Downloaded as they are into
