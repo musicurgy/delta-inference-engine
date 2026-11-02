@@ -143,6 +143,25 @@ public:
         if (part == 0) read(layer, expert, dst);
         (void) nparts;
     }
+    /// The bytes [lo, hi) of the blob that `read_part(layer, expert, part, nparts, ...)` writes - so a caller can use a
+    /// part as soon as its read returns.  False when the source does not say (use the blob only after every part).
+    virtual bool part_range(int64_t layer, int64_t expert, int part, int nparts, uint64_t& lo, uint64_t& hi) const {
+        (void) layer; (void) expert; (void) part; (void) nparts; (void) lo; (void) hi;
+        return false;
+    }
+    /// The blob's three file spans [gate | up | down] as (offset, bytes) - adjacent bytes of the file have adjacent
+    /// offsets, so a reader can merge neighbouring experts' spans into one read (read_span_direct).  False when the
+    /// source has no such layout (or reads it some other way: a mirror, no O_DIRECT).
+    virtual bool file_spans(int64_t layer, int64_t expert, uint64_t off[3], uint64_t bytes[3]) const {
+        (void) layer; (void) expert; (void) off; (void) bytes;
+        return false;
+    }
+    /// One aligned O_DIRECT read covering file bytes [off, off + n) (offsets from file_spans; [off, off + n) within one
+    /// file) into `scratch`; returns where byte `off` landed in it.  Null: the span does not fit `scratch_bytes`.
+    virtual const uint8_t* read_span_direct(uint64_t off, size_t n, uint8_t* scratch, size_t scratch_bytes) const {
+        (void) off; (void) n; (void) scratch; (void) scratch_bytes;
+        return nullptr;
+    }
     /// The chunk-prefetch reader pool's read: the same bytes as `read`, through the fastest path the source has.  A
     /// source with a raw file layout overrides this to pread through an `O_DIRECT` twin fd via the aligned `scratch`
     /// bounce (`read_staged_scratch()` bytes per thread, 4096-aligned).  Measured on the V41-GSQ GGUF: the scattered
@@ -213,6 +232,12 @@ private:
 class Ds41FileBlobs : public Ds41BlobSource {
 public:
     explicit Ds41FileBlobs(std::string gguf);
+    /// EXL3 experts (Delta): the routed experts come from an EXL3 checkpoint folder (LibertAIDAI's DeepSeek-V4.1 EXL3,
+    /// exllamav3's format; its config.json must say quant_method "exl3", codebook "mul1") instead of the GGUF, whose
+    /// geometry they must match.  Call before open().  Every layer's type is then exl3_type(K2), blobs are the
+    /// checkpoint's own [w1 | w3 | w2] parts (native_expert.hpp, exl3_native.cpp), and no mirror is used.
+    void set_exl3(std::string dir) { exl3_dir_ = std::move(dir); }
+    bool exl3() const { return !exl3_dir_.empty(); }
     ~Ds41FileBlobs() override;
     const char* kind() const override { return "deepseek41 gguf"; }
     bool open(std::string& err) override;
@@ -220,6 +245,9 @@ public:
     size_t blob_bytes(int64_t l) const override;
     void read(int64_t layer, int64_t expert, uint8_t* dst) const override;
     void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override;
+    bool part_range(int64_t layer, int64_t expert, int part, int nparts, uint64_t& lo, uint64_t& hi) const override;
+    bool file_spans(int64_t layer, int64_t expert, uint64_t off[3], uint64_t bytes[3]) const override;
+    const uint8_t* read_span_direct(uint64_t off, size_t n, uint8_t* scratch, size_t scratch_bytes) const override;
     void read_staged(int64_t layer, int64_t expert, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const override;
     size_t read_staged_scratch() const override { return scratch_; }
     void advise(int64_t layer, int64_t expert) const override;
@@ -274,12 +302,26 @@ private:
     std::vector<int32_t> slot_gu_, slot_d_;
     std::vector<uint64_t> gate_off_, up_off_, down_off_;   ///< per (layer, expert): absolute file offsets
     std::vector<uint32_t> gu_rb_, d_rb_;                   ///< per class: row bytes of gate/up and of down
+    std::string exl3_dir_;                                 ///< EXL3 experts' folder (empty = the GGUF's experts)
+    int x3_order_ = 0;                                     ///< EXL3 part order: 1 suh|svh|mul1|trellis, 2 mul1|suh|svh|trellis
+    std::vector<uint64_t> x3_part_;                        ///< EXL3, per class (one per K): bytes of one projection part
+    std::vector<uint64_t> x3_mul1_;                        ///< EXL3: every layer's expert-0 mul1 markers (checked at open)
+    bool check_exl3_mul1(std::string& err) const;
+    uint64_t gu_span(int c) const { return exl3() ? x3_part_[(size_t) c] : (uint64_t) gu_rb_[(size_t) c] * (uint64_t) g_.n_ff; }
+    uint64_t d_span(int c) const { return exl3() ? x3_part_[(size_t) c] : (uint64_t) d_rb_[(size_t) c] * (uint64_t) g_.n_embd; }
+    /// open(): the EXL3 geometry, offsets and shard list (files: replaced by the checkpoint's shards, in tag order).
+    bool open_exl3_spans(const std::vector<int64_t>& layer_ids, std::vector<std::string>& files, std::string& err);
 };
 
 /// Experts ranked by calibration routing counts (tools/v41/engine/v41_rank.py writes int32 (layer, expert) pairs).
 std::vector<std::pair<int32_t, int32_t>> ds41_read_ranked(const std::string& path, std::string& err);
-/// STRATA_CUDA_SPIN=1: cudaDeviceScheduleSpin for the process (call before any CUDA context exists; no-op on CPU builds)
-void ds41_cuda_schedule_from_env();
+/// STRATA_CUDA_SPIN=1: cudaDeviceScheduleSpin on `device` (-1 = the current one), before its context exists.
+void ds41_cuda_schedule_from_env(int device = -1);
+/// --gpus: a CUDA device's name and free / total memory (makes its context).  False without CUDA or a bad index.
+bool ds41_cuda_device_info(int device, std::string& name, size_t& free_bytes, size_t& total_bytes);
+/// --gpus: cudaDeviceCanAccessPeer(a, b) - 1 yes, 0 no, -1 unknown (no CUDA, a bad index).  Reported only: the cards
+/// exchange through the host either way (a peer copy can report success and move nothing on some bridges).
+int ds41_cuda_can_peer(int a, int b);
 /// Busy-poll a cudaEvent_t (as void*) until it completes (no-op on CPU builds or a null event).
 void ds41_cuda_event_spin(void* ev);
 
@@ -341,6 +383,19 @@ struct Ds41MoeConfig {
     /// REAP pruning: [n_layers * n_experts], nonzero = the expert is never routed (the dense side's selection bias
     /// masks it), so it takes no VRAM slot and no arena space - every ranking the tier seeds from skips it.  Empty = none.
     std::vector<char> exclude;
+    /// --gpus (the expert layer split): the CUDA device this tier lives on - every public call runs with it current
+    /// (and restores the caller's device after).  -1 = the caller's current device, untouched (one card: as before).
+    int device = -1;
+    /// --gpus: a CPU pool shared with the other cards' tiers (they run one layer at a time, so one set of workers
+    /// serves all of them).  Null = the tier creates its own (as before).
+    std::shared_ptr<cpu::ExpertPool> shared_pool;
+    /// --gpus: cap on this tier's arena CUDA registration in GiB (PinnedArena's max_pinned_bytes): Windows takes only
+    /// ~45-50 GiB of pinned RAM in all once a second card is open.  0 = no cap of the tier's own (STRATA_ARENA_PIN_GIB).
+    double pin_cap_gib = 0.0;
+    /// --gpus, a further card: run_multi sums the card's expert rows ON the card (the run_multi_to_dev sum, bit for bit
+    /// the host loop) and copies back only the token rows, instead of every expert row - the card's link carries
+    /// ~6x less per layer.  Off: the host sum, as on one card's host path.
+    bool sum_on_card = false;
     /// Decode (run): a routed expert that is a VRAM miss and weighs less than `skip_miss` x the token's weight sum is
     /// dropped (not fetched, contributes 0).  Hits are never dropped.  0 = off.  A quality trade: measure ppl.
     float skip_miss = 0.0f;
@@ -378,9 +433,10 @@ struct Ds41MoeStats {
     int64_t vram_swaps = 0;         ///< vram_lru: misses / prefetches moved into a VRAM slot
     int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)
     int64_t skipped = 0;            ///< skip_miss: low-weight misses dropped
+    int64_t remote = 0;             ///< computed by the STRATA_DS41_REMOTE helper process's GPU
 
     void add(const Ds41MoeStats& o);
-    int64_t lookups() const { return hits + cpu + pcie + skipped; }
+    int64_t lookups() const { return hits + cpu + pcie + skipped + remote; }
 };
 
 /// The tier's private state, defined in ds4_moe.cpp.  It carries the CUDA members in a CUDA build and none in a
@@ -502,12 +558,25 @@ public:
     /// run_multi writing the nt * n_embd sums to device memory `out_dev` instead of the host (D3: the verify pass's
     /// per-token routed rows, one call per layer).  nt*top_k token-major ids/w, x nt*n_embd.  GPU tier only.
     bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// The kernel replay bench (round 231).  STRATA_TIER_RECORD=<file> [STRATA_TIER_RECORD_MAX=N calls, default 2000]
+    /// makes run_multi_to_dev append each call's {layer, nt, ids, w, x, out} (out read back after the call: the
+    /// recording run is slower, its text unchanged).  `tier_replay` runs such a file through this tier `reps` times:
+    /// the last rep compares every output with the recorded one (bitwise and max |diff|) and reports ms per call and
+    /// the tier counters.  Record with the build before a kernel change, replay with the build after it.
+    bool tier_replay(const std::string& path, int reps, std::string& err);
     /// Measurement only (session 13): open a binary routing trace.  Writes a header snapshot (per (layer, expert):
     /// class, VRAM-resident, in arena), then one record per run_multi_to_dev call (the verify path): its distinct
     /// experts with the first pass row routing each and the class the call served it as.  `trace_mark` appends a
     /// caller record (the pass's acceptance).  Replayed by tools/v41/sim/route_sim.py.
+    /// Round 231 (the offline placement simulator, tools/v41/sim/place_sim.py): `trace_snapshot` writes an 'S'
+    /// record shaped like the header (the server re-seeds per request); `trace_rec` a generic {tag, n, n ints}
+    /// record - 'V' per pass (the pass's timing and tier counters, ds41_generate's pass_v) and 'R' per predicted
+    /// layer (the ranked prediction the prefetch / read-ahead would act on).  `tracing`: a trace is open.
     void trace_open(const std::string& path);
+    void trace_snapshot();
     void trace_mark(const float* v, int n);
+    void trace_rec(int32_t tag, const int32_t* v, int n);
+    bool tracing() const;
     /// cudaProfilerStart / Stop (nsys --capture-range=cudaProfilerApi); a no-op without CUDA.
     static void profiler(bool on);
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
@@ -554,6 +623,8 @@ public:
     const std::vector<double>& saliency_sum() const;
     const std::vector<int64_t>& saliency_count() const;
     cpu::ExpertPool& pool();           ///< the CPU tier's worker pool (the gate's single-expert check uses it)
+    /// The CPU pool as a shared handle: --gpus hands it to the other cards' tiers (Ds41MoeConfig::shared_pool).
+    std::shared_ptr<cpu::ExpertPool> shared_pool() const;
 
 private:
     std::unique_ptr<Ds41MoeImpl> im_;

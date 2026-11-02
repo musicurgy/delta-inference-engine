@@ -1183,9 +1183,13 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     }
     if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
         const int64_t pad = 256 - M % 256;
-        // F16 has no CUDA pad: concat zeros gathered from the one zero row (F16 -> F16, exact) - the same zeros
-        Kall = f16 ? ggml_concat(gc, Kall, ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * n, 0), true),
-                                                           DH, pad, n), 1)
+        // F16 has no CUDA pad: concat zeros gathered from the one zero row (F16 -> F16, exact) - the same zeros.
+        // The F32 pad kernel launches one grid row per key row (ggml-cuda/pad.cu: gridDim.y = ne1), and CUDA caps
+        // gridDim.y at 65,535, so past that build the pad rows explicitly too - the same zeros (upstream 5b06a59).
+        Kall = (f16 || M + pad > 65535)
+             ? ggml_concat(gc, Kall, f16
+                   ? ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * n, 0), true), DH, pad, n)
+                   : ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, DH, pad, n), 0.0f), 1)
              : ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
         Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, n), NEG_INF), 0);
         M += pad;

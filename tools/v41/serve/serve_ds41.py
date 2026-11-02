@@ -279,7 +279,22 @@ class Ds41Vision(_Vision):
             args += ["--dtype", str(cfg["dtype"])]
         self.spawn = (args, log, env)
         if not lazy and not self.lazy_vision and not self.elastic:
-            self._start()
+            try:
+                self._start()
+            except RuntimeError as e:   # a broken PyTorch (or file) must not stop the model: text works, pictures say why
+                print(f"[strata] pictures: the image encoder did not start ({e}); the model starts without pictures - "
+                      f"each picture tries it again", flush=True)
+
+    def encode(self, source, keep=()):
+        # the resident encoder died, timed out (STRATA_VISION_ENCODE_S) or never started: the base class writes to the
+        # dead process and pictures stayed broken until a restart of the server - start it again for this picture
+        if not self.alive() and not self.lazy_vision and not self.elastic:
+            print("[strata] pictures: starting the image encoder again ...", flush=True)
+            try:
+                self.restart()
+            except RuntimeError as e:
+                raise ValueError(f"pictures are not working: the image encoder did not start ({e})") from None
+        return super().encode(source, keep)
 
 
 S.Vision = Ds41Vision

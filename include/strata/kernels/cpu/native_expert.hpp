@@ -16,10 +16,10 @@ namespace strata::kernels::cpu {
 
 /// Bytes of the largest quantized gate/up activation any native layer uses.  DeepSeek-V4's n_embd 4096 as Q8_K
 /// (IQ2_XXS's vec_dot_type) is 16 x 292 = 4672, the largest; Qwen's 2560 as Q8_K is 2920 and 4096 as Q8_0 is 4352.
-inline constexpr size_t kNativeActBytes = 5840;   // xolotl: the MAX over every merged model (DS4 n_embd 5120 as Q8_K = 20 x 292)
+inline constexpr size_t kNativeActBytes = 20480;  // Delta: EXL3's F32 activation (DS4 n_embd 5120 x 4); was 5840 (5120 as Q8_K = 20 x 292)
 /// Bytes of the largest quantized down activation.  DeepSeek-V4's n_ff 2048 as Q8_K (Q2_K's vec_dot_type) is
 /// 8 x 292 = 2336, the largest; Qwen's 640 as Q8_0 is 20 x 34 = 680.
-inline constexpr size_t kNativeHBytes = 2628;   // xolotl: the MAX over every merged model (DS4 n_ff 2304 as Q8_K = 9 x 292)
+inline constexpr size_t kNativeHBytes = 9216;   // Delta: EXL3's F32 down activation (DS4 n_ff 2304 x 4); was 2628 (2304 as Q8_K = 9 x 292)
 /// The widest native expert intermediate (n_ff) any model has.  DeepSeek-V4's 2048 is twice Qwen's 640, so the
 /// pool's per-expert row buffers (ExpertPool::SplitBufMulti::ff) must be sized by THIS and not by the canonical
 /// `FF` (640) that the Q2_0 pack path uses: `native_gu_rows` writes rows [0, n_ff) of the model's own width, and
@@ -48,7 +48,35 @@ struct NativeFmt {
     /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
     /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
     size_t tail_off = 0;
+    /// The pool's row ranges start and end on multiples of this (EXL3: 128, its output transform is per 128-wide band;
+    /// 1 for every row-major format, whose partition is then exactly as before).
+    int row_align = 1;
 };
+
+/// EXL3 (exllamav3's trellis format, mul1 codebook) as expert types: kExl3TypeBase + K2 (K2 = 2 x bits per weight),
+/// far above ggml's type ids; its activations are plain F32 (kExl3ActType).  src/kernels/cpu/exl3_native.cpp.
+/// A part is its four tensors back to back as the checkpoint stores them: suh | svh | mul1 | trellis (LibertAIDAI's
+/// files), or with kExl3Mul1First added to the type, mul1 | suh | svh | trellis (bertholomus' 2.5 bpw: the tensors in
+/// name order).  The trellis sits at 2 k + 2 n + 4 either way.
+constexpr int kExl3TypeBase = 1000;
+constexpr int kExl3Mul1First = 100;
+constexpr int kExl3ActType = 999;
+inline bool is_exl3_type(int t) {
+    const int r = (t - kExl3TypeBase) % kExl3Mul1First;
+    return t > kExl3TypeBase && t <= kExl3TypeBase + kExl3Mul1First + 16 && r >= 1 && r <= 16;
+}
+inline int exl3_type(int k2, bool mul1_first = false) { return kExl3TypeBase + (mul1_first ? kExl3Mul1First : 0) + k2; }
+inline int exl3_k2_of(int t) { return (t - kExl3TypeBase) % kExl3Mul1First; }
+/// The byte offset of suh inside a part (svh follows it, 2 k bytes on).
+inline size_t exl3_suh_off(int t) { return t - kExl3TypeBase > kExl3Mul1First ? 4 : 0; }
+/// The bytes of one EXL3 projection part (its four tensors) of a k-input, n-output matrix.
+inline size_t exl3_native_part_bytes(int64_t k, int64_t n, int k2) {   // (inline: the GPU library uses it too)
+    return (size_t) (2 * k + 2 * n + 4) + (size_t) (k / 16) * (size_t) (n / 16) * 16u * (size_t) k2;
+}
+bool exl3_native_fmt(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+void exl3_native_quant(const float* x, int64_t n, void* dst);
+void exl3_native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff, int r0, int r1);
+void exl3_native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out, int r0, int r1);
 constexpr int kNvfp4Type = 40;
 constexpr size_t kNvfp4Tail = 16;
 

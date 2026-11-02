@@ -39,9 +39,18 @@ set STRATA_ENGRAM_HOT=
 if exist "%DS41_MODELS_W%\engram-hot-2g.bin" set "STRATA_ENGRAM_HOT=%DS41_MODELS%/engram-hot-2g.bin"
 set STRATA_POOL_TASKS=256
 set STRATA_ENGRAM_ASYNC=1
+rem Engram rows: 1 = unbuffered reads of DeepSeek's safetensors tables (engram/); tables inside a GGUF (the full
+rem model file's own, an Unsloth file's) stay buffered - unbuffered reads of a model file are ~10x slower on
+rem Windows.  2 = unbuffered for those too.  Exact either way.
 set STRATA_ENGRAM_DIRECT=1
 set STRATA_DENSE_ASYNC=1
 set STRATA_PASS_NOSYNC=1
+rem the next layer's attention is queued before the prediction readback (exact; server +2.2 percent, round 224)
+set STRATA_D3_PF_ASYNC=1
+rem SSD read-ahead: the experts the next layers will need that live only on the SSD are read into a pinned stash
+rem while the current layers run (exact; +22% writing speed on a 64 GB PC).  The engine skips it when every expert
+rem is in RAM (128 GB and up), so it costs nothing there.
+set STRATA_D3_SPEC=8
 set "STRATA_SERVE_DSPARK=%DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf"
 if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" set STRATA_SERVE_DSPARK=
 rem the card's VRAM (README.md, "What you need"):
@@ -67,6 +76,11 @@ if not defined SMALLCARD if not defined STRATA_SERVE_DSPARK echo No DSpark draft
 set STRATA_DSPARK_KEEP=tools/v41/serve/dspark_expert_counts.txt:64
 set STRATA_DSPARK_DEPTH=5
 set STRATA_DSPARK_CONF=0.6
+rem sampled drafts (exact): at temperature > 0 the drafter samples its drafts from its own sharpened distribution
+rem and the check accepts each with min(1, p/q) - the answers are distributed exactly as before, ~4-6% faster at the
+rem default sampling (rounds 271-273); greedy (temperature 0) requests are unchanged
+set STRATA_DSPARK_SAMPLE=1
+set STRATA_DSPARK_SAMPLE_T=0.5
 set STRATA_DENSE_REQUANT=q6_K
 rem serving and prompt switches (all exact; README.md, "Settings"):
 rem   rollback 8 - an answer forced after the thinking budget resumes from the live state in ~0.4 s instead of
@@ -89,7 +103,9 @@ rem            the answer's start): 40% fewer expert misses, ~12% faster writing
 rem   keep cache - a follow-up of up to 2048 new tokens borrows only part of the GPU's expert cache and gets exactly
 rem            those experts back after, instead of emptying and refilling it: such turns 0.6-0.9 s faster
 set STRATA_SERVE_ROLLBACK=8
-set STRATA_SERVE_BATCH_MIN=256
+rem            turns of 64+ new tokens take the batch path (was 256): a ~190-token turn reads 12% faster and the
+rem            chat as a whole ~4% at the client (round 246, 10-30); turns under 64 still run token by token
+set STRATA_SERVE_BATCH_MIN=64
 set STRATA_PASS_CAP_MIN=4096
 set STRATA_ENGRAM_THREADS=64
 set STRATA_KGATHER=1

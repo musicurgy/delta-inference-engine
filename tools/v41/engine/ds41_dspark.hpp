@@ -46,6 +46,14 @@ public:
     /// likewise.  `bonus` < 0: append only (seeding the window from a prompt).  Positions must be increasing and each
     /// appended position is "accepted" (it stays in the window until 128 later positions push it out).
     bool step(const float * main_hidden, const int * pos, int k, int bonus, int * ids, float * conf);
+    /// As step(), but each draft is SAMPLED from softmax(logits * inv_temp) (the Markov head's logits, the slot's own
+    /// distribution given the drafts before it) instead of taken by argmax: u[0..block) are uniforms in [0, 1), the
+    /// draft at slot i is the first token whose cumulative probability exceeds u[i] (inverse CDF on the device), and
+    /// cdf[i * vocab() ..] receives that slot's cumulative distribution - the proposal q the verifier needs for an
+    /// exact speculative-sampling accept (q(x) = cdf[x] - cdf[x - 1]).  Needs bonus >= 0.
+    bool step_sampled(const float * main_hidden, const int * pos, int k, int bonus, int * ids, float * conf,
+                      const float * u, float inv_temp, float * cdf);
+    int64_t vocab() const;              ///< the head's vocabulary (the cdf row length)
     /// Forget the window (a new conversation / a rewind past it).
     void reset();
     double last_ms() const;             ///< wall time of the last step's graph

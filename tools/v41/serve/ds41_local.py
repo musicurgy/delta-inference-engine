@@ -9,9 +9,13 @@
   (it carries them), or in an install from before 2026-10-27 the slim copy and DeepSeek's shards in engram/.  Set
   DS41_GGUF, or pick a model with Choose Model.bat (model-choice.txt), to run a GSQ or Unsloth model: an Unsloth GGUF
   reads its own Engram tables, a GSQ build the ds4 Q2 GGUF's.
+* ${DS41_EXL3}: a folder of EXL3 routed experts (the quality mode, bertholomus' 2.5 bpw: Choose Model.bat downloads it
+  into exl3/ and names the folder in model-choice.txt).  The engine then runs the default GGUF's dense layers and Engram
+  with these experts (--exl3 FOLDER, added to the args here).
 * "--arena-gib" "auto": the pinned/locked RAM arena that holds the routed experts the GPU cache cannot.  It is sized
-  from the installed RAM: total - DS41_RAM_RESERVE_GIB (default 38 GiB: the engine's own ~24 GiB outside the arena -
-  dense half, KV, prefill buffers, Engram hot set - plus ~14 GiB for Windows and other programs), capped at 140 GiB
+  from the installed RAM: total - DS41_RAM_RESERVE_GIB (default 28 GiB: the engine's own ~12-14 GiB outside the
+  arena - dense half, KV, prefill buffers, Engram hot set; measured - plus ~14 GiB for Windows and other programs;
+  a 64 GB PC gets a 31 GiB arena, a 96 GB PC 61, both tested without paging), capped at 140 GiB
   (15,102 of the 15,360 experts; more buys nothing).  192 GB -> 140 GiB, 128 GB -> ~89 GiB: the other experts are
   read from the NVMe drive on demand (O_DIRECT), so less RAM costs speed, not correctness.  DS41_ARENA_GIB=N overrides.
 * "model_name" / "display_name": named after the model file the engine loads (deepseek-v4.1-flash-1017-ds4-q2 /
@@ -35,6 +39,7 @@ import cpu_level  # noqa: E402  (same folder)
 
 ROOT =os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 ARENA_CAP_GIB = 140
+BIG_ARENA_CAP_GIB, BIG_RAM_RESERVE_GIB = 158, 20.0   # files with bigger experts (below: round 294)
 
 
 def total_ram_gib():
@@ -64,13 +69,18 @@ def env_gib(name, default):
     return f
 
 
+def out_bias(args):
+    """The --route-bias the expanded args carry (for the startup line)."""
+    return args[args.index("--route-bias") + 1] if "--route-bias" in args else "-"
+
+
 def arena_gib():
     fixed = env_gib("DS41_ARENA_GIB", None)
     if fixed is not None:
         if fixed < 1:
             sys.exit(f"ds41_local: DS41_ARENA_GIB={fixed:g} - the expert arena needs at least 1 GiB")
         return fixed
-    reserve = env_gib("DS41_RAM_RESERVE_GIB", 38.0)
+    reserve = env_gib("DS41_RAM_RESERVE_GIB", 28.0)
     return max(16.0, min(ARENA_CAP_GIB, int(total_ram_gib() - reserve)))
 
 
@@ -92,7 +102,12 @@ def expand(cfg):
             pick = ""
         if pick:
             p = (pick if os.path.isabs(pick) else m + "/" + pick).replace("\\", "/")
-            if os.path.exists(p):
+            if os.path.isdir(p):   # an EXL3 folder: its experts on the default GGUF
+                if os.path.exists(p + "/config.json"):
+                    os.environ.setdefault("DS41_EXL3", p)
+                else:
+                    print(f"ds41_local: model-choice.txt names {pick}, a folder without config.json - loading the default")
+            elif os.path.exists(p):
                 os.environ["DS41_GGUF"] = p
             else:
                 print(f"ds41_local: model-choice.txt names {pick}, which is not in {m} - loading the default")
@@ -103,7 +118,34 @@ def expand(cfg):
         # on another drive).  A GSQ build has none: the ds4 Q2 GGUF's (or an old install's shards).
         g = os.environ["DS41_GGUF"]
         own = "-00001-of-" in os.path.basename(g)
+        t = None
+        if own:
+            # the engine's Engram row reader handles Q5_K (13), IQ4_NL (20) and MXFP8 (43) tables - Unsloth's Dynamic
+            # V3.1 UD-IQ2_XXS / UD-Q2_K_XL (rev 60ad3651) store theirs as Q5_K: their own tables, measured as good as the
+            # default's exact FP8 ones (93.14 vs 92.94% top-1, the same speed).  Any other type takes the default's FP8
+            # tables - the default model must be installed then
+            try:
+                import gguf_head
+                tt = gguf_head.tensor_types(g)   # the tables: per_layer_token_embd (Xolotl's name) or blk.N.engram_kv (llama.cpp's)
+                t = tt.get("per_layer_token_embd.weight")
+                if t is None:
+                    t = next((v for k, v in tt.items() if k.endswith(".engram_kv.weight")), None)
+            except Exception as e:   # unreadable header: let the engine decide
+                print(f"ds41_local: could not read {os.path.basename(g)}'s header ({e}); trying its own Engram tables")
+                t = 20
+            if t is not None and t not in (13, 20, 43):
+                alt = m + "/engram" if old else full
+                if os.path.exists(alt):
+                    print(f"ds41_local: {os.path.basename(g)} stores its Engram tables as "
+                          f"{gguf_head.GGML_TYPE_NAMES.get(t, t)} - using the default model's exact FP8 tables ({alt})")
+                    own = False
+                else:
+                    sys.exit(f"ds41_local: {os.path.basename(g)} stores its Engram tables as "
+                             f"{gguf_head.GGML_TYPE_NAMES.get(t, t)}, which this build cannot read, and the default model "
+                             f"(its Engram tables) is not in {m}.  Install the default with Start DeepSeek.bat first.")
         os.environ["DS41_ENGRAM"] = g if own else m + "/engram" if old else full
+        if own and t != 43:   # the Engram hot set holds FP8 rows: a file with other tables would only log "SKIPPED"
+            os.environ.pop("STRATA_ENGRAM_HOT", None)
     # ${DS41_BUILD}: the first build this CPU can run - this PC's own (build-ds41.bat), the portable one (AVX2), the one
     # for older CPUs (cpu_level.py)
     if "DS41_BUILD" not in os.environ:
@@ -128,6 +170,51 @@ def expand(cfg):
     for i, x in enumerate(a[:-1]):
         if x == "--arena-gib" and a[i + 1] == "auto":
             a[i + 1] = f"{arena_gib():g}"
+    # the route bias: the config's 0.28 on every PC; DS41_ROUTE_BIAS overrides it (0 = exact routing, 0.10 = the
+    # high-agreement setting: 91.8 / 92.8% next-token agreement with DeepSeek's API vs 90.2 / 92.4% at 0.28, for about
+    # 18% of writing speed at 192 GB and 12-26% on 96 / 64 GB PCs - rounds 249, 250d, 250e, 250g, 2026-10-30 / 31)
+    rb = os.environ.get("DS41_ROUTE_BIAS", "").strip()
+    for i, x in enumerate(a[:-1]):
+        if x == "--route-bias":
+            if rb:
+                try:
+                    float(rb)
+                except ValueError:
+                    sys.exit(f"ds41_local: DS41_ROUTE_BIAS={rb!r} is not a number (ds41-paths.bat)")
+                a[i + 1] = rb
+    x3 = os.environ.get("DS41_EXL3", "").strip().replace("\\", "/")
+    if x3 and "--exl3" not in a:
+        a += ["--exl3", x3]
+    # Bigger experts than the default's (MXFP4 / IQ3_S / Q3_K / 4-bit rows: Unsloth UD-Q2_K_XL and up): the batch
+    # prompt path sizes its buffers and the kept cache for the default's ~10 MB experts and ran out of VRAM on
+    # UD-Q2_K_XL (round 287b: a 7K-token batch, then the cache regrow / c_bounce out of memory) - cap the prompt batch
+    # at 4096 tokens and keep 2 GiB of VRAM free unless the user set DS41_VRAM_MARGIN
+    try:
+        import gguf_head
+        big = {39, 21, 11, 12, 20, 23}   # MXFP4, IQ3_S, Q3_K, Q4_K, IQ4_NL, IQ4_XS
+        ex = {v for k, v in gguf_head.tensor_types(os.environ["DS41_GGUF"]).items() if "_exps" in k or "experts" in k}
+        if ex & big:
+            names = sorted(gguf_head.GGML_TYPE_NAMES.get(t, str(t)) for t in ex & big)
+            if "--prompt-batch" in a[:-1] and int(float(a[a.index("--prompt-batch") + 1])) > 4096:
+                a[a.index("--prompt-batch") + 1] = "4096"
+            if "DS41_VRAM_MARGIN" not in os.environ:
+                os.environ["DS41_VRAM_MARGIN"] = "2"
+            # their experts outgrow the 140 GiB arena (UD-Q2_K_XL: ~177 GiB): on 192 GB of RAM the arena goes to
+            # 158 GiB with 20 GiB kept back instead of 28 (round 294: half the file tier, +2% +- 1.9%; ran clean on an
+            # idle PC - other programs get ~8 GB).  Only where it is larger than the usual arena; DS41_ARENA_GIB /
+            # DS41_RAM_RESERVE_GIB still win.
+            if "DS41_ARENA_GIB" not in os.environ and "DS41_RAM_RESERVE_GIB" not in os.environ and "--arena-gib" in a[:-1]:
+                i = a.index("--arena-gib")
+                bigger = min(BIG_ARENA_CAP_GIB, int(total_ram_gib() - BIG_RAM_RESERVE_GIB))
+                if bigger > float(a[i + 1]):
+                    a[i + 1] = f"{bigger:g}"
+                    names.append(f"arena {bigger:g} GiB")
+            print(f"ds41_local: {os.path.basename(os.environ['DS41_GGUF'])} has "
+                  f"{', '.join(n for n in names if not n.startswith('arena'))} experts (bigger than the "
+                  f"default's): prompt batch 4096, 2 GiB of VRAM kept free" +
+                  "".join(f", {n}" for n in names if n.startswith("arena")))
+    except Exception as e:
+        print(f"ds41_local: expert-type check skipped ({e})")
     # DS41_GPU (ds41-paths.bat: the card with the most VRAM unless set): the server starts the engine on the config's
     # "gpu" (it sets CUDA_VISIBLE_DEVICES from it, nvidia-smi's numbering), not on the launcher's environment
     g = os.environ.get("DS41_GPU", "").strip()
@@ -239,6 +326,11 @@ def main():
     args = cfg.get("args", [])
     if "-m" in args[:-1]:
         mid, shown = model_names(args[args.index("-m") + 1])
+        if "--exl3" in args[:-1]:   # EXL3 experts on the default GGUF: named after the experts
+            b = re.search(r"EXL3-([0-9.]+)bpw", args[args.index("--exl3") + 1], re.I)
+            bpw = b.group(1) if b else ""
+            mid = f"deepseek-v4.1-flash-1017-exl3-{bpw}bpw" if bpw else "deepseek-v4.1-flash-1017-exl3"
+            shown = f"DeepSeek V4.1 Flash · EXL3 {bpw} bpw".replace("  ", " ")
         if cfg.get("model_name", DEFAULT_NAME) == DEFAULT_NAME:
             cfg["model_name"] = mid
         cfg.setdefault("display_name", shown)
@@ -248,12 +340,20 @@ def main():
     a = cfg.get("args", [])
     gib = a[a.index("--arena-gib") + 1] if "--arena-gib" in a else "?"
     # every file / folder the engine and server open at start (a missing one failed later, with a vaguer message)
-    paths = [cfg.get("exe"), cfg.get("tokenizer")] + [a[i + 1] for i, x in enumerate(a[:-1]) if x in ("-m", "--rank")]
+    paths = [cfg.get("exe"), cfg.get("tokenizer")] + [a[i + 1] for i, x in enumerate(a[:-1])
+                                                      if x in ("-m", "--rank", "--exl3")]
     paths += [d for i, x in enumerate(a[:-1]) if x == "--engram" for d in a[i + 1].split(";")]   # a list of folders
     missing = list(dict.fromkeys(p for p in paths if p and not os.path.exists(p)))   # (the model may be its Engram too)
     model = a[a.index("-m") + 1] if "-m" in a else "?"
-    print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB; model {os.path.basename(model)} "
-          f"(Choose Model.bat picks another); models in {os.environ['DS41_MODELS']}")
+    x3 = a[a.index("--exl3") + 1] if "--exl3" in a[:-1] else ""
+    print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB, route bias {out_bias(args)}; model {os.path.basename(model)}"
+          + (f" with the EXL3 experts in {os.path.basename(x3)}" if x3 else "")
+          + f" (Choose Model.bat picks another); models in {os.environ['DS41_MODELS']}")
+    # under ~110 GB of RAM the default reads most experts from the SSD (rounds 220 / 225 / 227, an RTX 3090): one line
+    # on the model that runs better there
+    if total_ram_gib() < 102 and os.path.basename(model) in ("DeepSeek-V4.1-Flash-1017-Q2.gguf", "ds4-q2-slim.gguf"):
+        print("ds41_local: tip - with this much RAM, Unsloth's UD-IQ1_S writes faster than the default (measured 30 / 25.5 "
+              "vs 22 / 16 tok/s at 96 / 64 GB; 89.3 vs 91.5% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
     if cfg.get("vision"):
         print(f"ds41_local: pictures on ({'on the GPU' if cfg['vision']['gpu'] else 'on the CPU'})")
     for p in missing:

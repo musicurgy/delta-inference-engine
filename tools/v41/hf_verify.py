@@ -27,9 +27,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True)
     ap.add_argument("--dir", required=True)
+    ap.add_argument("--revision", default=None, help="a commit / branch of the repo (default: main)")
     ap.add_argument("files", nargs="+")
     a = ap.parse_args()
-    info = HfApi().model_info(a.repo, files_metadata=True)
+    info = HfApi().model_info(a.repo, revision=a.revision, files_metadata=True)
     want = {s.rfilename: (s.lfs.sha256 if getattr(s, "lfs", None) else None) for s in info.siblings}
     bad = 0
     for name in a.files:

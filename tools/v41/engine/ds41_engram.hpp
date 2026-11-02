@@ -5,7 +5,8 @@
 // same 256 weight bytes then the 8 scale bytes, one pread per row; nazeshinjite's ds4 GGUF is byte-identical), or
 // re-quantized to IQ4_NL (144-byte rows, dequantized at read): ISTA-DASLab's Engram GGUF (blk.{1,14}.engram_embd.weight
 // IQ4_NL [256, rows]) and llama.cpp mainline's GGUFs (Unsloth's: per_layer_token_embd.weight, both tables in one
-// tensor, layer after layer).  The hot set holds FP8 rows: it is not used with IQ4_NL tables.  A row dequantizes to 256 floats = fp8 * 2^(e8m0 - 127) per 32 (model.py ParallelEngramEmbedding;
+// tensor, layer after layer; IQ4_NL, MXFP8, or Q5_K in UD-IQ2_XXS / UD-Q2_K_XL - 176-byte rows, upstream PR #84).  The hot
+// set holds FP8 rows: it is not used with the GGUF-quantized tables.  A row dequantizes to 256 floats = fp8 * 2^(e8m0 - 127) per 32 (model.py ParallelEngramEmbedding;
 // exactly representable in bf16, so model.py's bf16 cast is a no-op on them).
 //
 // rows()/start() are the fast batch reader: hashes are deduped and sorted by row id, so per row the two preads come out
@@ -92,7 +93,8 @@ private:
                    int dfd_w = -1, dfd_s = -1; };   // STRATA_ENGRAM_DIRECT: unbuffered handles for the row reads
     bool open_gguf(const std::string & path, std::string & err);
     // Row format: wrow_ weight bytes + srow_ scale bytes.  qtype_ < 0: DeepSeek's FP8 - 256 + 8 (F8_E4M3 + F8_E8M0 per
-    // 32).  qtype_ = 20 (IQ4_NL): 144 + 0 (8 blocks of fp16 d + 16 bytes of 4-bit indices).  The row cache keeps raw rows.
+    // 32).  qtype_ = 20 (IQ4_NL): 144 + 0 (8 blocks of fp16 d + 16 bytes of 4-bit indices); 43 (MXFP8): 264 + 0; 13 (Q5_K):
+    // 176 + 0 (one block: fp16 d, dmin, 12 scale bytes, 32 high-bit bytes, 128 nibble bytes).  The row cache keeps raw rows.
     int qtype_ = -1;
     int64_t wrow_ = 0, srow_ = 0;
     void deq_row(const uint8_t * w, const uint8_t * s, float * out) const;   ///< one raw row -> dim_ floats

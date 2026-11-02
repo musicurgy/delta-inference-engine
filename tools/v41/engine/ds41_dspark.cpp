@@ -45,10 +45,11 @@ struct Ds41DSpark::Impl {
     std::vector<ggml_tensor *> ring;
     ggml_tensor * i_main = nullptr, * i_mpos = nullptr, * i_mslot = nullptr, * i_emb = nullptr, * i_bpos = nullptr;
     ggml_tensor * i_mask = nullptr, * i_bonus = nullptr, * i_pre = nullptr;
+    ggml_tensor * i_u = nullptr, * i_invt = nullptr;   // step_sampled: per-slot uniforms, 1 / temperature
     std::vector<int> filled;           // ring slot -> position held (-1 empty)
-    // graphs (one per (k, draft?) shape), one allocator
+    // graphs (one per (k, mode) shape: mode 0 = append only, 1 = draft by argmax, 2 = sampled draft), one allocator
     ggml_gallocr_t ga = nullptr;
-    struct G { ggml_context * c = nullptr; ggml_cgraph * gf = nullptr; std::vector<ggml_tensor *> ids, conf, rids; };
+    struct G { ggml_context * c = nullptr; ggml_cgraph * gf = nullptr; std::vector<ggml_tensor *> ids, conf, rids, cdf; };
     // STRATA_DSPARK_COUNT=<file>: every block's routed-expert picks are counted (draft AND feed graphs) and written at
     // exit as 3 lines of NE counts - the input of STRATA_DSPARK_KEEP.
     std::vector<std::vector<int64_t>> counts;
@@ -57,8 +58,8 @@ struct Ds41DSpark::Impl {
     // of the card - VRAM the trunk's expert cache does not get.  Drafts are verified by the trunk, so this moves only
     // acceptance, never the output.
     std::vector<std::vector<int32_t>> keep;
-    std::map<std::pair<int, bool>, G> graphs;
-    std::pair<int, bool> last_key { -1, false };   ///< the graph ga was last planned for
+    std::map<std::pair<int, int>, G> graphs;
+    std::pair<int, int> last_key { -1, 0 };   ///< the graph ga was last planned for
     double ms = 0;
 
     ~Impl() {
@@ -82,7 +83,8 @@ struct Ds41DSpark::Impl {
     }
     ggml_tensor * BW(int b, const std::string & n) const { return W("mtp." + std::to_string(b) + "." + n); }
     bool load(std::string & e);
-    G & graph(int k, bool draft);
+    G & graph(int k, int mode);
+    bool run(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf, const float * u, float inv_temp, float * cdf);
 };
 
 Ds41DSpark::Ds41DSpark() : p_(new Impl) {}
@@ -258,6 +260,8 @@ bool Ds41DSpark::init(const Ds41DSparkConfig & cfg, std::string & err) {
     im.i_mask = ggml_new_tensor_2d(im.sctx, GGML_TYPE_F32, MP, im.BS);
     im.i_bonus = ggml_new_tensor_1d(im.sctx, GGML_TYPE_I32, 1);
     im.i_pre = ggml_new_tensor_2d(im.sctx, GGML_TYPE_F32, im.HC, im.BS);
+    im.i_u = ggml_new_tensor_1d(im.sctx, GGML_TYPE_F32, im.BS);
+    im.i_invt = ggml_new_tensor_1d(im.sctx, GGML_TYPE_F32, 1);
     im.sbuf = ggml_backend_alloc_ctx_tensors_from_buft(im.sctx, ggml_backend_get_default_buffer_type(im.be));
     if (!im.sbuf) { err = "cannot allocate the DSpark state"; return false; }
     ggml_backend_buffer_clear(im.sbuf, 0);
@@ -282,8 +286,9 @@ static ggml_tensor * fake_quant_fp8(ggml_context * c, ggml_tensor * x) {
 #endif
 }
 
-Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, bool draft) {
-    G & gr = graphs[{ k, draft }];
+Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, int mode) {
+    const bool draft = mode > 0, sampled = mode == 2;
+    G & gr = graphs[{ k, mode }];
     if (gr.gf) return gr;
     ggml_init_params ip = { 16384 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16384, false), nullptr, true };
     ggml_context * c = gr.c = ggml_init(ip);
@@ -399,7 +404,19 @@ Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, bool draft) {
         ggml_tensor * bias = ggml_mul_mat(c, W("mtp.2.markov_head.head.weight"), e);             // [V, 1]
         ggml_mul_mat_set_prec(bias, GGML_PREC_F32);
         ggml_tensor * li = ggml_add(c, ggml_view_2d(c, lg, V, 1, lg->nb[1], (size_t) i * lg->nb[1]), bias);
-        tok = ggml_argmax(c, li);                                                                 // I32 [1]
+        if (!sampled) tok = ggml_argmax(c, li);                                                   // I32 [1]
+        else {
+            // inverse CDF: q = softmax(li / T); tok = #{ x : cdf[x] < u_i } (clamped to V - 1) - exactly the token whose
+            // cumulative interval [cdf[x - 1], cdf[x]) holds u_i, so tok ~ q with q(x) = cdf[x] - cdf[x - 1] as the
+            // verifier reads it back
+            ggml_tensor * cdf = ggml_cumsum(c, ggml_soft_max(c, ggml_mul(c, li, i_invt)));          // [V, 1]
+            ggml_tensor * below = ggml_step(c, ggml_neg(c, ggml_sub(c, cdf, ggml_view_1d(c, i_u, 1, (size_t) i * 4))));
+            ggml_tensor * cnt = ggml_clamp(c, ggml_sum_rows(c, below), 0.0f, (float) (V - 1));       // F32 [1, 1]
+            tok = ggml_reshape_1d(c, ggml_cast(c, cnt, GGML_TYPE_I32), 1);                           // I32 [1]
+            ggml_set_output(cdf);
+            gr.cdf.push_back(cdf);
+            ggml_build_forward_expand(gf, cdf);
+        }
         ggml_tensor * hc = ggml_concat(c, ggml_view_2d(c, hn, D, 1, hn->nb[1], (size_t) i * hn->nb[1]), e, 0);
         ggml_tensor * cf = ggml_mul_mat(c, W("mtp.2.confidence_head.proj.weight"), hc);           // [1, 1]
         ggml_set_output(tok);
@@ -413,7 +430,20 @@ Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, bool draft) {
 }
 
 bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf) {
-    Impl & im = *p_;
+    return p_->run(mh, pos, k, bonus, ids, conf, nullptr, 1.0f, nullptr);
+}
+
+bool Ds41DSpark::step_sampled(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf,
+                              const float * u, float inv_temp, float * cdf) {
+    if (bonus < 0 || !u || !cdf) { p_->err = "DSpark step_sampled: needs a bonus token, uniforms and a cdf buffer"; return false; }
+    return p_->run(mh, pos, k, bonus, ids, conf, u, inv_temp, cdf);
+}
+
+int64_t Ds41DSpark::vocab() const { return p_->V; }
+
+bool Ds41DSpark::Impl::run(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf,
+                           const float * u, float inv_temp, float * cdf) {
+    Impl & im = *this;
     if (k < 1 || k > im.KM) { im.err = "DSpark step: k out of range"; return false; }
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<int32_t> mp(pos, pos + k), ms((size_t) k);
@@ -444,8 +474,13 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
         ggml_backend_tensor_set(im.i_bpos, bp.data(), 0, bp.size() * 4);
         ggml_backend_tensor_set(im.i_mask, mask.data(), 0, mask.size() * 4);
         ggml_backend_tensor_set(im.i_bonus, &bo, 0, 4);
+        if (u) {
+            ggml_backend_tensor_set(im.i_u, u, 0, (size_t) im.BS * 4);
+            ggml_backend_tensor_set(im.i_invt, &inv_temp, 0, 4);
+        }
     }
-    Impl::G & gr = im.graph(k, draft);
+    const int mode = !draft ? 0 : u ? 2 : 1;
+    Impl::G & gr = im.graph(k, mode);
     // ONE gallocr serves every cached graph, and ggml_gallocr only places tensors whose data is NULL: a cached graph
     // kept the addresses of its FIRST allocation, which a later, bigger graph's reserve frees (the buffer is
     // reallocated) - --serve crashed (CUDA invalid argument in a cpy) when a 16-row seeding graph ran again after the
@@ -455,7 +490,7 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
         t->data = nullptr;
         t->buffer = nullptr;
     }
-    const std::pair<int, bool> key { k, draft };
+    const std::pair<int, int> key { k, mode };
     if (im.last_key != key) {
         if (!ggml_gallocr_reserve(im.ga, gr.gf)) { im.err = "DSpark graph reserve failed"; return false; }
         im.last_key = key;
@@ -475,6 +510,7 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
             ggml_backend_tensor_get(gr.ids[i], &ids[i], 0, 4);
             ggml_backend_tensor_get(gr.conf[i], &conf[i], 0, 4);
         }
+        for (size_t i = 0; i < gr.cdf.size(); ++i) ggml_backend_tensor_get(gr.cdf[i], cdf + i * (size_t) im.V, 0, (size_t) im.V * 4);
     }
     im.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;

@@ -27,7 +27,7 @@ import json
 import time
 import uuid
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, reasoning_given
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -146,7 +146,8 @@ def input_messages(req: dict) -> list[dict]:
         nonlocal open_turn
         open_turn = {"role": "assistant", "content": content}
         if thinking:
-            open_turn["reasoning_content"] = "".join(thinking)
+            if reasoning_given("".join(thinking)):
+                open_turn["reasoning_content"] = "".join(thinking)
             thinking.clear()
         messages.append(open_turn)
         return open_turn
