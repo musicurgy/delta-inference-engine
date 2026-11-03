@@ -49,8 +49,8 @@ UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreemen
     "UD-IQ1_S": (233, "40 / 37.5 / 30 / 25.5", "89.3%", "IQ4_NL"),   # rounds 167, 170, 227
     "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
     "UD-IQ2_XXS": (301, "40 / 34 / - / -", "92.5%", "Q5_K"),    # 40.5 tok/s (v2 40e42129), 34.2 at 128 GB (round 310); 92.5% / 95.9%
-    "UD-Q2_K_XL": (335, "32 / - / - / -", "95.0%", "Q5_K"),    # round 267: 32.2 tok/s, 95.0% / 96.8% - the quality pick
-    "UD-IQ3_XXS": (395, "28 / - / - / -", "95.5%", "the default's"),   # rounds 295 / 311c: 27.8 tok/s, 95.5% / 97.6%; its Q6_K Engram tables are not read (the default's)
+    "UD-Q2_K_XL": (335, "31 / - / - / -", "95.0%", "Q5_K"),    # the final cards: 31.3 tok/s; 95.0% / 96.8% - the quality pick
+    "UD-IQ3_XXS": (395, "28 / - / - / -", "95.5%", "the default's"),   # the final cards: 28.2 tok/s; 95.5% / 97.6%; its Q6_K Engram tables are not read (the default's)
     "UD-IQ3_S": (424, "-", "-", "IQ4_NL"),
     "UD-Q3_K_XL": (485, "-", "-", "exact"),
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
@@ -245,7 +245,8 @@ def main():
     print("  README).  On 192 GB of RAM: Unsloth UD-IQ2_XXS is the pick - it writes about as fast as the default (40.5 vs")
     print("  40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling) and agrees more (92.5%, and")
     print("  95.9% on code + maths against the default's 91.5 / 93.0%), from 65 GB less disk; Unsloth UD-Q2_K_XL is the")
-    print("  quality pick (32 tok/s, 95.0% / 96.8%) - it agrees more than EXL3 2.5 bpw and writes ~28% faster.  With less")
+    print("  quality pick (31 tok/s, 95.0% / 96.8%) - it agrees more than EXL3 2.5 bpw and writes ~25% faster; UD-IQ3_XXS is")
+    print("  the most exact (28 tok/s, 95.5% / 97.6%), UD-Q2_K_XL the faster of the two.  With less")
     print("  RAM a smaller file writes faster (more of it fits; the rest is read from the SSD on every token): under")
     print("  110 GB, Unsloth UD-IQ1_S, 30 / 25.5 tok/s at 96 / 64 GB against the default's 27 / 20, one point lower")
     print("  agreement.  (Measured on an RTX 3090.)\n")
