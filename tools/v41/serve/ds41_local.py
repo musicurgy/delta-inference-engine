@@ -236,6 +236,10 @@ def expand(cfg):
             ENGINE_ENV["STRATA_DENSE_REQUANT"] = "q5_K"
     except Exception as e:
         print(f"ds41_local: expert-type check skipped ({e})")
+    # STRATA_CHUNK_CPU (Start DeepSeek.bat: 3) helps short prompts only with every expert in RAM: on 96 / 64 GB the CPU pool
+    # also serves the file tier and prompts read ~3.5% slower at k=3 (B2's lowk, 11-03) - off below 192 GB-class RAM
+    if total_ram_gib() < 170 and os.environ.get("STRATA_CHUNK_CPU", "") not in ("", "0"):
+        ENGINE_ENV["STRATA_CHUNK_CPU"] = "0"
     if ENGINE_ENV:
         out["env"] = {**(out.get("env") or {}), **ENGINE_ENV}
     # DS41_GPU (ds41-paths.bat: the card with the most VRAM unless set): the server starts the engine on the config's
