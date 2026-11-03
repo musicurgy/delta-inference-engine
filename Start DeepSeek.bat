@@ -62,7 +62,9 @@ rem            drafter - its 2.4 GB of weights cost more expert cache than draft
 rem   under 12 GB: probably does not fit (the dense half, KV and buffers need ~9 GB)
 set "VRAM_MIB="
 for /f "tokens=1" %%m in ('nvidia-smi --query-gpu^=memory.total --format^=csv^,noheader^,nounits -i %DS41_GPU% 2^>nul') do set "VRAM_MIB=%%m"
-rem a numeric copy that always exists (an empty %VRAM_MIB% in an if-comparison aborts the script)
+rem a numeric copy that always exists (an empty %VRAM_MIB% in an if-comparison aborts the script); an answer
+rem that is not a number ("[N/A]", "No devices were found") counts as unknown, not as 0 MiB
+echo %VRAM_MIB%| findstr /r "^[0-9][0-9]*$" >nul || set "VRAM_MIB="
 set /a VRAMN=VRAM_MIB+0 2>nul
 if defined VRAM_MIB if %VRAMN% LSS 20000 set STRATA_ARENA_PIN_GIB=48
 set "SMALLCARD="

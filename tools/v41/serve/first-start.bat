@@ -166,7 +166,9 @@ if not exist "%M%\tokenizer\vocab.json" (
 rem the drafter: not used under 14 GB of VRAM (Start DeepSeek.bat runs without it there), so not set up there either
 set "VRAM_MIB="
 for /f "tokens=1" %%m in ('nvidia-smi --query-gpu^=memory.total --format^=csv^,noheader^,nounits -i %DS41_GPU% 2^>nul') do if not defined VRAM_MIB set "VRAM_MIB=%%m"
-rem numeric copies that always exist (an empty %X% in an if-comparison aborts the script)
+rem numeric copies that always exist (an empty %X% in an if-comparison aborts the script); a VRAM answer that is not
+rem a number ("[N/A]", "No devices were found") counts as unknown, not as 0 MiB
+echo %VRAM_MIB%| findstr /r "^[0-9][0-9]*$" >nul || set "VRAM_MIB="
 set /a VRAMN=VRAM_MIB+0 2>nul
 set "DS41_NO_DRAFTER="
 if defined VRAM_MIB if %VRAMN% LSS 14000 set "DS41_NO_DRAFTER=1"

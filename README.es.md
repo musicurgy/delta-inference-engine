@@ -1,3 +1,5 @@
+> **Nota:** esta traducción está desactualizada; para la versión 0.93 (DeepSeek V4.1 Flash en Windows), consulta [README.md](README.md) (inglés).
+
 <h1 align="center">Strata</h1>
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · **Español** · [Português](README.pt-BR.md)
