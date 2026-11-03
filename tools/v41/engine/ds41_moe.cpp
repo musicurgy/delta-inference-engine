@@ -31,6 +31,9 @@
 #include <functional>
 #include <thread>
 #include <utility>
+#if defined(_WIN32)
+#include <malloc.h>   // _aligned_malloc (run_chunk's pageable bounce fallback)
+#endif
 
 #include "ds41_sys.hpp"
 #include "ds41_posix.hpp"
@@ -129,6 +132,24 @@ void ck(cudaError_t e, const char* what) {
         std::fprintf(stderr, "ds4_moe: %s: %s\n", what, cudaGetErrorString(e));
         std::abort();
     }
+}
+
+// run_chunk's bounce halves when the pinned budget is full: 4 KiB-aligned (the wave reader's O_DIRECT reads land there)
+uint8_t* bounce_alloc_pageable(size_t n) {
+#if defined(_WIN32)
+    return (uint8_t*) _aligned_malloc(n, 4096);
+#else
+    void* p = nullptr;
+    return posix_memalign(&p, 4096, n) == 0 ? (uint8_t*) p : nullptr;
+#endif
+}
+
+void bounce_free_pageable(uint8_t* p) {
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
 }
 
 /// The five metadata arrays of ONE grouped launch sit in a region of the pinned h_meta block at `b`:
@@ -463,6 +484,7 @@ struct Gpu {
     void *c_x = nullptr, *c_xq = nullptr, *c_parts = nullptr, *c_scratch = nullptr, *c_ptr = nullptr,
          *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_stage[2] = {};
     uint8_t* c_bounce[2] = {};
+    bool c_bounce_pg[2] = {};     ///< that bounce half is pageable (aligned host memory): the pinned budget was full
     float* c_hparts = nullptr;
     cudaStream_t s_cp = nullptr;
     cudaEvent_t c_copied[2] = {}, c_used[2] = {};
@@ -515,8 +537,11 @@ struct Gpu {
         if (h_hsum) cudaFreeHost(h_hsum);
         for (void* p : {c_x, c_xq, c_parts, c_scratch, c_ptr, c_start, c_ng, c_dst, c_tokv, c_stage[0], c_stage[1], c_w, c_out})
             if (p) cudaFree(p);
-        for (uint8_t* p : c_bounce)
-            if (p) cudaFreeHost(p);
+        for (int i = 0; i < 2; ++i)
+            if (c_bounce[i]) {
+                if (c_bounce_pg[i]) bounce_free_pageable(c_bounce[i]);
+                else cudaFreeHost(c_bounce[i]);
+            }
         if (c_hparts) cudaFreeHost(c_hparts);
         for (int i = 0; i < 2; ++i) {
             if (c_copied[i]) cudaEventDestroy(c_copied[i]);
@@ -5047,7 +5072,30 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             // zeroed once, so whatever MMQ reads past a blob decodes to finite numbers (llama.cpp zero-pads too)
             ck(cudaMalloc(&gp.c_stage[h], (size_t) gp.c_half + 1048576), "c_stage");
             ck(cudaMemset(gp.c_stage[h], 0, (size_t) gp.c_half + 1048576), "c_stage zero");
-            if (!gp.c_bounce[h]) ck(cudaMallocHost((void**) &gp.c_bounce[h], (size_t) gp.c_bhalf), "c_bounce");
+            // The bounce halves are PINNED host memory, and the arena's pin already takes all but ~4 GiB of the GPU's
+            // shared-memory budget on Windows (WDDM): two 1 GiB halves can fail there ("c_bounce: out of memory" -
+            // round 295, UD-IQ3_XXS's first ~200-token prompt).  A half needs only one blob (the wave is
+            // slots_half = c_bhalf / BL blobs), so halve the size down to one blob, then fall back to pageable aligned
+            // memory (cudaMemcpyAsync stages it: slower, the same bytes).  Both halves end at the smaller size.
+            if (!gp.c_bounce[h]) {
+                int64_t want = gp.c_bhalf;
+                cudaError_t e = cudaMallocHost((void**) &gp.c_bounce[h], (size_t) want);
+                while (e != cudaSuccess && want > im.blob) {
+                    (void) cudaGetLastError();
+                    want = std::max<int64_t>(im.blob, want / 2);
+                    e = cudaMallocHost((void**) &gp.c_bounce[h], (size_t) want);
+                }
+                if (e != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    gp.c_bounce[h] = bounce_alloc_pageable((size_t) want);
+                    if (!gp.c_bounce[h]) ck(e, "c_bounce");
+                    gp.c_bounce_pg[h] = true;
+                }
+                if (want < gp.c_bhalf || gp.c_bounce_pg[h])
+                    std::fprintf(stderr, "ds4_moe: chunk bounce half %d: %.0f -> %.0f MiB%s (the pinned budget is full)\n", h,
+                                 (double) gp.c_bhalf / 1048576.0, (double) want / 1048576.0, gp.c_bounce_pg[h] ? ", pageable" : "");
+                gp.c_bhalf = want;   // the other half (and later prompts) use at most this; a bigger half 0 is fine
+            }
             ck(cudaEventCreateWithFlags(&gp.c_copied[h], cudaEventDisableTiming), "ev");
             ck(cudaEventCreateWithFlags(&gp.c_used[h], cudaEventDisableTiming), "ev");
             ck(cudaEventRecord(gp.c_used[h], gp.s), "ev");
