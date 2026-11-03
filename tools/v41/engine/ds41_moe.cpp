@@ -31,6 +31,9 @@
 #include <functional>
 #include <thread>
 #include <utility>
+#if defined(_WIN32)
+#include <malloc.h>   // _aligned_malloc (run_chunk's pageable bounce fallback)
+#endif
 
 #include "ds41_sys.hpp"
 #include "ds41_posix.hpp"
@@ -41,6 +44,7 @@
 #if defined(DS4_MOE_CUDA)
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "ds41_remote.hpp"
@@ -128,6 +132,24 @@ void ck(cudaError_t e, const char* what) {
         std::fprintf(stderr, "ds4_moe: %s: %s\n", what, cudaGetErrorString(e));
         std::abort();
     }
+}
+
+// run_chunk's bounce halves when the pinned budget is full: 4 KiB-aligned (the wave reader's O_DIRECT reads land there)
+uint8_t* bounce_alloc_pageable(size_t n) {
+#if defined(_WIN32)
+    return (uint8_t*) _aligned_malloc(n, 4096);
+#else
+    void* p = nullptr;
+    return posix_memalign(&p, 4096, n) == 0 ? (uint8_t*) p : nullptr;
+#endif
+}
+
+void bounce_free_pageable(uint8_t* p) {
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
 }
 
 /// The five metadata arrays of ONE grouped launch sit in a region of the pinned h_meta block at `b`:
@@ -462,6 +484,7 @@ struct Gpu {
     void *c_x = nullptr, *c_xq = nullptr, *c_parts = nullptr, *c_scratch = nullptr, *c_ptr = nullptr,
          *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_stage[2] = {};
     uint8_t* c_bounce[2] = {};
+    bool c_bounce_pg[2] = {};     ///< that bounce half is pageable (aligned host memory): the pinned budget was full
     float* c_hparts = nullptr;
     cudaStream_t s_cp = nullptr;
     cudaEvent_t c_copied[2] = {}, c_used[2] = {};
@@ -514,8 +537,11 @@ struct Gpu {
         if (h_hsum) cudaFreeHost(h_hsum);
         for (void* p : {c_x, c_xq, c_parts, c_scratch, c_ptr, c_start, c_ng, c_dst, c_tokv, c_stage[0], c_stage[1], c_w, c_out})
             if (p) cudaFree(p);
-        for (uint8_t* p : c_bounce)
-            if (p) cudaFreeHost(p);
+        for (int i = 0; i < 2; ++i)
+            if (c_bounce[i]) {
+                if (c_bounce_pg[i]) bounce_free_pageable(c_bounce[i]);
+                else cudaFreeHost(c_bounce[i]);
+            }
         if (c_hparts) cudaFreeHost(c_hparts);
         for (int i = 0; i < 2; ++i) {
             if (c_copied[i]) cudaEventDestroy(c_copied[i]);
@@ -4686,7 +4712,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
 // MIMO_CHUNK_PROF=1: run_chunk's time split (host waits on the copy events / final sync, GPU time of the grouped
 // launches by event pairs), printed by release_chunk.  Timing only - the same work runs.
 struct ChunkProf { double file_gb = 0, rd_busy = 0; double wall = 0, file = 0, file_rd = 0, wait_copied = 0, sync = 0, kern = 0, resident_kern = 0; int64_t calls = 0, launches = 0;
-                   double tc = 0, tc_gb = 0; int64_t tc_launches = 0, mmq_subruns = 0; };   // + the PTQ1_0 -> Q2_0 transcode inside MMQ
+                   double tc = 0, tc_gb = 0; int64_t tc_launches = 0, mmq_subruns = 0;
+                   double ccpu_ms = 0, ccpu_wait = 0; };   // + STRATA_CHUNK_CPU: the pool's busy time, the join's wait   // + the PTQ1_0 -> Q2_0 transcode inside MMQ
 ChunkProf g_cprof;
 bool chunk_prof() { static const bool on = [] { const char* e = std::getenv("MIMO_CHUNK_PROF"); return e && *e == '1'; }(); return on; }
 
@@ -4894,6 +4921,78 @@ void chunk_pstage_issue(Ds41MoeImpl& im, int64_t layer) {
 
 // cf >= 0 (per-expert geometry): only the entries whose expert is of class cf; `first` uploads and quantizes the
 // activations, `last` takes the weighted sum (each entry's parts row is written by exactly one class pass)
+// STRATA_CHUNK_CPU=k (default 0 = off): in a layer-major batch of at most STRATA_CHUNK_CPU_MAXN tokens (default 1024),
+// the RAM-arena experts that k or fewer of the batch's tokens route to are computed by the CPU pool, on a helper thread,
+// while the card streams and computes the rest - instead of every non-resident expert crossing PCIe.  A short prompt
+// routes ~180 of 384 experts a layer and 61% of them serve <= 3 tokens: a 1-token expert is 0.23 ms in the pool and
+// 0.41 ms of PCIe at best (1.2 ms from the arena's unpinned tail, a blocking pageable copy) - C2's prefill profile
+// 2026-11-02, prefill-ttft.md.  STRATA_CHUNK_CPU_PAGEABLE=1 also sends the arena's unpinned experts to the pool (any
+// token count).  The pool's rows land in the same parts rows the card's kernels would have written (scatter_rows_f32),
+// so the weighted sum is unchanged; routing is unchanged; the pool's arithmetic rounds differently from the card's
+// (the decode tier's CPU / PCIe mix does the same): same distribution, not bit-identical to the all-PCIe batch.
+struct ChunkCpuBuf {
+    float* h = nullptr;        ///< pinned: the pool's rows, compact, this layer's class passes one after another
+    int32_t* hj = nullptr;     ///< pinned: each row's parts row (entry j)
+    float* d = nullptr;        ///< device copy of h (scattered into c_parts from here)
+    int32_t* dj = nullptr;
+    int64_t hcap = 0, dcap = 0;  ///< rows h / d hold
+    int64_t off = 0;           ///< rows used by this layer's earlier class passes
+    std::vector<cpu::ActQ> aq; ///< per token (Q2_0-class formats)
+    std::vector<uint8_t> na;   ///< per token, kNativeActBytes (native formats)
+    std::vector<cpu::ExpertJobMulti> jobs;
+};
+static ChunkCpuBuf g_ccpu;
+
+static void chunk_cpu_release() {   // the device rows (the deferred VRAM seed wants them); the pinned ones persist
+    if (g_ccpu.d) cudaFree(g_ccpu.d);
+    if (g_ccpu.dj) cudaFree(g_ccpu.dj);
+    g_ccpu.d = nullptr;
+    g_ccpu.dj = nullptr;
+    g_ccpu.dcap = g_ccpu.off = 0;
+}
+
+// room for `rows` rows of H floats past g_ccpu.off; a grow happens only at a layer's first rows (sized for every entry
+// of the call, `ne`, so the later class passes of the layer fit), never under rows still queued for upload
+static bool chunk_cpu_reserve(int64_t rows, int64_t ne, int64_t H) {
+    const int64_t need = g_ccpu.off + rows;
+    if (need > g_ccpu.hcap) {
+        if (g_ccpu.off > 0) return false;
+        if (g_ccpu.h) cudaFreeHost(g_ccpu.h);
+        if (g_ccpu.hj) cudaFreeHost(g_ccpu.hj);
+        g_ccpu.h = nullptr;
+        g_ccpu.hj = nullptr;
+        g_ccpu.hcap = 0;
+        const int64_t c = std::max<int64_t>(std::max(rows, ne), 1024);
+        if (cudaMallocHost((void**) &g_ccpu.h, (size_t) c * (size_t) H * 4) != cudaSuccess ||
+            cudaMallocHost((void**) &g_ccpu.hj, (size_t) c * 4) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        g_ccpu.hcap = c;
+    }
+    if (need > g_ccpu.dcap) {
+        if (g_ccpu.off > 0) return false;
+        chunk_cpu_release();
+        const int64_t c = std::max(rows, ne);
+        if (cudaMalloc((void**) &g_ccpu.d, (size_t) c * (size_t) H * 4) != cudaSuccess ||
+            cudaMalloc((void**) &g_ccpu.dj, (size_t) c * 4) != cudaSuccess) {
+            (void) cudaGetLastError();
+            chunk_cpu_release();
+            return false;
+        }
+        g_ccpu.dcap = c;
+    }
+    return true;
+}
+
+// the arena expert's blob lies in the CUDA-registered prefix (a DMA out of it is async); the by-need layout is not a
+// prefix - treated as pinned (no pageable preference)
+static bool chunk_arena_pinned(const Arena& a, int64_t layer, int64_t e) {
+    const uint8_t* p = a.ptr(layer, e);
+    if (!p || !a.owner || a.owner->by_need) return true;
+    return (uint64_t) (p - (const uint8_t*) a.base) + (uint64_t) a.blob <= a.owner->registered_bytes;
+}
+
 bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x_host,
                    float* out, void* out_dev = nullptr, int cf = -1, bool first_pass = true, bool last_pass = true) {
     Gpu& gp = *im.gpu;
@@ -4973,7 +5072,30 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             // zeroed once, so whatever MMQ reads past a blob decodes to finite numbers (llama.cpp zero-pads too)
             ck(cudaMalloc(&gp.c_stage[h], (size_t) gp.c_half + 1048576), "c_stage");
             ck(cudaMemset(gp.c_stage[h], 0, (size_t) gp.c_half + 1048576), "c_stage zero");
-            if (!gp.c_bounce[h]) ck(cudaMallocHost((void**) &gp.c_bounce[h], (size_t) gp.c_bhalf), "c_bounce");
+            // The bounce halves are PINNED host memory, and the arena's pin already takes all but ~4 GiB of the GPU's
+            // shared-memory budget on Windows (WDDM): two 1 GiB halves can fail there ("c_bounce: out of memory" -
+            // round 295, UD-IQ3_XXS's first ~200-token prompt).  A half needs only one blob (the wave is
+            // slots_half = c_bhalf / BL blobs), so halve the size down to one blob, then fall back to pageable aligned
+            // memory (cudaMemcpyAsync stages it: slower, the same bytes).  Both halves end at the smaller size.
+            if (!gp.c_bounce[h]) {
+                int64_t want = gp.c_bhalf;
+                cudaError_t e = cudaMallocHost((void**) &gp.c_bounce[h], (size_t) want);
+                while (e != cudaSuccess && want > im.blob) {
+                    (void) cudaGetLastError();
+                    want = std::max<int64_t>(im.blob, want / 2);
+                    e = cudaMallocHost((void**) &gp.c_bounce[h], (size_t) want);
+                }
+                if (e != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    gp.c_bounce[h] = bounce_alloc_pageable((size_t) want);
+                    if (!gp.c_bounce[h]) ck(e, "c_bounce");
+                    gp.c_bounce_pg[h] = true;
+                }
+                if (want < gp.c_bhalf || gp.c_bounce_pg[h])
+                    std::fprintf(stderr, "ds4_moe: chunk bounce half %d: %.0f -> %.0f MiB%s (the pinned budget is full)\n", h,
+                                 (double) gp.c_bhalf / 1048576.0, (double) want / 1048576.0, gp.c_bounce_pg[h] ? ", pageable" : "");
+                gp.c_bhalf = want;   // the other half (and later prompts) use at most this; a bigger half 0 is fine
+            }
             ck(cudaEventCreateWithFlags(&gp.c_copied[h], cudaEventDisableTiming), "ev");
             ck(cudaEventCreateWithFlags(&gp.c_used[h], cudaEventDisableTiming), "ev");
             ck(cudaEventRecord(gp.c_used[h], gp.s), "ev");
@@ -5362,6 +5484,77 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         h0 = 1 - gp.c_pre_half;
     }
     gp.c_pre_layer = -1;
+    // ---- STRATA_CHUNK_CPU: the arena experts of few tokens (and with _PAGEABLE, the unpinned ones) to the CPU pool
+    static const int ccpu_k = std::getenv("STRATA_CHUNK_CPU") ? std::max(0, std::atoi(std::getenv("STRATA_CHUNK_CPU"))) : 0;
+    static const bool ccpu_pg = std::getenv("STRATA_CHUNK_CPU_PAGEABLE") && std::getenv("STRATA_CHUNK_CPU_PAGEABLE")[0] == '1';
+    static const int ccpu_maxn = std::getenv("STRATA_CHUNK_CPU_MAXN") ? std::atoi(std::getenv("STRATA_CHUNK_CPU_MAXN")) : 1024;
+    static bool ccpu_said = false;
+    if (first_pass) g_ccpu.off = 0;   // the last layer's rows were consumed before its final sync
+    std::thread ccpu_th;
+    int64_t ccpu_rows = 0, ccpu_r0 = 0;
+    double ccpu_ms = 0;
+    if ((ccpu_k > 0 || ccpu_pg) && n <= ccpu_maxn && im.pool && x_host && !im.cfg.saliency && !arena_e.empty()) {
+        std::vector<int32_t> keep, ce;
+        int ccls = -1;
+        for (int32_t e : arena_e) {
+            bool c = cnt[(size_t) e] <= ccpu_k || (ccpu_pg && !chunk_arena_pinned(gp.arena, layer, e));
+            const int k = im.g.cls(layer, e);
+            if (c && ccls >= 0 && k != ccls) c = false;   // one format (one activation) per pool batch
+            if (c) { ccls = k; ce.push_back(e); ccpu_rows += cnt[(size_t) e]; }
+            else keep.push_back(e);
+        }
+        if (!ce.empty() && chunk_cpu_reserve(ccpu_rows, NE, H)) {
+            if (!ccpu_said) {
+                ccpu_said = true;
+                std::fprintf(stderr, "ds4_moe: STRATA_CHUNK_CPU=%d%s: batch experts of <= %d tokens%s on the CPU pool (batches <= %d tokens)\n",
+                             ccpu_k, ccpu_pg ? " +PAGEABLE" : "", ccpu_k, ccpu_pg ? " and the arena's unpinned ones" : "", ccpu_maxn);
+            }
+            arena_e = std::move(keep);
+            ccpu_r0 = g_ccpu.off;
+            g_ccpu.off += ccpu_rows;
+            const cpu::NativeFmt& fc = im.fl[(size_t) ccls];
+            const bool q2 = cpu::q2_native_kernels(fc.gu_type);
+            if (q2 && (int64_t) g_ccpu.aq.size() < n) g_ccpu.aq.resize((size_t) n);
+            if (!q2 && (int64_t) g_ccpu.na.size() < (int64_t) n * (int64_t) cpu::kNativeActBytes)
+                g_ccpu.na.resize((size_t) n * cpu::kNativeActBytes);
+            std::vector<char> need((size_t) n, 0);
+            g_ccpu.jobs.clear();
+            int64_t r = ccpu_r0;
+            for (int32_t e : ce) {
+                const uint8_t* blob = gp.arena.ptr(layer, e);
+                cpu::ExpertJobMulti* jb = nullptr;
+                for (int32_t q = first[(size_t) e]; q < first[(size_t) e] + cnt[(size_t) e]; ++q, ++r) {
+                    if (!jb || jb->nt == cpu::MAXT) {
+                        g_ccpu.jobs.emplace_back();
+                        jb = &g_ccpu.jobs.back();
+                        jb->blob = blob;
+                        jb->nt = 0;
+                        jb->fmt = &fc;
+                    }
+                    const int32_t t = tok[(size_t) q];
+                    need[(size_t) t] = 1;
+                    if (q2) jb->act[jb->nt] = &g_ccpu.aq[(size_t) t];
+                    else jb->nact[jb->nt] = g_ccpu.na.data() + (size_t) t * cpu::kNativeActBytes;
+                    jb->out[jb->nt] = g_ccpu.h + (size_t) r * (size_t) H;
+                    g_ccpu.hj[(size_t) r] = dst[(size_t) q];
+                    ++jb->nt;
+                }
+            }
+            ccpu_th = std::thread([&im, &fc, q2, need = std::move(need), x_host, H, n, r0 = ccpu_r0, rows = ccpu_rows, &ccpu_ms]() {
+                const double c0 = now_ms();
+                for (int t = 0; t < n; ++t) {
+                    if (!need[(size_t) t]) continue;
+                    if (q2) cpu::act_quant_any(x_host + (size_t) t * H, (int) H, g_ccpu.aq[(size_t) t]);
+                    else cpu::native_quant_act(fc, x_host + (size_t) t * H, g_ccpu.na.data() + (size_t) t * cpu::kNativeActBytes);
+                }
+                std::memset(g_ccpu.h + (size_t) r0 * (size_t) H, 0, (size_t) rows * (size_t) H * 4);
+                im.pool->run_split_multi_native(fc, g_ccpu.jobs.data(), (int) g_ccpu.jobs.size());
+                ccpu_ms = now_ms() - c0;
+            });
+        } else {
+            ccpu_rows = 0;
+        }
+    }
     std::vector<int32_t> stream_e(arena_e);
     stream_e.insert(stream_e.end(), order[2].begin(), order[2].end());
     for (int32_t e : stream_e) ent_str += cnt[(size_t) e];
@@ -5574,6 +5767,19 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         ck(cudaEventRecord(gp.c_used[h], gp.s), "used");
     }
     for (auto& t : readers) t.join();
+    if (ccpu_th.joinable()) {   // STRATA_CHUNK_CPU: the pool's rows into their parts rows (stream order: before the sum)
+        const double tj = now_ms();
+        ccpu_th.join();
+        if (prof) g_cprof.ccpu_wait += now_ms() - tj;
+        if (prof) g_cprof.ccpu_ms += ccpu_ms;
+        const size_t o = (size_t) ccpu_r0;
+        ck(cudaMemcpyAsync(g_ccpu.d + o * (size_t) H, g_ccpu.h + o * (size_t) H, (size_t) ccpu_rows * (size_t) H * 4,
+                           cudaMemcpyHostToDevice, gp.s), "ccpu rows");
+        ck(cudaMemcpyAsync(g_ccpu.dj + o, g_ccpu.hj + o, (size_t) ccpu_rows * 4, cudaMemcpyHostToDevice, gp.s), "ccpu idx");
+        strata::kernels::scatter_rows_f32(g_ccpu.d + o * (size_t) H, (float*) gp.c_parts, g_ccpu.dj + o, ccpu_rows, H, gp.s);
+        st.cpu += ccpu_rows;
+        st.cpu_ms += ccpu_ms;
+    }
     const int64_t n_file = (int64_t) nF;
     if (prof && nF && pf_slab < 0) {
         g_cprof.file_rd += now_ms() - t_rd0;
@@ -6179,6 +6385,8 @@ void Ds41MoeTier::release_chunk() {
         std::fprintf(stderr, "chunk prof MMQ: %lld sub-runs; PTQ1_0 -> Q2_0 transcode %.0f ms GPU (inside the grouped "
                              "kernels) over %lld sub-runs, %.1f GB of ternary read = %.0f GB/s\n",
                      (long long) c.mmq_subruns, c.tc, (long long) c.tc_launches, c.tc_gb, c.tc > 0 ? c.tc_gb / (c.tc / 1000.0) : 0.0);
+        if (c.ccpu_ms > 0)
+            std::fprintf(stderr, "chunk prof CPU (STRATA_CHUNK_CPU): pool %.0f ms, the stream loop waited %.0f ms for it\n", c.ccpu_ms, c.ccpu_wait);
         g_cprof = ChunkProf{};
     }
     if (chunk_prof() && (g_pf.blobs || g_pf.used)) {
@@ -6202,6 +6410,7 @@ void Ds41MoeTier::release_chunk() {
                     gp.c_stage[0], gp.c_stage[1], gp.c_w, gp.c_out})
         if (p) cudaFree(p);
     gp.free_mmq();   // MMQ scratch + the PTQ1_0 transcode copies (GBs): the deferred VRAM seed wants them back
+    chunk_cpu_release();   // STRATA_CHUNK_CPU's row buffers
     for (int i = 0; i < 2; ++i) {
         if (gp.c_copied[i]) cudaEventDestroy(gp.c_copied[i]);
         if (gp.c_used[i]) cudaEventDestroy(gp.c_used[i]);

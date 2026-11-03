@@ -6,7 +6,8 @@ Lists the models in the model folder (DS41_MODELS, ds41-paths.bat) and the ones 
   * ISTA-DASLab's GSQ-RCO quants (IQ2_XS / IQ2_XXS / IQ1_M), built here from their files by
     tools/v41/gsq_stream_merge.py - they read their Engram from the ds4 Q2 GGUF, so that file stays;
   * Unsloth's quants (UD-IQ1_S ... UD-Q8_K_XL), downloaded into unsloth/<quant>/ as they are (every file SHA-256
-    checked).  Their files carry their own Engram tables (IQ4_NL up to UD-IQ3_S - measured as good as DeepSeek's exact
+    checked).  Their files carry their own Engram tables (IQ4_NL / Q5_K - UD-IQ3_XXS's Q6_K ones are not read, it uses
+    the default's -, measured as good as DeepSeek's exact
     FP8 tables on UD-IQ1_S -, exact from UD-Q3_K_XL), which the launcher reads (ds41_local.py).
   * the quality mode: bertholomus' EXL3 2.5 bpw routed experts (exllamav3's trellis format) on the default's dense layers
     and Engram, downloaded as they are into exl3/<repo name>/ (every shard SHA-256 checked); the launcher gives the
@@ -33,12 +34,12 @@ GB = 1e9
 # not measured).  The model to recommend on a PC with less than LOW_RAM_GB of RAM:
 LOW_RAM_GB = 110
 LOW_RAM_PICK = "UD-IQ1_S"
-# ... and on one with HIGH_RAM_GB or more (round 290b, 0.93: UD-IQ2_XXS writes as fast as the default at the shipped
-# sampling - 37.3 vs 37.6 tok/s - agrees more, 92.5 / 95.9% vs 91.5 / 93.0%, and is 65 GB smaller; measured at 192 GB only)
+# ... and on one with HIGH_RAM_GB or more (0.93's final cards: UD-IQ2_XXS writes about as fast as the default - 40.5 vs
+# 40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling - agrees more, 92.5 / 95.9% vs 91.5 / 93.0%, and is 65 GB smaller)
 HIGH_RAM_GB = 180
 HIGH_RAM_PICK = "UD-IQ2_XXS"
 # (menu name, GB on disk, writing tok/s, top-1 agreement with DeepSeek's API)
-DEFAULT = ("ds4 Q2 (the default)", 366, "41 / 33 / 27 / 20", "91.5%")   # 96 / 64: rounds 234 (reserve 28 + read-ahead 8)
+DEFAULT = ("ds4 Q2 (the default)", 366, "40 / 36 / 27 / 20", "91.5%")   # 96 / 64: rounds 234 (reserve 28 + read-ahead 8)
 GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
     "ds41-gsq-iq2_xs.gguf": ("GSQ IQ2_XS", 159, "38 / 26 / - / -", "90.0%", "IQ2_XS"),
     "ds41-gsq-iq2_xxs.gguf": ("GSQ IQ2_XXS", 142, "41 / 32 / - / -", "87.8%", "IQ2_XXS"),
@@ -47,15 +48,15 @@ GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
 UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreement, its Engram tables
     "UD-IQ1_S": (233, "40 / 37.5 / 30 / 25.5", "89.3%", "IQ4_NL"),   # rounds 167, 170, 227
     "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
-    "UD-IQ2_XXS": (301, "37 / - / - / -", "92.5%", "Q5_K"),    # round 266b: 36.8 tok/s, 92.5% / 95.9% (code + maths)
-    "UD-Q2_K_XL": (335, "32 / - / - / -", "95.0%", "Q5_K"),    # round 267: 32.2 tok/s, 95.0% / 96.8% - the quality pick
-    "UD-IQ3_XXS": (395, "-", "-", "IQ4_NL"),
+    "UD-IQ2_XXS": (301, "40 / 34 / - / -", "92.5%", "Q5_K"),    # 40.5 tok/s (v2 40e42129), 34.2 at 128 GB (round 310); 92.5% / 95.9%
+    "UD-Q2_K_XL": (335, "31 / - / - / -", "95.0%", "Q5_K"),    # the final cards: 31.3 tok/s; 95.0% / 96.8% - the quality pick
+    "UD-IQ3_XXS": (395, "28 / - / - / -", "95.5%", "the default's"),   # the final cards: 28.2 tok/s; 95.5% / 97.6%; its Q6_K Engram tables are not read (the default's)
     "UD-IQ3_S": (424, "-", "-", "IQ4_NL"),
     "UD-Q3_K_XL": (485, "-", "-", "exact"),
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
     "UD-Q8_K_XL": (508, "-", "-", "exact"),
 }
-TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ2_XXS": " (192 GB pick)"}   # the picks the menu text below explains
+TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ2_XXS": " (192 GB)"}   # the picks the menu text below explains
 EXL3 = {   # folder in exl3/ -> name, GB to download, speed, agreement, Hugging Face repo
     "DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw": ("EXL3 2.5 bpw", 185, "25 / - / - / -", "94.4%",
                                              "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw"),   # round 238
@@ -78,7 +79,7 @@ def ram_gb():
                     ("tvirt", ctypes.c_ulonglong), ("avirt", ctypes.c_ulonglong), ("aext", ctypes.c_ulonglong)]
     m = MS()
     m.len = ctypes.sizeof(MS)
-    return round(m.total / GB) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
+    return round(m.total / 2**30) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
 
 
 def models_dir():
@@ -166,8 +167,8 @@ def get(q):
     if not f:
         gb = UNSLOTH_Q[q][0]
         free = shutil.disk_usage(m).free
-        if free < (gb + 5) * GB:
-            sys.exit(f"Not enough space for Unsloth {q}: it needs ~{gb + 5} GB free in {m}, there are {free / GB:.0f} GB.")
+        if free < (gb + 20) * GB:   # + the drafter, which the first start sets up next (~16 GB at its peak)
+            sys.exit(f"Not enough space for Unsloth {q}: it needs ~{gb + 20} GB free in {m}, there are {free / GB:.0f} GB.")
         print(f"Downloading Unsloth {q} (~{gb} GB) into {os.path.join(m, 'unsloth', q)} - if it stops, start again: it resumes.")
         download_unsloth(m, q)
         f = unsloth_first(m, q)
@@ -192,15 +193,15 @@ def main():
     low = ram is not None and ram < LOW_RAM_GB
     high = ram is not None and ram >= HIGH_RAM_GB
     print(f"Model folder: {m}" + (f"   (this PC: {ram} GB of RAM)" if ram else "") + "\n")
-    print("     model                          disk     writing tok/s at             agreement with")
-    print("                                             192 / 128 / 96 / 64 GB RAM   DeepSeek's API")
+    print("     model                                     disk     writing tok/s at             agreement with")
+    print("                                                        192 / 128 / 96 / 64 GB RAM   DeepSeek's API")
     menu = []
 
     def row(kind, path, name, gb, tps, agr, note=""):
         menu.append((kind, path))
         mark = "  <- now" if kind == "use" and path == now else ""
         rec = "  <- recommended for this PC" if (low and LOW_RAM_PICK in name) or (high and HIGH_RAM_PICK in name) else ""
-        print(f"  {len(menu):>2}. {name:<28} {gb:>4} GB   {tps:<28} {agr:<8}{note}{mark}{rec}")
+        print(f"  {len(menu):>2}. {name:<39} {gb:>4} GB   {tps:<28} {agr:<8}{note}{mark}{rec}")
 
     if base:
         row("use", base, *DEFAULT)
@@ -241,12 +242,13 @@ def main():
             row("download", d, "download " + name.split(" (")[0], gb, tps, agr,
                 ("  - needs ~192 GB of RAM" if small else "") + room(gb))
     print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, exact routing (code + maths in the")
-    print("  README).  On 192 GB of RAM: Unsloth UD-IQ2_XXS is the pick - at the shipped sampling it writes as fast as the")
-    print("  default (37.3 vs 37.6 tok/s; the default is faster only at temperature 0: 41 vs 37) and agrees more (92.5%, and")
+    print("  README).  On 192 GB of RAM: Unsloth UD-IQ2_XXS is the pick - it writes about as fast as the default (40.5 vs")
+    print("  40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling) and agrees more (92.5%, and")
     print("  95.9% on code + maths against the default's 91.5 / 93.0%), from 65 GB less disk; Unsloth UD-Q2_K_XL is the")
-    print("  quality pick (32 tok/s, 95.0% / 96.8%) - it agrees more than EXL3 2.5 bpw and writes 27% faster.  With less")
+    print("  quality pick (31 tok/s, 95.0% / 96.8%) - it agrees more than EXL3 2.5 bpw and writes ~25% faster; UD-IQ3_XXS is")
+    print("  the most exact (28 tok/s, 95.5% / 97.6%), UD-Q2_K_XL the faster of the two.  With less")
     print("  RAM a smaller file writes faster (more of it fits; the rest is read from the SSD on every token): under")
-    print("  110 GB, Unsloth UD-IQ1_S, 30 / 25.5 tok/s at 96 / 64 GB against the default's 22 / 16, one point lower")
+    print("  110 GB, Unsloth UD-IQ1_S, 30 / 25.5 tok/s at 96 / 64 GB against the default's 27 / 20, one point lower")
     print("  agreement.  (Measured on an RTX 3090.)\n")
     if not menu:
         sys.exit("No model yet - run Start DeepSeek.bat first: it downloads the default one.")
@@ -281,6 +283,9 @@ def main():
             sys.exit("The download finished but a shard is not checked - nothing changed.")
     elif kind == "download":
         gb = UNSLOTH_Q[f][0]
+        if UNSLOTH_Q[f][3] == "the default's" and base is None:
+            sys.exit(f"Unsloth {f} reads its Engram tables from the default (ds4 Q2 GGUF), which is not in {m}: "
+                     "download the default first - nothing changed.")
         free = shutil.disk_usage(m).free
         if free < (gb + 5) * GB:
             sys.exit(f"Not enough space for Unsloth {f}: it needs ~{gb + 5} GB free in {m}, there are {free / GB:.0f} GB.")

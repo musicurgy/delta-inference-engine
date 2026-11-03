@@ -120,6 +120,26 @@ def t_parser():
     # plain answer, and text that only looks like a wrapper start
     r, c, k = run_parser("plain answer <｜DSML not a tag", False, 3)
     check("non-DSML text passes through", c == "plain answer <｜DSML not a tag" and not k, (c, k))
+    # upstream #106: a turn cut (max_tokens, cancel) anywhere inside the DSML sends no DSML as content
+    raw = "Checking." + dsml([("read_file", {"path": "a b.txt", "lines": 3})])
+    for thinking in (False, True):
+        text = ("plan" + E.thinking_end_token if thinking else "") + raw
+        bad, done = [], text.index(D.INVOKE_CLOSE) + len(D.INVOKE_CLOSE)   # the call is whole from here
+        for cut in range(text.index("<" + E.dsml_token), len(text) + 1):
+            for step in (1, 7, 4096):
+                for reason in ("length", "cancel"):
+                    p = F.OutputParser(thinking=thinking, tools=TOOLS)
+                    ev = []
+                    for i in range(0, cut, step):
+                        ev += p.feed(text[i:min(i + step, cut)])
+                    ev += p.finish(reason)
+                    c = "".join(e.text for e in ev if e.kind == "content")
+                    calls = [e.call.name for e in ev if e.kind == "tool_call"]
+                    if c.strip() != "Checking." or calls != (["read_file"] if cut >= done else []):
+                        bad.append((cut - len(text), step, reason, c[-40:], calls))
+        check(f"a cut inside DSML sends no DSML text, every cut / step 1, 7, 4096 (thinking={thinking})", not bad, bad[:2])
+    r, c, k = run_parser("ok <" + E.dsml_token + " inv", False, 4096)
+    check("a natural stop inside a tag keeps it as text", c == "ok <" + E.dsml_token + " inv", c)
     esc = "a&lt;" + D.P_CLOSE[1:] + "b"
     check("DwarfStar escape undone", D.unescape(esc) == "a" + D.P_CLOSE + "b", D.unescape(esc))
 

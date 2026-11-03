@@ -30,6 +30,7 @@
 import ctypes
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
@@ -39,6 +40,9 @@ import cpu_level  # noqa: E402  (same folder)
 
 ROOT =os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 ARENA_CAP_GIB = 140
+# engine settings for this model, carried in the config's "env" (the server starts the engine with them - this script's
+# own environment does not reach it)
+ENGINE_ENV = {}
 BIG_ARENA_CAP_GIB, BIG_RAM_RESERVE_GIB = 158, 20.0   # files with bigger experts (below: round 294)
 
 
@@ -145,7 +149,7 @@ def expand(cfg):
                              f"(its Engram tables) is not in {m}.  Install the default with Start DeepSeek.bat first.")
         os.environ["DS41_ENGRAM"] = g if own else m + "/engram" if old else full
         if own and t != 43:   # the Engram hot set holds FP8 rows: a file with other tables would only log "SKIPPED"
-            os.environ.pop("STRATA_ENGRAM_HOT", None)
+            ENGINE_ENV["STRATA_ENGRAM_HOT"] = "0"   # "0" = no hot set (ds41_engram.cpp)
     # ${DS41_BUILD}: the first build this CPU can run - this PC's own (build-ds41.bat), the portable one (AVX2), the one
     # for older CPUs (cpu_level.py)
     if "DS41_BUILD" not in os.environ:
@@ -182,6 +186,10 @@ def expand(cfg):
                 except ValueError:
                     sys.exit(f"ds41_local: DS41_ROUTE_BIAS={rb!r} is not a number (ds41-paths.bat)")
                 a[i + 1] = rb
+                # 0 means exact routing: the prompt path's own bias (--route-bias-file) goes to 0 as well
+                if float(rb) == 0 and "--route-bias-file" in a[:-1]:
+                    a[a.index("--route-bias-file") + 1] = "0"
+                    print("ds41_local: DS41_ROUTE_BIAS=0 - exact routing (--route-bias 0, --route-bias-file 0)")
     x3 = os.environ.get("DS41_EXL3", "").strip().replace("\\", "/")
     if x3 and "--exl3" not in a:
         a += ["--exl3", x3]
@@ -195,15 +203,18 @@ def expand(cfg):
         ex = {v for k, v in gguf_head.tensor_types(os.environ["DS41_GGUF"]).items() if "_exps" in k or "experts" in k}
         if ex & big:
             names = sorted(gguf_head.GGML_TYPE_NAMES.get(t, str(t)) for t in ex & big)
-            if "--prompt-batch" in a[:-1] and int(float(a[a.index("--prompt-batch") + 1])) > 4096:
-                a[a.index("--prompt-batch") + 1] = "4096"
+            # UD-IQ3_XXS (the largest menu file): prompt batch 2048 and 3 GiB free - its first card at 4096 / 2 ran out
+            # of VRAM in the prompt path (round 295); 2048 / 3 ran clean at 27.8 tok/s (round 311c)
+            pb_cap, vm = (2048, "3") if "UD-IQ3_XXS" in os.path.basename(os.environ["DS41_GGUF"]) else (4096, "2")
+            if "--prompt-batch" in a[:-1] and int(float(a[a.index("--prompt-batch") + 1])) > pb_cap:
+                a[a.index("--prompt-batch") + 1] = str(pb_cap)
             if "DS41_VRAM_MARGIN" not in os.environ:
-                os.environ["DS41_VRAM_MARGIN"] = "2"
+                os.environ["DS41_VRAM_MARGIN"] = vm
             # their experts outgrow the 140 GiB arena (UD-Q2_K_XL: ~177 GiB): on 192 GB of RAM the arena goes to
             # 158 GiB with 20 GiB kept back instead of 28 (round 294: half the file tier, +2% +- 1.9%; ran clean on an
             # idle PC - other programs get ~8 GB).  Only where it is larger than the usual arena; DS41_ARENA_GIB /
-            # DS41_RAM_RESERVE_GIB still win.
-            if "DS41_ARENA_GIB" not in os.environ and "DS41_RAM_RESERVE_GIB" not in os.environ and "--arena-gib" in a[:-1]:
+            # DS41_RAM_RESERVE_GIB still win.  192 GB-class PCs only: below that the usual 28 GiB reserve stays.
+            if total_ram_gib() >= 170 and "DS41_ARENA_GIB" not in os.environ and "DS41_RAM_RESERVE_GIB" not in os.environ and "--arena-gib" in a[:-1]:
                 i = a.index("--arena-gib")
                 bigger = min(BIG_ARENA_CAP_GIB, int(total_ram_gib() - BIG_RAM_RESERVE_GIB))
                 if bigger > float(a[i + 1]):
@@ -211,10 +222,33 @@ def expand(cfg):
                     names.append(f"arena {bigger:g} GiB")
             print(f"ds41_local: {os.path.basename(os.environ['DS41_GGUF'])} has "
                   f"{', '.join(n for n in names if not n.startswith('arena'))} experts (bigger than the "
-                  f"default's): prompt batch 4096, 2 GiB of VRAM kept free" +
+                  f"default's): prompt batch {pb_cap}, {os.environ['DS41_VRAM_MARGIN']} GiB of VRAM kept free" +
                   "".join(f", {n}" for n in names if n.startswith("arena")))
+        else:
+            # experts a little over the usual arena (Unsloth UD-IQ2_XXS: 146 GiB vs 140): on 192 GB the arena covers
+            # them all, up to 150 GiB with 20 GiB kept back (rounds 302b / 307: +2.5%, the file tier gone)
+            # only split files (Unsloth's): ds4 Q2's 142.4 GiB at 147 measured -2.6% vs 140 (round 308: 39.68 vs 40.72) -
+            # its residency changes the text it writes, which drafts worse
+            eg = gguf_head.expert_gib(os.environ["DS41_GGUF"]) if "-00001-of-" in os.path.basename(os.environ["DS41_GGUF"]) else None
+            if eg and total_ram_gib() >= 170 and "DS41_ARENA_GIB" not in os.environ and "DS41_RAM_RESERVE_GIB" not in os.environ                     and "--arena-gib" in a[:-1] and eg > float(a[a.index("--arena-gib") + 1]):
+                i = a.index("--arena-gib")
+                cover = min(150, math.ceil(eg) + 4, int(total_ram_gib() - BIG_RAM_RESERVE_GIB))
+                if cover > float(a[i + 1]):
+                    a[i + 1] = f"{cover:g}"
+                    print(f"ds41_local: {os.path.basename(os.environ['DS41_GGUF'])}'s experts are {eg:.1f} GiB: "
+                          f"arena {cover:g} GiB")
+        # Unsloth UD-IQ2_XXS: the dense half re-quantized to q5_K instead of q6_K - round 304: +1.2% at greedy, the same
+        # agreement with DeepSeek's API (91.07 / 94.50 vs 90.80 / 94.38%).  Only when the config's q6_K is in force.
+        if "UD-IQ2_XXS" in os.path.basename(os.environ["DS41_GGUF"]) and os.environ.get("STRATA_DENSE_REQUANT", "q6_K") == "q6_K":
+            ENGINE_ENV["STRATA_DENSE_REQUANT"] = "q5_K"
     except Exception as e:
         print(f"ds41_local: expert-type check skipped ({e})")
+    # STRATA_CHUNK_CPU (Start DeepSeek.bat: 3) helps short prompts only with every expert in RAM: on 96 / 64 GB the CPU pool
+    # also serves the file tier and prompts read ~3.5% slower at k=3 (B2's lowk, 11-03) - off below 192 GB-class RAM
+    if total_ram_gib() < 170 and os.environ.get("STRATA_CHUNK_CPU", "") not in ("", "0"):
+        ENGINE_ENV["STRATA_CHUNK_CPU"] = "0"
+    if ENGINE_ENV:
+        out["env"] = {**(out.get("env") or {}), **ENGINE_ENV}
     # DS41_GPU (ds41-paths.bat: the card with the most VRAM unless set): the server starts the engine on the config's
     # "gpu" (it sets CUDA_VISIBLE_DEVICES from it, nvidia-smi's numbering), not on the launcher's environment
     g = os.environ.get("DS41_GPU", "").strip()
@@ -353,7 +387,7 @@ def main():
     # on the model that runs better there
     if total_ram_gib() < 102 and os.path.basename(model) in ("DeepSeek-V4.1-Flash-1017-Q2.gguf", "ds4-q2-slim.gguf"):
         print("ds41_local: tip - with this much RAM, Unsloth's UD-IQ1_S writes faster than the default (measured 30 / 25.5 "
-              "vs 22 / 16 tok/s at 96 / 64 GB; 89.3 vs 91.5% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
+              "vs 27 / 20 tok/s at 96 / 64 GB; 89.3 vs 91.5% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
     if cfg.get("vision"):
         print(f"ds41_local: pictures on ({'on the GPU' if cfg['vision']['gpu'] else 'on the CPU'})")
     for p in missing:

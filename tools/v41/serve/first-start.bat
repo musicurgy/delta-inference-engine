@@ -26,11 +26,15 @@ set "CCMIN="
 for /f "tokens=1,2 delims=. " %%a in ('nvidia-smi --query-gpu^=compute_cap --format^=csv^,noheader -i %DS41_GPU% 2^>nul') do if not defined CCMAJ (set "CCMAJ=%%a" & set "CCMIN=%%b")
 set "CC="
 echo %CCMAJ%.%CCMIN%| findstr /r "^[0-9][0-9]*\.[0-9][0-9]*$" >nul && set /a CC=CCMAJ*10+CCMIN
-if defined CC if %CC% LSS 75 goto oldgpu
+rem (no "if defined CC if %CC% ..." on one line: %CC% expands before "defined" is tested, and empty it aborts the script)
+if not defined CC goto ccok
+if %CC% LSS 75 goto oldgpu
+:ccok
 rem the engine is built with CUDA 13, which needs driver 580 or newer (an older one fails later with a CUDA error)
 set "DRV="
 for /f "tokens=1 delims=." %%v in ('nvidia-smi --query-gpu^=driver_version --format^=csv^,noheader 2^>nul') do if not defined DRV set "DRV=%%v"
-if defined DRV if %DRV% LSS 580 (
+set /a DRVN=DRV+0 2>nul
+if defined DRV if %DRVN% LSS 580 (
   echo The NVIDIA driver is version %DRV%; this needs 580 or newer ^(CUDA 13^). Update it, then start again:
   echo   https://www.nvidia.com/Download/index.aspx
   exit /b 1
@@ -162,8 +166,12 @@ if not exist "%M%\tokenizer\vocab.json" (
 rem the drafter: not used under 14 GB of VRAM (Start DeepSeek.bat runs without it there), so not set up there either
 set "VRAM_MIB="
 for /f "tokens=1" %%m in ('nvidia-smi --query-gpu^=memory.total --format^=csv^,noheader^,nounits -i %DS41_GPU% 2^>nul') do if not defined VRAM_MIB set "VRAM_MIB=%%m"
+rem numeric copies that always exist (an empty %X% in an if-comparison aborts the script); a VRAM answer that is not
+rem a number ("[N/A]", "No devices were found") counts as unknown, not as 0 MiB
+echo %VRAM_MIB%| findstr /r "^[0-9][0-9]*$" >nul || set "VRAM_MIB="
+set /a VRAMN=VRAM_MIB+0 2>nul
 set "DS41_NO_DRAFTER="
-if defined VRAM_MIB if %VRAM_MIB% LSS 14000 set "DS41_NO_DRAFTER=1"
+if defined VRAM_MIB if %VRAMN% LSS 14000 set "DS41_NO_DRAFTER=1"
 set "NEEDDRAFT="
 if not defined DS41_NO_DRAFTER if not exist "%M%\V41-1017-MTP-iq2xxs.gguf" (
   set "NEEDDRAFT=1"
@@ -180,17 +188,18 @@ if defined NEEDVIS if exist "%M%\DeepSeek-V4.1-Flash-1017-Vision.gguf.ok" ".venv
 if defined NEEDVIS echo   missing: pictures ^(the vision encoder, 0.97 GB, and PyTorch, 124 MB^)
 if not defined NEED if not defined NEEDDRAFT if not defined NEEDVIS exit /b 0
 rem what the README asks for, said before any download (the launcher's own notes come only once all is there)
-if defined VRAM_MIB if %VRAM_MIB% LSS 11800 echo   Note: this card has %VRAM_MIB% MiB of VRAM. Under 12 GB is untested: the model may not fit on it.
+if defined VRAM_MIB if %VRAMN% LSS 11800 echo   Note: this card has %VRAM_MIB% MiB of VRAM. Under 12 GB is untested: the model may not fit on it.
 set "RAM_GB="
 for /f "usebackq" %%r in (`".venv\Scripts\python.exe" tools\v41\serve\cpu_level.py --ram-gb`) do set "RAM_GB=%%r"
-if defined RAM_GB if %RAM_GB% LSS 120 echo   Note: this PC has %RAM_GB% GB of RAM; DeepSeek needs 128 GB or more ^(README.md, "What you need"^).
-if defined RAM_GB if %RAM_GB% LSS 120 if %RAM_GB% GEQ 56 echo         With less it runs, but the experts that do not fit are read from the SSD on every token: measured on an RTX 3090 the default writes ~22 tok/s at 96 GB, ~16 at 64 GB.
-if defined RAM_GB if %RAM_GB% LSS 56 echo         With this little it will probably not start at all.
-rem under 110 GB: offer Unsloth's UD-IQ1_S instead of the default (rounds 227 / 225: 30 / 25.5 vs 22 / 16 tok/s)
-if defined NEEDMAIN if defined RAM_GB if %RAM_GB% LSS 110 if %RAM_GB% GEQ 56 (
+set /a RAMN=RAM_GB+0 2>nul
+if defined RAM_GB if %RAMN% LSS 120 echo   Note: this PC has %RAM_GB% GB of RAM; DeepSeek needs 128 GB or more ^(README.md, "What you need"^).
+if defined RAM_GB if %RAMN% LSS 120 if %RAMN% GEQ 56 echo         With less it runs, but the experts that do not fit are read from the SSD on every token: measured on an RTX 3090 the default writes ~27 tok/s at 96 GB, ~20 at 64 GB.
+if defined RAM_GB if %RAMN% LSS 56 echo         With this little it will probably not start at all.
+rem under 110 GB: offer Unsloth's UD-IQ1_S instead of the default (rounds 227 / 225: 30 / 25.5 vs 27 / 20 tok/s)
+if defined NEEDMAIN if defined RAM_GB if %RAMN% LSS 110 if %RAMN% GEQ 56 (
   echo.
   echo   With %RAM_GB% GB of RAM, Unsloth's UD-IQ1_S is the better model for this PC: measured on an RTX 3090 it
-  echo   writes 30 / 25.5 tok/s at 96 / 64 GB, the default 22 / 16, and agrees with DeepSeek's API 89.3%% of the
+  echo   writes 30 / 25.5 tok/s at 96 / 64 GB, the default 27 / 20, and agrees with DeepSeek's API 89.3%% of the
   echo   time against the default's 91.5%%.  It is a 233 GB download ^(the default: ~375 GB^).
   choice /c YN /m "Download UD-IQ1_S instead of the default"
   if not errorlevel 2 (
@@ -198,13 +207,14 @@ if defined NEEDMAIN if defined RAM_GB if %RAM_GB% LSS 110 if %RAM_GB% GEQ 56 (
     set "NEEDMAIN="
   )
 )
-rem 180 GB and up: Unsloth's UD-IQ2_XXS is the default for this PC (0.93, round 290b: as fast as the ds4 Q2 GGUF at the
-rem shipped sampling, 37.3 vs 37.6 tok/s on an RTX 3090 + 192 GB; agrees more, 92.5 / 95.9%% vs 91.5 / 93.0%%; 301 GB)
-if defined NEEDMAIN if defined RAM_GB if %RAM_GB% GEQ 180 (
+rem 180 GB and up: Unsloth's UD-IQ2_XXS is the default for this PC (0.93's final cards on an RTX 3090 + 192 GB: about as
+rem fast as the ds4 Q2 GGUF, 40.5 vs 40.0 tok/s greedy, 38.4 vs 39.7 sampled; agrees more, 92.5 / 95.9%% vs 91.5 / 93.0%%; 301 GB)
+if defined NEEDMAIN if defined RAM_GB if %RAMN% GEQ 180 (
   echo.
   echo   With %RAM_GB% GB of RAM, Unsloth's UD-IQ2_XXS is the default for this PC: measured on an RTX 3090 it writes
-  echo   as fast as the ds4 Q2 GGUF ^(37.3 vs 37.6 tok/s^), agrees with DeepSeek's API more often ^(92.5%% vs 91.5%%;
-  echo   95.9%% vs 93.0%% on code and maths^) and is a 301 GB download ^(the ds4 Q2 GGUF: ~375 GB^).  N keeps the ds4 Q2.
+  echo   about as fast as the ds4 Q2 GGUF ^(40.5 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the default sampling^), agrees
+  echo   with DeepSeek's API more often ^(92.5%% vs 91.5%%; 95.9%% vs 93.0%% on code and maths^) and is a 301 GB
+  echo   download ^(the ds4 Q2 GGUF: ~375 GB^).  N keeps the ds4 Q2.
   choice /c YN /m "Download UD-IQ2_XXS (recommended)"
   if not errorlevel 2 (
     ".venv\Scripts\python.exe" tools\v41\serve\pick_model.py --get UD-IQ2_XXS || exit /b 1

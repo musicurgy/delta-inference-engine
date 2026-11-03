@@ -400,6 +400,13 @@ def _op_feed_ds41(self, delta: str):
 
 
 def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reason=...)
+    if (a[0] if a else k.get("reason")) not in (None, "stop") and self.state in ("content", "call", "json"):
+        # upstream #106: the turn was cut (max_tokens, a cancel, an error) inside DSML - `<｜DSML｜ inv` before a call,
+        # a call without its end, or `</｜DSML｜ calls` after a whole one.  None of it is text the model meant, and as
+        # content it reached clients as DSML in the answer (an agent read it as the answer).  What is held here is only
+        # ever a tag that may still be arriving or an unfinished call (never streamed: stream_tools is off), so a cut
+        # drops nothing else; a natural stop keeps it as text, as before.
+        self.dsml_hold, self.buf = "", ""
     out = _op_feed(self, _strip_wrappers(self, "", True)) if self.dsml_hold else []
     out = _drop_wrap_echo(self, out + _op_finish(self, *a, **k))
     if self.echo_hold:                 # ended while matching: the whole sentence = the echo, a part of it = real text
