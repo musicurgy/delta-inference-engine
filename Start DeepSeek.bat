@@ -62,15 +62,17 @@ rem            drafter - its 2.4 GB of weights cost more expert cache than draft
 rem   under 12 GB: probably does not fit (the dense half, KV and buffers need ~9 GB)
 set "VRAM_MIB="
 for /f "tokens=1" %%m in ('nvidia-smi --query-gpu^=memory.total --format^=csv^,noheader^,nounits -i %DS41_GPU% 2^>nul') do set "VRAM_MIB=%%m"
-if defined VRAM_MIB if %VRAM_MIB% LSS 20000 set STRATA_ARENA_PIN_GIB=48
+rem a numeric copy that always exists (an empty %VRAM_MIB% in an if-comparison aborts the script)
+set /a VRAMN=VRAM_MIB+0 2>nul
+if defined VRAM_MIB if %VRAMN% LSS 20000 set STRATA_ARENA_PIN_GIB=48
 set "SMALLCARD="
-if defined VRAM_MIB if %VRAM_MIB% LSS 14000 set "SMALLCARD=1"
+if defined VRAM_MIB if %VRAMN% LSS 14000 set "SMALLCARD=1"
 if defined SMALLCARD (
   echo This card has %VRAM_MIB% MiB of VRAM: running without the DSpark drafter and the pinned RAM ^(they need room it lacks^).
   set STRATA_SERVE_DSPARK=
   set STRATA_ARENA_PIN_GIB=1
 )
-if defined VRAM_MIB if %VRAM_MIB% LSS 11800 echo Under 12 GB of VRAM is untested: the model may not fit on this card.
+if defined VRAM_MIB if %VRAMN% LSS 11800 echo Under 12 GB of VRAM is untested: the model may not fit on this card.
 rem (no ( ... ) block around a line that prints a path: a ")" in the folder's name, "...-main (1)", would end the block)
 if not defined SMALLCARD if not defined STRATA_SERVE_DSPARK echo No DSpark drafter at %DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf - running without it, slower. See README.md.
 set STRATA_DSPARK_KEEP=tools/v41/serve/dspark_expert_counts.txt:64

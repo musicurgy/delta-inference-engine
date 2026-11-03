@@ -6,7 +6,8 @@ Lists the models in the model folder (DS41_MODELS, ds41-paths.bat) and the ones 
   * ISTA-DASLab's GSQ-RCO quants (IQ2_XS / IQ2_XXS / IQ1_M), built here from their files by
     tools/v41/gsq_stream_merge.py - they read their Engram from the ds4 Q2 GGUF, so that file stays;
   * Unsloth's quants (UD-IQ1_S ... UD-Q8_K_XL), downloaded into unsloth/<quant>/ as they are (every file SHA-256
-    checked).  Their files carry their own Engram tables (IQ4_NL up to UD-IQ3_S - measured as good as DeepSeek's exact
+    checked).  Their files carry their own Engram tables (IQ4_NL / Q5_K - UD-IQ3_XXS's Q6_K ones are not read, it uses
+    the default's -, measured as good as DeepSeek's exact
     FP8 tables on UD-IQ1_S -, exact from UD-Q3_K_XL), which the launcher reads (ds41_local.py).
   * the quality mode: bertholomus' EXL3 2.5 bpw routed experts (exllamav3's trellis format) on the default's dense layers
     and Engram, downloaded as they are into exl3/<repo name>/ (every shard SHA-256 checked); the launcher gives the
@@ -49,13 +50,13 @@ UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreemen
     "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
     "UD-IQ2_XXS": (301, "37 / - / - / -", "92.5%", "Q5_K"),    # round 266b: 36.8 tok/s, 92.5% / 95.9% (code + maths)
     "UD-Q2_K_XL": (335, "32 / - / - / -", "95.0%", "Q5_K"),    # round 267: 32.2 tok/s, 95.0% / 96.8% - the quality pick
-    "UD-IQ3_XXS": (395, "-", "-", "IQ4_NL"),
+    "UD-IQ3_XXS": (395, "-", "-", "the default's"),   # its own tables are Q6_K, not read: it needs the default's
     "UD-IQ3_S": (424, "-", "-", "IQ4_NL"),
     "UD-Q3_K_XL": (485, "-", "-", "exact"),
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
     "UD-Q8_K_XL": (508, "-", "-", "exact"),
 }
-TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ2_XXS": " (192 GB pick)"}   # the picks the menu text below explains
+TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ2_XXS": " (192 GB)"}   # the picks the menu text below explains
 EXL3 = {   # folder in exl3/ -> name, GB to download, speed, agreement, Hugging Face repo
     "DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw": ("EXL3 2.5 bpw", 185, "25 / - / - / -", "94.4%",
                                              "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw"),   # round 238
@@ -78,7 +79,7 @@ def ram_gb():
                     ("tvirt", ctypes.c_ulonglong), ("avirt", ctypes.c_ulonglong), ("aext", ctypes.c_ulonglong)]
     m = MS()
     m.len = ctypes.sizeof(MS)
-    return round(m.total / GB) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
+    return round(m.total / 2**30) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
 
 
 def models_dir():
@@ -166,8 +167,8 @@ def get(q):
     if not f:
         gb = UNSLOTH_Q[q][0]
         free = shutil.disk_usage(m).free
-        if free < (gb + 5) * GB:
-            sys.exit(f"Not enough space for Unsloth {q}: it needs ~{gb + 5} GB free in {m}, there are {free / GB:.0f} GB.")
+        if free < (gb + 20) * GB:   # + the drafter, which the first start sets up next (~16 GB at its peak)
+            sys.exit(f"Not enough space for Unsloth {q}: it needs ~{gb + 20} GB free in {m}, there are {free / GB:.0f} GB.")
         print(f"Downloading Unsloth {q} (~{gb} GB) into {os.path.join(m, 'unsloth', q)} - if it stops, start again: it resumes.")
         download_unsloth(m, q)
         f = unsloth_first(m, q)
@@ -246,7 +247,7 @@ def main():
     print("  95.9% on code + maths against the default's 91.5 / 93.0%), from 65 GB less disk; Unsloth UD-Q2_K_XL is the")
     print("  quality pick (32 tok/s, 95.0% / 96.8%) - it agrees more than EXL3 2.5 bpw and writes 27% faster.  With less")
     print("  RAM a smaller file writes faster (more of it fits; the rest is read from the SSD on every token): under")
-    print("  110 GB, Unsloth UD-IQ1_S, 30 / 25.5 tok/s at 96 / 64 GB against the default's 22 / 16, one point lower")
+    print("  110 GB, Unsloth UD-IQ1_S, 30 / 25.5 tok/s at 96 / 64 GB against the default's 27 / 20, one point lower")
     print("  agreement.  (Measured on an RTX 3090.)\n")
     if not menu:
         sys.exit("No model yet - run Start DeepSeek.bat first: it downloads the default one.")
@@ -281,6 +282,9 @@ def main():
             sys.exit("The download finished but a shard is not checked - nothing changed.")
     elif kind == "download":
         gb = UNSLOTH_Q[f][0]
+        if UNSLOTH_Q[f][3] == "the default's" and base is None:
+            sys.exit(f"Unsloth {f} reads its Engram tables from the default (ds4 Q2 GGUF), which is not in {m}: "
+                     "download the default first - nothing changed.")
         free = shutil.disk_usage(m).free
         if free < (gb + 5) * GB:
             sys.exit(f"Not enough space for Unsloth {f}: it needs ~{gb + 5} GB free in {m}, there are {free / GB:.0f} GB.")

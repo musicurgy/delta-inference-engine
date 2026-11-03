@@ -186,6 +186,10 @@ def expand(cfg):
                 except ValueError:
                     sys.exit(f"ds41_local: DS41_ROUTE_BIAS={rb!r} is not a number (ds41-paths.bat)")
                 a[i + 1] = rb
+                # 0 means exact routing: the prompt path's own bias (--route-bias-file) goes to 0 as well
+                if float(rb) == 0 and "--route-bias-file" in a[:-1]:
+                    a[a.index("--route-bias-file") + 1] = "0"
+                    print("ds41_local: DS41_ROUTE_BIAS=0 - exact routing (--route-bias 0, --route-bias-file 0)")
     x3 = os.environ.get("DS41_EXL3", "").strip().replace("\\", "/")
     if x3 and "--exl3" not in a:
         a += ["--exl3", x3]
@@ -206,8 +210,8 @@ def expand(cfg):
             # their experts outgrow the 140 GiB arena (UD-Q2_K_XL: ~177 GiB): on 192 GB of RAM the arena goes to
             # 158 GiB with 20 GiB kept back instead of 28 (round 294: half the file tier, +2% +- 1.9%; ran clean on an
             # idle PC - other programs get ~8 GB).  Only where it is larger than the usual arena; DS41_ARENA_GIB /
-            # DS41_RAM_RESERVE_GIB still win.
-            if "DS41_ARENA_GIB" not in os.environ and "DS41_RAM_RESERVE_GIB" not in os.environ and "--arena-gib" in a[:-1]:
+            # DS41_RAM_RESERVE_GIB still win.  192 GB-class PCs only: below that the usual 28 GiB reserve stays.
+            if total_ram_gib() >= 170 and "DS41_ARENA_GIB" not in os.environ and "DS41_RAM_RESERVE_GIB" not in os.environ and "--arena-gib" in a[:-1]:
                 i = a.index("--arena-gib")
                 bigger = min(BIG_ARENA_CAP_GIB, int(total_ram_gib() - BIG_RAM_RESERVE_GIB))
                 if bigger > float(a[i + 1]):
@@ -380,7 +384,7 @@ def main():
     # on the model that runs better there
     if total_ram_gib() < 102 and os.path.basename(model) in ("DeepSeek-V4.1-Flash-1017-Q2.gguf", "ds4-q2-slim.gguf"):
         print("ds41_local: tip - with this much RAM, Unsloth's UD-IQ1_S writes faster than the default (measured 30 / 25.5 "
-              "vs 22 / 16 tok/s at 96 / 64 GB; 89.3 vs 91.5% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
+              "vs 27 / 20 tok/s at 96 / 64 GB; 89.3 vs 91.5% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
     if cfg.get("vision"):
         print(f"ds41_local: pictures on ({'on the GPU' if cfg['vision']['gpu'] else 'on the CPU'})")
     for p in missing:
