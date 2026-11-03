@@ -203,10 +203,13 @@ def expand(cfg):
         ex = {v for k, v in gguf_head.tensor_types(os.environ["DS41_GGUF"]).items() if "_exps" in k or "experts" in k}
         if ex & big:
             names = sorted(gguf_head.GGML_TYPE_NAMES.get(t, str(t)) for t in ex & big)
-            if "--prompt-batch" in a[:-1] and int(float(a[a.index("--prompt-batch") + 1])) > 4096:
-                a[a.index("--prompt-batch") + 1] = "4096"
+            # UD-IQ3_XXS (the largest menu file): prompt batch 2048 and 3 GiB free - its first card at 4096 / 2 ran out
+            # of VRAM in the prompt path (round 295); 2048 / 3 ran clean at 27.8 tok/s (round 311c)
+            pb_cap, vm = (2048, "3") if "UD-IQ3_XXS" in os.path.basename(os.environ["DS41_GGUF"]) else (4096, "2")
+            if "--prompt-batch" in a[:-1] and int(float(a[a.index("--prompt-batch") + 1])) > pb_cap:
+                a[a.index("--prompt-batch") + 1] = str(pb_cap)
             if "DS41_VRAM_MARGIN" not in os.environ:
-                os.environ["DS41_VRAM_MARGIN"] = "2"
+                os.environ["DS41_VRAM_MARGIN"] = vm
             # their experts outgrow the 140 GiB arena (UD-Q2_K_XL: ~177 GiB): on 192 GB of RAM the arena goes to
             # 158 GiB with 20 GiB kept back instead of 28 (round 294: half the file tier, +2% +- 1.9%; ran clean on an
             # idle PC - other programs get ~8 GB).  Only where it is larger than the usual arena; DS41_ARENA_GIB /
@@ -219,7 +222,7 @@ def expand(cfg):
                     names.append(f"arena {bigger:g} GiB")
             print(f"ds41_local: {os.path.basename(os.environ['DS41_GGUF'])} has "
                   f"{', '.join(n for n in names if not n.startswith('arena'))} experts (bigger than the "
-                  f"default's): prompt batch 4096, 2 GiB of VRAM kept free" +
+                  f"default's): prompt batch {pb_cap}, {os.environ['DS41_VRAM_MARGIN']} GiB of VRAM kept free" +
                   "".join(f", {n}" for n in names if n.startswith("arena")))
         else:
             # experts a little over the usual arena (Unsloth UD-IQ2_XXS: 146 GiB vs 140): on 192 GB the arena covers

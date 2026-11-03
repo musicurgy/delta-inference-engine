@@ -50,7 +50,7 @@ UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreemen
     "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
     "UD-IQ2_XXS": (301, "37 / - / - / -", "92.5%", "Q5_K"),    # round 266b: 36.8 tok/s, 92.5% / 95.9% (code + maths)
     "UD-Q2_K_XL": (335, "32 / - / - / -", "95.0%", "Q5_K"),    # round 267: 32.2 tok/s, 95.0% / 96.8% - the quality pick
-    "UD-IQ3_XXS": (395, "-", "-", "the default's"),   # its own tables are Q6_K, not read: it needs the default's
+    "UD-IQ3_XXS": (395, "28 / - / - / -", "95.5%", "the default's"),   # rounds 295 / 311c: 27.8 tok/s, 95.5% / 97.6%; its Q6_K Engram tables are not read (the default's)
     "UD-IQ3_S": (424, "-", "-", "IQ4_NL"),
     "UD-Q3_K_XL": (485, "-", "-", "exact"),
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
