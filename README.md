@@ -51,23 +51,23 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
 
 These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 
-| | 192 GB RAM | 128 GB RAM |
+| ds4 Q2 GGUF | 192 GB RAM | 128 GB RAM |
 |---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **41 tok/s** | **36 tok/s** |
-| Writing, the default sampling (temperature 1, top-p 0.95) | **38 tok/s** | - |
+| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **40 tok/s** | **36 tok/s** |
+| Writing, the default sampling (temperature 1, top-p 0.95) | **40 tok/s** | - |
 | Reading a long prompt (25-64k tokens) | **610 tok/s** | **410 tok/s** |
 
 The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  Greedy means temperature 0 in the
 request; the default sampling is what a client gets when it sends no temperature.  Sampling accepts fewer of the
-drafter's guesses, so it writes ~7% slower.  0.93 narrowed that gap from ~12%: the drafter's guesses are now
+drafter's guesses, so it writes a little slower (ds4 Q2 40.0 -> 39.7 tok/s, UD-IQ2_XXS 40.5 -> 38.4).  0.93 narrowed
+that gap from ~12%: the drafter's guesses are now
 sampled instead of taken as its top pick (`STRATA_DSPARK_SAMPLE` in `Start DeepSeek.bat`); the answers'
 distribution is unchanged.
 
 **New in 0.93: on 192 GB of RAM the default is Unsloth's UD-IQ2_XXS** (first start offers it on 180 GB or more; the
-ds4 Q2 GGUF stays one answer away).  At the default sampling it writes as fast as the ds4 Q2 GGUF - 37.3 vs 37.6 tok/s,
-the same within ±2% over three seed-varied pairs - and agrees with DeepSeek's own model more often: 92.5% vs 91.5% on
-general text, 95.9% vs 93.0% on code and maths (below: "Other quants").  At greedy (temperature 0) the ds4 Q2 GGUF is
-still ~10% faster.
+ds4 Q2 GGUF stays one answer away).  It writes about as fast as the ds4 Q2 GGUF - 40.5 vs 40.0 tok/s greedy, 38.4 vs
+39.7 at the default sampling - and agrees with DeepSeek's own model more often: 92.5% vs 91.5% on general text, 95.9%
+vs 93.0% on code and maths (below: "Other quants").
 
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
 long prompts, but the output is the same.
@@ -80,7 +80,7 @@ own model:
 
 | Model | Agreement | 192 GB | 128 GB | **96 GB** | **64 GB** |
 |---|---|---|---|---|---|
-| ds4 Q2 (the default) | 91.5% | 41 | 36 | 27 | 20 |
+| ds4 Q2 (the default) | 91.5% | 40 | 36 | 27 | 20 |
 | **Unsloth UD-IQ1_S** | 89.3% | 40 | 37.5 | **30** | **25.5** |
 | GSQ IQ1_M | 85.5% | 42 | 37.5 | **34** | **28** |
 
@@ -199,7 +199,7 @@ pick and saves your choice (`model-choice.txt`); the next start loads it.
   RAM - more than EXL3 2.5 bpw (94.4 / 95.6) and ~28% faster.  On 192 GB the launcher gives files with experts this big a
   158 GiB arena (20 GiB of RAM kept back instead of 28: close other big programs).  **The 192 GB default: Unsloth
   UD-IQ2_XXS** (301 GB): 92.5% / 95.9% - a point more than the ds4 Q2 GGUF on general text and three more on code and
-  maths - and as fast at the default sampling (37.3 vs 37.6 tok/s); 10% slower at greedy.
+  maths - and about as fast (40.5 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the default sampling).
   Both measured on revision 60ad3651 (Unsloth's Dynamic V3.1 files of 10-30), the one Choose Model downloads, with
   the default model's exact FP8 Engram tables.  They carry their own (Q5_K, in the last file), which the engine reads:
   as good as the FP8 ones (UD-IQ2_XXS 93.1 vs 92.9% top-1, the same speed), so they need no other file.
@@ -218,12 +218,12 @@ Measured here, exact routing, top-1 agreement with DeepSeek's own model (teacher
 
 | | download | general | code + maths | writing, 192 / 128 GB RAM | notes |
 |---|---|---|---|---|---|
-| default (ds4 Q2) | 366 GB | 91.5% | 93.0% | 41 / 36 tok/s | DeepSeek's exact Engram tables |
+| default (ds4 Q2) | 366 GB | 91.5% | 93.0% | 40 / 36 tok/s | DeepSeek's exact Engram tables |
 | GSQ IQ2_XS | 159 GB + the default | 90.0% | 92.9% | 38 / 26 tok/s | answered our task questions as well as the default |
 | GSQ IQ2_XXS | 142 GB + the default | 87.8% | 89.5% | 41 / 32 tok/s | fewer knowledge questions right; long prompts slower |
 | GSQ IQ1_M | 125 GB + the default | 85.5% | - | 42 / 37.5 tok/s | long prompts slower (no fast prompt kernel for IQ1_M) |
 | Unsloth UD-IQ1_S | 233 GB | 89.3% | 91.1% | 40 / **37.5** tok/s | the pick under 110 GB: IQ1_M's speed, 4 points more agreement |
-| **Unsloth UD-IQ2_XXS** (the 192 GB default) | 301 GB | **92.5%** | **95.9%** | 37 / - tok/s | +1 point general, +3 on code and maths; as fast as ds4 Q2 at the default sampling, 10% slower at greedy |
+| **Unsloth UD-IQ2_XXS** (the 192 GB default) | 301 GB | **92.5%** | **95.9%** | 40.5 / 34 tok/s | +1 point general, +3 on code and maths; about as fast as ds4 Q2 (38.4 vs 39.7 at the default sampling) |
 | **Unsloth UD-Q2_K_XL** (the quality mode) | 335 GB | **95.0%** | **96.8%** | 32 / - tok/s | agrees best of everything measured here; ~28% faster than EXL3 2.5 |
 | Unsloth UD-IQ1_M, UD-IQ3_XXS ... UD-Q8_K_XL | 250-508 GB | - | - | - | load and run (every expert type checked on real weights); not measured |
 | EXL3 2.5 bpw | 185 GB + the default | 94.4% | 95.6% | 25 / - tok/s | below UD-Q2_K_XL on both counts; 192 GB of RAM and an internal NVMe |
