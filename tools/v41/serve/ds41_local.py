@@ -220,7 +220,9 @@ def expand(cfg):
         else:
             # experts a little over the usual arena (Unsloth UD-IQ2_XXS: 146 GiB vs 140): on 192 GB the arena covers
             # them all, up to 150 GiB with 20 GiB kept back (rounds 302b / 307: +2.5%, the file tier gone)
-            eg = gguf_head.expert_gib(os.environ["DS41_GGUF"])
+            # only split files (Unsloth's): ds4 Q2's 142.4 GiB at 147 measured -2.6% vs 140 (round 308: 39.68 vs 40.72) -
+            # its residency changes the text it writes, which drafts worse
+            eg = gguf_head.expert_gib(os.environ["DS41_GGUF"]) if "-00001-of-" in os.path.basename(os.environ["DS41_GGUF"]) else None
             if eg and "DS41_ARENA_GIB" not in os.environ and "DS41_RAM_RESERVE_GIB" not in os.environ                     and "--arena-gib" in a[:-1] and eg > float(a[a.index("--arena-gib") + 1]):
                 i = a.index("--arena-gib")
                 cover = min(150, math.ceil(eg) + 4, int(total_ram_gib() - BIG_RAM_RESERVE_GIB))
