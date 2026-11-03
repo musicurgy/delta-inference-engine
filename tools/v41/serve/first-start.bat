@@ -208,11 +208,11 @@ if defined NEEDMAIN if defined RAM_GB if %RAMN% LSS 110 if %RAMN% GEQ 56 (
   )
 )
 rem 180 GB and up: Unsloth's UD-IQ2_XXS is the default for this PC (0.93's final cards on an RTX 3090 + 192 GB: about as
-rem fast as the ds4 Q2 GGUF, 40.5 vs 40.0 tok/s greedy, 38.4 vs 39.7 sampled; agrees more, 92.5 / 95.9%% vs 91.5 / 93.0%%; 301 GB)
+rem fast as the ds4 Q2 GGUF, 40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 sampled; agrees more, 92.5 / 95.9%% vs 91.5 / 93.0%%; 301 GB)
 if defined NEEDMAIN if defined RAM_GB if %RAMN% GEQ 180 (
   echo.
   echo   With %RAM_GB% GB of RAM, Unsloth's UD-IQ2_XXS is the default for this PC: measured on an RTX 3090 it writes
-  echo   about as fast as the ds4 Q2 GGUF ^(40.5 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the default sampling^), agrees
+  echo   about as fast as the ds4 Q2 GGUF ^(40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the default sampling^), agrees
   echo   with DeepSeek's API more often ^(92.5%% vs 91.5%%; 95.9%% vs 93.0%% on code and maths^) and is a 301 GB
   echo   download ^(the ds4 Q2 GGUF: ~375 GB^).  N keeps the ds4 Q2.
   choice /c YN /m "Download UD-IQ2_XXS (recommended)"
