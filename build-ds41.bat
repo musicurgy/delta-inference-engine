@@ -38,7 +38,18 @@ if not exist "%LLAMA%\ggml\CMakeLists.txt" (
   rem core.longpaths: llama.cpp has ~150-character paths (tools\ui), past Windows' 260 under a deep folder
   git clone -q -c core.autocrlf=false -c core.longpaths=true https://github.com/ggml-org/llama.cpp.git "%LLAMA%" || exit /b 1
   git -C "%LLAMA%" -c core.autocrlf=false -c core.longpaths=true checkout -q %PIN% || exit /b 1
-  git -C "%LLAMA%" apply "%ROOT%tools\xolotl\ggml\xolotl-ggml.patch" || exit /b 1
+)
+rem third_party\llama.cpp\.xolotl-patch holds the pin + the patch's hash it was built from: when either changes (an
+rem update brought new hunks), the checkout goes back to the clean pin and the current patch is applied again
+set "PATCH=%ROOT%tools\xolotl\ggml\xolotl-ggml.patch"
+for /f %%h in ('git hash-object "%PATCH%"') do set "PHASH=%%h"
+set "STAMP="
+if exist "%LLAMA%\.xolotl-patch" set /p STAMP=<"%LLAMA%\.xolotl-patch"
+if not "%STAMP%"=="%PIN% %PHASH%" (
+  git -C "%LLAMA%" -c core.autocrlf=false -c core.longpaths=true checkout -q -f %PIN% || exit /b 1
+  git -C "%LLAMA%" clean -q -f -d || exit /b 1
+  git -C "%LLAMA%" apply "%PATCH%" || exit /b 1
+  >"%LLAMA%\.xolotl-patch" echo %PIN% %PHASH%
   echo llama.cpp %PIN% + xolotl-ggml.patch in third_party\llama.cpp
 )
 rem the GPU's architecture from nvidia-smi (8.6 -> 86).  RTX 50 = 120a, not 120: ggml's MXFP4 kernels use Blackwell's
