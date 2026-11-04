@@ -127,15 +127,26 @@ set STRATA_BIAS_REFRESH=1
 set STRATA_SERVE_KEEP_CACHE=1
 set STRATA_SERVE_KEEP_LRU=1
 set STRATA_SERVE_KEEP_MAX=2048
+set "OPENPAGE=--open"
+:serve
 rem this PC's copy of the config: paths filled in, the RAM arena sized (tools\v41\serve\local\, not in git)
 ".venv\Scripts\python.exe" tools\v41\serve\ds41_local.py tools\v41\serve\ds41-windows.json tools\v41\serve\local\ds41-windows.json
-if errorlevel 1 (
-  pause
-  exit /b 1
-)
+if not errorlevel 1 goto configured
+rem the page's last change cannot start: back to the model that did
+".venv\Scripts\python.exe" tools\v41\serve\setup_panel.py --rollback
+if not errorlevel 1 goto serve
+pause
+exit /b 1
+:configured
 rem the Windows settings that make it faster, if any is off (read only: README.md, "Windows settings for speed")
 ".venv\Scripts\python.exe" tools\v41\serve\windows_tips.py
 rem --open: the chat page opens in the browser once the model is ready (API clients use http://127.0.0.1:8080/v1; the
 rem port is DS41_PORT in ds41-paths.bat)
-".venv\Scripts\python.exe" tools\v41\serve\serve_ds41.py --engine strata --config tools\v41\serve\local\ds41-windows.json --port %DS41_PORT% --open
+".venv\Scripts\python.exe" tools\v41\serve\serve_ds41.py --engine strata --config tools\v41\serve\local\ds41-windows.json --port %DS41_PORT% %OPENPAGE%
+set "SRC=%errorlevel%"
+set "OPENPAGE="
+rem 75: Apply on the chat page's Setup card: the new settings need a new start.  The page waits and comes back by itself.
+if "%SRC%"=="75" goto serve
+".venv\Scripts\python.exe" tools\v41\serve\setup_panel.py --rollback
+if not errorlevel 1 goto serve
 pause

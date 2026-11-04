@@ -46,6 +46,16 @@ ENGINE_ENV = {}
 BIG_ARENA_CAP_GIB, BIG_RAM_RESERVE_GIB = 158, 20.0   # files with bigger experts (below: round 294)
 
 
+def page_settings():
+    """delta-settings.json: the chat page's Setup card (setup_panel.py)"""
+    try:
+        with open(os.path.join(ROOT, "delta-settings.json"), encoding="utf-8") as f:
+            s = json.load(f)
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def total_ram_gib():
     if os.name == "nt":
         class MS(ctypes.Structure):
@@ -178,6 +188,10 @@ def expand(cfg):
     # high-agreement setting: 91.8 / 92.8% next-token agreement with DeepSeek's API vs 90.2 / 92.4% at 0.28, for about
     # 18% of writing speed at 192 GB and 12-26% on 96 / 64 GB PCs - rounds 249, 250d, 250e, 250g, 2026-10-30 / 31)
     rb = os.environ.get("DS41_ROUTE_BIAS", "").strip()
+    if not rb:      # the chat page's Setup card: Fast (the config's), Balanced, Most exact
+        rb = {"balanced": "0.10", "exact": "0"}.get(page_settings().get("mode"), "")
+        if rb == "0":
+            print("ds41_local: Setup card: most exact")
     for i, x in enumerate(a[:-1]):
         if x == "--route-bias":
             if rb:
@@ -263,12 +277,42 @@ def expand(cfg):
             a[a.index("--vram-margin") + 1] = f"{margin:g}"
         else:
             a += ["--vram-margin", f"{margin:g}"]
+    # the chat page's multi-GPU switch: the helper on the second card (serve_ds41.py starts it beside the engine)
+    plan = helper_plan(out, a)
+    hf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local", "helper.json")
+    if plan:
+        os.makedirs(os.path.dirname(hf), exist_ok=True)
+        with open(hf, "w", encoding="utf-8") as f:
+            json.dump(plan, f)
+        out["env"] = {**(out.get("env") or {}), "STRATA_DS41_REMOTE": plan["name"]}
+        print(f"ds41_local: multi-GPU on: {plan['gpu_name']} holds experts ({plan['gib']:g} GiB)")
+    elif os.path.exists(hf):
+        os.remove(hf)
     vision = vision_section(m)
     if vision:
         out["vision"] = vision
         if "--vision" not in a:   # here, not by the server: it would add --vram-reserve-mib, which this engine refuses
             a.append("--vision")
     return out
+
+
+def helper_plan(out, a):
+    """The Setup card's multi-GPU switch -> what ds41_helper needs, or None (off, no second card, or a card under 20 GB:
+    the small-card profile has no room for the slots the helper's misses go through)."""
+    if not page_settings().get("multi_gpu") or "--rank" not in a[:-1] or "-m" not in a[:-1]:
+        return None
+    import setup_panel
+    gpus = setup_panel.list_gpus()
+    h = setup_panel.helper_gpu(gpus, out.get("gpu"))
+    me = next((g for g in gpus if g["index"] == out.get("gpu")), None)
+    if not h or not me or me["mib"] < 20000:
+        return None
+    args = ["-m", a[a.index("-m") + 1], "--rank", a[a.index("--rank") + 1], "--device", "0",
+            "--skip-gib", f"{me['mib'] / 1024 - 9.5:g}", "--gib", f"{h['mib'] / 1024 - 2.5:g}", "--name", "ds41_remote"]
+    if "--exl3" in a[:-1]:
+        args += ["--exl3", a[a.index("--exl3") + 1]]
+    return {"exe": os.path.join(os.path.dirname(out["exe"]), "ds41_helper.exe"), "args": args, "gpu": h["index"],
+            "gpu_name": h["name"], "gib": h["mib"] / 1024 - 2.5, "name": "ds41_remote"}
 
 
 VISION_FILE = "DeepSeek-V4.1-Flash-1017-Vision.gguf"   # nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF

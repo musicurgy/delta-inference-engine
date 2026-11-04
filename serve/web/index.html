@@ -34,7 +34,7 @@
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>Setup</button>
   </nav>
   <span class="st-header__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
@@ -180,6 +180,32 @@
   <!-- ============================ About ============================ -->
   <section class="view view--about" id="view-about" role="tabpanel" aria-labelledby="tab-btn-about" hidden>
     <div class="about">
+      <div class="st-card" id="setup-card" hidden>
+        <div class="req-head"><span class="card-title">Setup</span><span class="muted small" id="setup-pc"></span></div>
+        <div class="st-field">
+          <label class="st-label" for="setup-model">Model</label>
+          <select class="st-input" id="setup-model"></select>
+          <span class="muted small" id="setup-model-note"></span>
+        </div>
+        <div class="st-field">
+          <span class="st-label">Speed or quality</span>
+          <div class="seg" id="setup-mode" role="radiogroup" aria-label="Speed or quality">
+            <button type="button" role="radio" data-v="fast">Fast</button><button type="button" role="radio" data-v="balanced">Balanced</button><button type="button" role="radio" data-v="exact">Most exact</button>
+          </div>
+          <span class="muted small" id="setup-mode-note"></span>
+        </div>
+        <div class="toggle-row" id="setup-gpu-row" hidden><span>Use the second graphics card<br><span class="muted small"
+          id="setup-gpu-note"></span></span>
+          <button class="st-toggle" id="setup-gpu" role="switch" aria-checked="false" aria-label="Use the second graphics card"></button></div>
+        <details class="muted small"><summary>Use your own model</summary>
+          <p>Copy a GGUF of DeepSeek-V4.1-Flash-1017 (all 384 experts), or a folder of EXL3 experts, into
+            <code id="setup-folder"></code>, then press Refresh.  It appears in the list above.</p>
+          <ul id="setup-refused"></ul>
+        </details>
+        <div class="cfg-actions"><button class="st-btn st-btn--primary" id="setup-apply" type="button">Apply</button>
+          <button class="st-btn st-btn--secondary" id="setup-refresh" type="button">Refresh</button>
+          <span class="muted small" id="setup-msg" role="status"></span></div>
+      </div>
       <div class="st-card">
         <span class="card-title">Model and engine</span>
         <dl class="facts" id="facts-engine"></dl>

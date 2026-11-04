@@ -195,32 +195,15 @@ set /a RAMN=RAM_GB+0 2>nul
 if defined RAM_GB if %RAMN% LSS 120 echo   Note: this PC has %RAM_GB% GB of RAM; DeepSeek needs 128 GB or more ^(README.md, "What you need"^).
 if defined RAM_GB if %RAMN% LSS 120 if %RAMN% GEQ 56 echo         With less it runs, but the experts that do not fit are read from the SSD on every token: measured on an RTX 3090 the default writes ~27 tok/s at 96 GB, ~20 at 64 GB.
 if defined RAM_GB if %RAMN% LSS 56 echo         With this little it will probably not start at all.
-rem under 110 GB: offer Unsloth's UD-IQ1_S instead of the default (rounds 227 / 225: 30 / 25.5 vs 27 / 20 tok/s)
-if defined NEEDMAIN if defined RAM_GB if %RAMN% LSS 110 if %RAMN% GEQ 56 (
-  echo.
-  echo   With %RAM_GB% GB of RAM, Unsloth's UD-IQ1_S is the better model for this PC: measured on an RTX 3090 it
-  echo   writes 30 / 25.5 tok/s at 96 / 64 GB, the default 27 / 20, and agrees with DeepSeek's API 89.3%% of the
-  echo   time against the default's 91.5%%.  It is a 233 GB download ^(the default: ~375 GB^).
-  choice /c YN /m "Download UD-IQ1_S instead of the default"
-  if not errorlevel 2 (
-    ".venv\Scripts\python.exe" tools\v41\serve\pick_model.py --get UD-IQ1_S || exit /b 1
-    set "NEEDMAIN="
-  )
-)
-rem 180 GB and up: Unsloth's UD-IQ2_XXS is the default for this PC (0.93's final cards on an RTX 3090 + 192 GB: about as
-rem fast as the ds4 Q2 GGUF, 40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 sampled; agrees more, 92.5 / 95.9%% vs 91.5 / 93.0%%; 301 GB)
-if defined NEEDMAIN if defined RAM_GB if %RAMN% GEQ 180 (
-  echo.
-  echo   With %RAM_GB% GB of RAM, Unsloth's UD-IQ2_XXS is the default for this PC: measured on an RTX 3090 it writes
-  echo   about as fast as the ds4 Q2 GGUF ^(40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the default sampling^), agrees
-  echo   with DeepSeek's API more often ^(92.5%% vs 91.5%%; 95.9%% vs 93.0%% on code and maths^) and is a 301 GB
-  echo   download ^(the ds4 Q2 GGUF: ~375 GB^).  N keeps the ds4 Q2.
-  choice /c YN /m "Download UD-IQ2_XXS (recommended)"
-  if not errorlevel 2 (
-    ".venv\Scripts\python.exe" tools\v41\serve\pick_model.py --get UD-IQ2_XXS || exit /b 1
-    set "NEEDMAIN="
-  )
-)
+rem no model yet: the user picks one - the one for this PC is marked, any other is fine, or none and their own
+if not defined NEEDMAIN goto picked
+".venv\Scripts\python.exe" tools\v41\serve\pick_model.py --first
+set "PRC=%errorlevel%"
+if "%PRC%"=="0" set "NEEDMAIN="
+if "%PRC%"=="0" goto picked
+if "%PRC%"=="10" goto picked
+exit /b 1
+:picked
 echo The model files above go to %M%
 echo   ^(DS41_MODELS in ds41-paths.bat - put it on your fastest NVMe drive^).  They come from Hugging Face: DeepSeek's
 echo   official repository and a Q2 GGUF of it; every large file is checked against its published SHA-256.
