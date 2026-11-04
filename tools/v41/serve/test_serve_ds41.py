@@ -138,6 +138,53 @@ def t_parser():
                     if c.strip() != "Checking." or calls != (["read_file"] if cut >= done else []):
                         bad.append((cut - len(text), step, reason, c[-40:], calls))
         check(f"a cut inside DSML sends no DSML text, every cut / step 1, 7, 4096 (thinking={thinking})", not bad, bad[:2])
+    # upstream #110: the ways a low-bit quant spells the tags - whole they are one call, cut anywhere no markup in the content
+    def spelled(o, c):
+        return (f'{o} calls>\n{o} invoke name="read_file">\n{o} parameter name="path" string="true">a.txt{c} parameter>\n'
+                f'{o} parameter name="lines" string="false">3{c} parameter>\n{c} invoke>\n{c} calls>')
+    forms = [("the token", "<" + E.dsml_token, "</" + E.dsml_token), ("bare", "<", "</"), ("backslash", "<\\", "</\\"),
+             ("U+FF3C", "<＼", "</＼"), ("misspelled", "<＼DSML＼", "</＼DSML＼"),
+             ("mixed", "<", "</" + E.dsml_token)]
+    want = [("read_file", {"path": "a.txt", "lines": 3})]
+    for name, o, cl in forms:
+        for thinking in (True, False):
+            head = ("hm" + E.thinking_end_token if thinking else "") + "Reading.\n"
+            whole, bad = head + spelled(o, cl), []
+            for step in (1, 7, 4096):
+                r, c, k = run_parser(whole, thinking, step)
+                if k != want or c.strip() != "Reading.":
+                    bad.append((step, c, k))
+            check(f"{name}: one call and the text before it (thinking={thinking})", not bad, bad[:1])
+            bad = []
+            for cut in range(len(head), len(whole) + 1):
+                for step in (1, 7, 4096):
+                    p, ev = F.OutputParser(thinking=thinking, tools=TOOLS), []
+                    for i in range(0, cut, step):
+                        ev += p.feed(whole[:cut][i:i + step])
+                    ev += p.finish("length")
+                    c = "".join(e.text for e in ev if e.kind == "content")
+                    if c.strip() != "Reading.":
+                        bad.append((cut, step, c))
+            check(f"{name}: cut anywhere, no markup in the content (thinking={thinking})", not bad, bad[:2])
+    for text in ('Never run < invoke name="rm"> here.', 'Use `< invoke name="read_file">` for that.',
+                 '```\n< invoke name="read_file">\n```\n', "if a < b and c > d: pass", "x <invoke> y", "1 < 2 < 3", "a <\\ b"):
+        r, c, k = run_parser(text, False, 3)
+        check(f"prose stays text: {text[:24]!r}", c == text and not k, (c, k))
+    r, c, k = run_parser('Reading:\n< invoke name="bash">\n< parameter name="command" string="true">ls</ parameter>\n</ invoke>', False, 5)
+    check("an undeclared tool's call at the start of a line is a call", k == [("bash", {"command": "ls"})], (c, k))
+    flat = [t["function"] for t in TOOLS]              # as the server hands them to the parser
+    def run_flat(text):
+        p, ev = F.OutputParser(thinking=False, tools=flat), []
+        for i in range(0, len(text), 5):
+            ev += p.feed(text[i:i + 5])
+        ev += p.finish()
+        return "".join(e.text for e in ev if e.kind == "content"), [(e.call.name, e.call.arguments) for e in ev if e.kind == "tool_call"]
+    c, k = run_flat('< invoke name="read_file">\n< parameter name="lines">3</ parameter>\n< parameter name="path">a</ parameter>\n</ invoke>')
+    check("no string= attribute: by the declared type", k == [("read_file", {"lines": 3, "path": "a"})], (c, k))
+    c, k = run_flat('Now: < invoke name="read_file">\n< parameter name="path">a</ parameter>\n</ invoke>')
+    check("a declared tool's bare call in mid-line is a call", k == [("read_file", {"path": "a"})] and c.strip() == "Now:", (c, k))
+    r, c, k = run_parser(dsml([("read_file", {"path": "a < b </ c", "lines": 3})]), False, 4)
+    check("tags inside a value are not tags", k == [("read_file", {"path": "a < b </ c", "lines": 3})], (c, k))
     r, c, k = run_parser("ok <" + E.dsml_token + " inv", False, 4096)
     check("a natural stop inside a tag keeps it as text", c == "ok <" + E.dsml_token + " inv", c)
     esc = "a&lt;" + D.P_CLOSE[1:] + "b"
