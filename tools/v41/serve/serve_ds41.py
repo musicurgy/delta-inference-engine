@@ -349,11 +349,123 @@ _op_init, _op_feed, _op_finish = F.OutputParser.__init__, F.OutputParser.feed, F
 WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
 
 
+# ---- low-bit quants' spellings of the tags (upstream #110): a quant sometimes writes a call's tags without the ｜DSML｜
+# token - `< invoke name="write">` - or with a backslash (ASCII or U+FF3C) or a misspelled token (＼DSML＼) in its place,
+# and markers can differ within one call.  As text those calls reached clients as the answer, which ends an agent's run.
+# Every tag goes through here first and comes out in the one spelling the rest of this file reads.  Without the real
+# token a tag opens a call only inside a calls block, for a declared tool, or at the start of a line outside code, so
+# `< invoke name="rm">` in prose stays text; `<invoke>` (no marker) is never a tag.
+_M = r"(?P<tok>｜DSML｜\s*)?(?(tok)|(?:[\\＼｜]DSML[\\＼｜]\s*|[\\＼]\s*|\s+))"
+_ANY_TAG = re.compile(rf'<(?P<end>/?){_M}(?:(?:tool_|function_)?(?P<calls>calls)|(?P<word>invoke|parameter)'
+                      r'(?:\s+name\s*=\s*"(?P<name>[^"]*)")?(?:\s+string\s*=\s*"(?P<s>true|false)")?)\s*>')
+_TAG_HEAD = re.compile(r"^</?(?:｜(?:D(?:S(?:M(?:L(?:｜)?)?)?)?)?|[\\＼](?:D(?:S(?:M(?:L(?:[\\＼｜])?)?)?)?)?)?$")   # "<", "<｜DS", "</＼DSM"
+_TAG_REST = re.compile(rf"^</?{_M}(?P<rest>[^<>]*)$")
+_TAG_WORDS = ("calls", "tool_calls", "function_calls", "invoke", "parameter")
+_TAG_MAX = 600                  # a longer `<...` is text, not held any further
+
+
+def _maybe_tag(s: str) -> bool:
+    """`s` starts with '<' and has no '>' yet: it may still become a tag."""
+    if len(s) > _TAG_MAX:
+        return False
+    if _TAG_HEAD.match(s):
+        return True
+    m = _TAG_REST.match(s)
+    if m is None:
+        return False
+    rest = m.group("rest")
+    if any(w.startswith(rest) for w in _TAG_WORDS):
+        return True
+    return any(rest.startswith(w) and rest[len(w)].isspace() and ("\n" not in rest if w[0] in "ip" else not rest[len(w):].strip())
+               for w in _TAG_WORDS)                    # the word is whole: invoke's and parameter's attributes are arriving
+
+
+def _tag_text(self, text: str, out: list):
+    out.append(text)
+    *done, self.tag_line = (self.tag_line + text).split("\n")
+    for line in done:
+        if line.lstrip().startswith("```"):
+            self.tag_fence = not self.tag_fence
+
+
+def _param_is_string(self, tool: str, name: str) -> str:
+    """A parameter tag written without string=...: as the declared type says, a string if nothing does."""
+    props = ((self.schemas.get(tool) or {}).get("parameters") or {}).get("properties") or {}
+    return "true" if (props.get(name) or {}).get("type") in (None, "string") else "false"
+
+
+def _tag(self, m, out: list) -> bool:
+    """The tag `m` at this state -> its one spelling in `out`, True; False when here it is not a tag."""
+    word, end, st = "calls" if m["calls"] else m["word"], bool(m["end"]), self.tag_state
+    if st == "param":
+        if word == "parameter" and end:
+            out.append(P_CLOSE); self.tag_state = "invoke"
+            return True
+        if word == "invoke" and end:                # the value's closing tag was left out
+            out.append(P_CLOSE + INVOKE_CLOSE); self.tag_state = "calls"
+            return True
+        return False
+    if word == "parameter":
+        if st != "invoke" or end or m["name"] is None:
+            return False
+        out.append(f'{P_OPEN} name="{m["name"]}" string="{m["s"] or _param_is_string(self, self.tag_tool, m["name"])}">')
+        self.tag_state = "param"
+        return True
+    if word == "invoke":
+        if end:
+            if st != "invoke":
+                return False
+            out.append(INVOKE_CLOSE); self.tag_state = "calls"
+            return True
+        if st == "invoke" or m["name"] is None:
+            return False
+        if st == "text" and not m["tok"] and (self.tag_fence or self.tag_line.count("`") % 2 or
+                                               (m["name"] not in self.schemas and self.tag_line.strip())):
+            return False
+        out.append(f'{INVOKE_OPEN} name="{m["name"]}">')
+        self.tag_state, self.tag_tool = "invoke", m["name"]
+        return True
+    if end:
+        if st == "text":
+            return False
+        out.append(CALLS_CLOSE); self.tag_state = "text"
+        return True
+    if st != "text" or (not m["tok"] and (self.tag_fence or self.tag_line.strip())):
+        return False
+    out.append(CALLS_OPEN); self.tag_state = "calls"
+    return True
+
+
+def _spell_tags(self, delta: str, final: bool) -> str:
+    """One delta of the model's text with its tags in the one spelling, holding a `<...` until it is decided."""
+    buf, out = self.tag_hold + delta, []
+    while buf:
+        lt = buf.find("<")
+        if lt < 0:
+            _tag_text(self, buf, out); buf = ""
+            break
+        if lt:
+            _tag_text(self, buf[:lt], out); buf = buf[lt:]
+        gt = buf.find(">")
+        if gt < 0 and _maybe_tag(buf):
+            if final:
+                _tag_text(self, buf, out); buf = ""
+            break
+        m = _ANY_TAG.fullmatch(buf[:gt + 1]) if gt >= 0 else None
+        if m is not None and _tag(self, m, out):
+            buf = buf[gt + 1:]
+        else:
+            _tag_text(self, "<", out); buf = buf[1:]
+    self.tag_hold = buf
+    return "".join(out)
+
+
 def _op_init_ds41(self, *a, **k):
     _op_init(self, *a, **k)
     self.stream_tools = False          # the streaming scanner reads Qwen's <function=...> body
     self.dsml_hold = ""
     self.echo_check, self.echo_hold = True, ""
+    self.tag_hold, self.tag_state, self.tag_tool, self.tag_line, self.tag_fence = "", "text", None, "", False
 
 
 # 2026-10-19: after the server closes a thinking budget with REASONING_WRAP_UP, the 1017 sometimes repeats that sentence
@@ -396,7 +508,7 @@ def _strip_wrappers(self, delta: str, final: bool) -> str:
 
 
 def _op_feed_ds41(self, delta: str):
-    return _drop_wrap_echo(self, _op_feed(self, _strip_wrappers(self, delta, False)))
+    return _drop_wrap_echo(self, _op_feed(self, _strip_wrappers(self, _spell_tags(self, delta, False), False)))
 
 
 def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reason=...)
@@ -406,8 +518,9 @@ def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reaso
         # content it reached clients as DSML in the answer (an agent read it as the answer).  What is held here is only
         # ever a tag that may still be arriving or an unfinished call (never streamed: stream_tools is off), so a cut
         # drops nothing else; a natural stop keeps it as text, as before.
-        self.dsml_hold, self.buf = "", ""
-    out = _op_feed(self, _strip_wrappers(self, "", True)) if self.dsml_hold else []
+        self.dsml_hold, self.buf, self.tag_hold = "", "", ""
+    tail = _spell_tags(self, "", True)
+    out = _op_feed(self, _strip_wrappers(self, tail, True)) if tail or self.dsml_hold else []
     out = _drop_wrap_echo(self, out + _op_finish(self, *a, **k))
     if self.echo_hold:                 # ended while matching: the whole sentence = the echo, a part of it = real text
         if self.echo_hold.strip() != WRAP_SENTENCE:
