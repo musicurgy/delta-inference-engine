@@ -23,7 +23,9 @@ concurrency:
 jobs:
   build:
     name: build-ds41-${{ matrix.variant }}
-    runs-on: windows-latest
+    # windows-2022, not -latest: -latest and windows-2025 now carry Visual Studio 2026, and CUDA 13.0's crt/host_config.h
+    # stops the build on it (_MSC_VER >= 1950: "unsupported Microsoft Visual Studio version").
+    runs-on: windows-2022
     timeout-minutes: 360   # GitHub's limit; four CUDA archs on a hosted runner's 4 cores may take hours
     strategy:
       fail-fast: false
