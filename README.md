@@ -28,8 +28,9 @@ CPUs from before 2013.)
    - the engine: the prebuilt one for your CPU from the
      [Releases page](https://github.com/musicurgy/delta-inference-engine/releases) (under 1 GB, no compiler needed) - or it builds
      it, if you have Visual Studio Build Tools, the CUDA Toolkit and Git,
-   - the model files from Hugging Face (~375 GB of downloads, checked against their published SHA-256; it checks the
-     free space first; resumable - just start it again if it stops).
+   - the model: it asks which one you want and marks the one that suits your RAM, then downloads it from Hugging Face
+     (233-395 GB, checked against the published SHA-256; it checks the free space first; resumable - just start it
+     again if it stops).
 3. Then the server starts and the chat page opens in your browser. Apps use `http://127.0.0.1:8080/v1` (OpenAI) or
    `/v1/messages` (Anthropic), any API key.  (Another port: `DS41_PORT` in `ds41-paths.bat`.)
 
@@ -46,6 +47,19 @@ files stay as they are.
 PASS / FAIL list), starts DeepSeek in a second window with everything it prints saved, and when you close that window
 it packs it all into `logs\debug-<time>.zip`. Attach that zip to an issue with a line on what went wrong. It holds no
 prompts or answers, and your Windows user name is replaced by `<user>`.
+
+## What's new in 0.93
+
+- **A model picker and a Setup tab.** The first start offers the model that suits your RAM, and the Setup tab in the
+  chat page changes the model and the settings without a batch file or a text editor.
+- **A new default from 128 GB of RAM up:** Unsloth's UD-IQ2_XXS, a 301 GB download. It writes 41 tok/s at 192 GB and
+  34 at 128 GB, and got 57 of 99 hard questions right against 52 for the old default, ds4 Q2.
+- **64 and 96 GB of RAM are supported.** The first start offers Unsloth's UD-IQ1_S there: 36 tok/s at 96 GB, 31 at 64 GB.
+- **More models at full speed:** Unsloth's UD-Q2_K_XL and UD-IQ3_XXS for better quality, in `Choose Model.bat`.
+- **A second GPU** can run a helper: a switch on the Setup tab.
+- **Built in public.** The release zips come from GitHub's own runners, each with a build attestation.
+
+The full list is on the [Releases page](https://github.com/musicurgy/delta-inference-engine/releases).
 
 ## Speed
 
