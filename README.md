@@ -69,7 +69,7 @@ These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 |---|---|---|
 | Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **41 tok/s** | **34 tok/s** |
 | Writing, the default sampling (temperature 1, top-p 0.95) | **40 tok/s** | - |
-| Reading a long prompt (25-64k tokens) | **620-740 tok/s** | **470-600 tok/s** |
+| Reading a long prompt (~64K tokens) | **up to 740 tok/s** | **up to 600 tok/s** |
 
 The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  Greedy means temperature 0 in the
 request; the default sampling is what a client gets when it sends no temperature.  Sampling accepts fewer of the
@@ -176,18 +176,33 @@ normal priority.
 
 ## Quality
 
-How often the top choice matches DeepSeek's own API, on the same prompts (UD-IQ2_XXS):
+How often the top choice matches DeepSeek's own API, on the same prompts:
 
-| | General | Code + maths |
-|---|---|---|
-| Exact routing | 92.5% | 95.9% |
-| **Route bias 0.28 (the default)** | **91.1%** | **94.5%** |
+| Model | Routing | General | Code + maths | Agentic |
+|---|---|---|---|---|
+| **Unsloth UD-IQ2_XXS (the default from 128 GB up)** | **Route bias 0.28, as shipped** | **91.1%** | **94.5%** | **95.9%** |
+| Unsloth UD-IQ2_XXS | Exact routing | 92.5% | 95.9% | 96.5% |
+| ds4 Q2 | Route bias 0.28, as shipped | 89.9% | 93.1% | 95.1% |
+| ds4 Q2 | Route bias 0.10 | 91.8% | 92.8% | - |
+| ds4 Q2 | Exact routing | 91.5% | 93.0% | 96.1% |
 
-- Route bias prefers experts that are already on the GPU. It is roughly 25% faster. It follows the GPU's experts as they
-  change during an answer (`STRATA_BIAS_REFRESH=1` in the launcher), which made it both faster and closer to DeepSeek's
-  own model (at 0.3: 89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with the
-  refresh). The test moves by about 0.2 points between identical runs.
-- For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`.
+Every model is in the tables under "Other quants".
+
+- **Want the most agreement?** Set `DS41_ROUTE_BIAS=0` in `ds41-paths.bat` for exact routing: +1.4 points on UD-IQ2_XXS,
+  about 25% slower.  `0.10` costs about 18% of writing speed at 192 GB of RAM on ds4 Q2 (34 instead of 41 tok/s) and
+  12-26% on 96 / 64 GB PCs; it has not been measured on UD-IQ2_XXS.  The startup line shows the bias in use.
+- Route bias prefers experts that are already on the GPU, so fewer have to come from RAM: about 25% faster than exact
+  routing at 192 GB, more on smaller PCs.  It follows the GPU's experts as they change during an answer
+  (`STRATA_BIAS_REFRESH=1` in the launcher), which made it both faster and closer to DeepSeek's own model (at 0.3:
+  89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with the refresh).  The test moves
+  by about 0.2 points between identical runs.
+- On agentic, tool-calling text (53 transcripts with tools, tool calls and tool results, 46K tokens) the bias costs the
+  same as on prose: on ds4 Q2 exact routing agrees with DeepSeek's own model on 96.05% of next tokens, bias 0.28 on
+  95.10%; inside the tool-call JSON itself the cost is 0.4 points, in the prose between calls 2.9.  There is no
+  collapse at this setting (reports of collapse come from a bias of 1.0, which this launcher does not use).
+- `--kv-fp4` (the compressed KV cache, on by default) is exact: the logits are bit-identical with and without it.
+- For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`, or
+  per request with `"strata_tune": {"route_bias": 0, "route_bias_file": 0}` - about 25% slower.
 
 ## Other quants: Unsloth (the default from 128 GB up and the quality mode), ISTA-DASLab's GSQ-RCO, EXL3
 
