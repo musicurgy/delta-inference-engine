@@ -2,7 +2,7 @@
 
 **DeepSeek-V4.1-Flash on one NVIDIA GPU, natively on Windows.**
 
-Delta runs all 552 billion parameters of **DeepSeek-V4.1-Flash-1017** ( 2-bit experts) on one
+Delta runs all 552 billion parameters of **DeepSeek-V4.1-Flash-1017** (2-bit experts) on one
 consumer PC, natively on Windows. It serves an OpenAI-compatible API at `http://127.0.0.1:8080/v1` with up to 1M tokens
 of context.
 
@@ -20,7 +20,7 @@ CPUs from before 2013.)
 1. Get this folder (**Code > Download ZIP**, or
    `git clone -c core.longpaths=true https://github.com/musicurgy/delta-inference-engine C:\AI\Delta`) somewhere with
    a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 64 GB+ of RAM (128 GB+ recommended),
-   ~385 GB free on a fast NVMe drive (its speed matters - see below).
+   ~320 GB free on a fast NVMe drive for the default model (its speed matters - see below).
 2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
    asks before anything big:
    - Python and its packages (no Python 3.10-3.12 on the PC: it offers to install python.org's Python 3.11 with
@@ -56,7 +56,7 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
   34 at 128 GB, and got 57 of 99 hard questions right against 52 for the old default, ds4 Q2.
 - **64 and 96 GB of RAM are supported.** The first start offers Unsloth's UD-IQ1_S there: 36 tok/s at 96 GB, 31 at 64 GB.
 - **More models at full speed:** Unsloth's UD-Q2_K_XL and UD-IQ3_XXS for better quality, in `Choose Model.bat`.
-- **A second GPU** can run a helper: a switch on the Setup tab.
+- **A second GPU** can run a helper, a switch on the Setup tab: about 7% more writing speed with an RTX 3060 beside the 3090.
 - **Built in public.** The release zips come from GitHub's own runners, each with a build attestation.
 
 The full list is on the [Releases page](https://github.com/musicurgy/delta-inference-engine/releases).
@@ -94,8 +94,8 @@ own model:
 
 | Model | Agreement | 192 GB | 128 GB | **96 GB** | **64 GB** |
 |---|---|---|---|---|---|
-| Unsloth UD-IQ2_XXS | 91.1% | 40 | 34 | 29 | 21 |
-| ds4 Q2 (the default) | 89.9% | 40 | 36 | 27 | 20 |
+| **Unsloth UD-IQ2_XXS** (the default from 128 GB up) | 91.1% | 41 | 34 | 29 | 21 |
+| ds4 Q2 | 89.9% | 41 | 36 | 27 | 20 |
 | **Unsloth UD-IQ1_S** | 89.1% | 41 | 41 | **36** | **31** |
 | Unsloth UD-Q2_K_XL | 92.5% | 31 | 27 | 23 | 15 |
 | Unsloth UD-IQ3_XXS | 92.7% | 28 | 23 | 18 | 12 |
@@ -104,7 +104,7 @@ own model:
 - **Under ~110 GB of RAM, use Unsloth's UD-IQ1_S**: about a point less agreement than ds4 Q2 and much faster.  New prompts
   take longer than on 192 GB: UD-IQ1_S reads a ~180-token prompt in ~4.3 s at 96 GB and ~8.3 s at 64 GB. The first start offers
   UD-IQ1_S instead of the default on such a PC; `Choose Model.bat` downloads it on an existing install.
-- The default's 96 / 64 GB numbers are this release's launcher as it ships: the expert memory it gives such a PC
+- ds4 Q2's 96 / 64 GB numbers are this release's launcher as it ships: the expert memory it gives such a PC
   (61 and 31 GiB; it was 51 and 21) and the SSD read-ahead (`STRATA_D3_SPEC=8`, which reads the experts the next
   layers will need while the current ones run - exact, +22% at 64 GB).  Before those two changes the same rows were
   22 and 16.  The SSD matters most here: everything was read from a PCIe 4.0 NVMe (~3.5 GiB/s).
@@ -112,13 +112,13 @@ own model:
 
 On the 192 GB PC, a new 6k-token prompt takes about 15 s and a 25k-token prompt about 41 s (UD-IQ2_XXS). Writing is fastest on
 maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the prompt and the thinking, a client sees
-~39 tok/s.
+~38 tok/s.
 
 ### A second GPU
 
 The Setup tab in the chat page has a Multi-GPU switch: a helper on a second card of 8 GB or more holds experts the
-main card has no room for.  The main card needs 20 GB or more.  Measured with an RTX 3060 12 GB in an x4 slot beside
-the 3090: about +0-3% writing speed on UD-IQ2_XXS, +1.5% on ds4 Q2.  It does not split the model across cards, so it
+main card has no room for.  The main card needs 20 GB or more for this switch; the engine itself runs from 12 GB.  With
+an RTX 3060 12 GB in an x4 slot beside the 3090 it adds about 7% writing speed.  It does not split the model across cards, so it
 does not scale: for two or more big cards use [Project Maya](https://github.com/mw00/project-maya), which runs
 DeepSeek in tensor parallel.
 
@@ -178,22 +178,26 @@ normal priority.
 
 How often the top choice matches DeepSeek's own API, on the same prompts:
 
-| | General | Code + maths |
-|---|---|---|
-| Exact routing | 91.4% | 92.1% |
-| **Route bias 0.28 (the default)** | **89.9%** | **93.1%** |
-| Route bias 0.10 (`DS41_ROUTE_BIAS=0.10`) | 91.8% | 92.8% |
+| Model | Routing | General | Code + maths | Agentic |
+|---|---|---|---|---|
+| **Unsloth UD-IQ2_XXS (the default from 128 GB up)** | **Route bias 0.28, as shipped** | **91.1%** | **94.5%** | **95.9%** |
+| Unsloth UD-IQ2_XXS | Exact routing | 92.5% | 95.9% | 96.5% |
+| ds4 Q2 | Route bias 0.28, as shipped | 89.9% | 93.1% | 95.1% |
+| ds4 Q2 | Route bias 0.10 | 91.8% | 92.8% | - |
+| ds4 Q2 | Exact routing | 91.5% | 93.0% | 96.1% |
 
-- **Want the most agreement?** Set `DS41_ROUTE_BIAS=0.10` in `ds41-paths.bat`: +1.6 points on general text and +0.4 on
-  code and maths (above exact routing's 91.4 / 92.1%), for about 18% of writing speed at 192 GB of RAM (34 instead of
-  41 tok/s) and 12-26% on 96 / 64 GB PCs.  `0` gives exact routing.  The startup line shows the bias in use.
+Every model is in the tables under "Other quants".
+
+- **Want the most agreement?** Set `DS41_ROUTE_BIAS=0` in `ds41-paths.bat` for exact routing: +1.4 points on UD-IQ2_XXS,
+  about 25% slower.  `0.10` costs about 18% of writing speed at 192 GB of RAM on ds4 Q2 (34 instead of 41 tok/s) and
+  12-26% on 96 / 64 GB PCs; it has not been measured on UD-IQ2_XXS.  The startup line shows the bias in use.
 - Route bias prefers experts that are already on the GPU, so fewer have to come from RAM: about 25% faster than exact
   routing at 192 GB, more on smaller PCs.  It follows the GPU's experts as they change during an answer
   (`STRATA_BIAS_REFRESH=1` in the launcher), which made it both faster and closer to DeepSeek's own model (at 0.3:
   89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with the refresh).  The test moves
   by about 0.2 points between identical runs.
 - On agentic, tool-calling text (53 transcripts with tools, tool calls and tool results, 46K tokens) the bias costs the
-  same as on prose: exact routing agrees with DeepSeek's own model on 96.05% of next tokens, the default 0.28 on
+  same as on prose: on ds4 Q2 exact routing agrees with DeepSeek's own model on 96.05% of next tokens, bias 0.28 on
   95.10%; inside the tool-call JSON itself the cost is 0.4 points, in the prose between calls 2.9.  There is no
   collapse at this setting (reports of collapse come from a bias of 1.0, which this launcher does not use).
 - `--kv-fp4` (the compressed KV cache, on by default) is exact: the logits are bit-identical with and without it.
@@ -202,7 +206,8 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 
 ## Other quants: Unsloth (the default from 128 GB up and the quality mode), ISTA-DASLab's GSQ-RCO, EXL3
 
-Besides the default, the engine runs the two other most-downloaded quant families of 1017, and EXL3 experts.
+Besides the ds4 Q2 GGUF, the engine runs the two other most-downloaded quant families of 1017, and EXL3 experts.  In
+this section "the default" means the ds4 Q2 file, the first default, whose Engram tables some of these quants read.
 **`Choose Model.bat`** lists the models in your model folder and the ones you can add, builds or downloads the one you
 pick and saves your choice (`model-choice.txt`); the next start loads it.
 
@@ -222,8 +227,8 @@ pick and saves your choice (`model-choice.txt`); the next start loads it.
 - **The quality mode: Unsloth UD-Q2_K_XL** (Choose Model, 335 GB): 92.5% / 95.3% agreement at the shipped bias at 31 tok/s
   on 192 GB of RAM (95.0% / 96.8% exact routing, more than EXL3 2.5 bpw's 94.4 / 95.6) and ~25% faster than EXL3.  Unsloth
   UD-IQ3_XXS (395 GB + the default) is the most exact, 92.7% / 95.9% at 28 tok/s; UD-Q2_K_XL stays the faster quality pick.  On 192 GB the launcher gives files with
-  experts this big a 158 GiB arena (20 GiB of RAM kept back instead of 28: close other big programs).  **The 192 GB
-  default: Unsloth UD-IQ2_XXS** (301 GB): 91.1% / 94.5% - about a point more than the ds4 Q2 GGUF on general text and on
+  experts this big a 158 GiB arena (20 GiB of RAM kept back instead of 28: close other big programs).  **The default from
+  128 GB up: Unsloth UD-IQ2_XXS** (301 GB): 91.1% / 94.5% - about a point more than the ds4 Q2 GGUF on general text and on
   code and maths - and about as fast (41.1 vs 40.7 tok/s greedy, 39.7 vs 40.3 at the default sampling).
   UD-Q2_K_XL and UD-IQ2_XXS: measured on revision 60ad3651 (Unsloth's files of 10-20; the re-made UD-Q2_K_XL tied them in our test), the one Choose Model
   downloads (UD-IQ1_S: 8a6ec9cf, whose re-made files agree 1.3-1.6 points more than the older ones at the same size; re-download
@@ -246,7 +251,7 @@ every token), and writing speed through the server:
 
 | | download | general | code + maths | agentic | writing, 192 / 128 / 96 / 64 GB RAM |
 |---|---|---|---|---|---|
-| ds4 Q2 (the default) | 366 GB | 89.9% | 93.1% | 95.1% | 40 / 36 / 27 / 20 tok/s |
+| ds4 Q2 | 366 GB | 89.9% | 93.1% | 95.1% | 41 / 36 / 27 / 20 tok/s |
 | Unsloth UD-IQ1_S | 233 GB | 89.1% | 91.5% | 95.3% | 41 / 41 / 36 / 31 tok/s |
 | **Unsloth UD-IQ2_XXS** (the default from 128 GB up) | 301 GB | **91.1%** | **94.5%** | **95.9%** | 41 / 34 / 29 / 21 tok/s |
 | **Unsloth UD-Q2_K_XL** (the quality mode) | 335 GB | **92.5%** | **95.3%** | **97.0%** | 31 / 27 / 23 / 15 tok/s |
@@ -257,7 +262,7 @@ reaches with no route bias (slower):
 
 | | download | general | code + maths | writing, 192 / 128 GB RAM | notes |
 |---|---|---|---|---|---|
-| default (ds4 Q2) | 366 GB | 91.5% | 93.0% | 40 / 36 tok/s | DeepSeek's exact Engram tables |
+| ds4 Q2 | 366 GB | 91.5% | 93.0% | 41 / 36 tok/s | DeepSeek's exact Engram tables |
 | GSQ IQ2_XS | 159 GB + the default | 90.0% | 92.9% | 38 / 26 tok/s | answered our task questions as well as the default |
 | GSQ IQ2_XXS | 142 GB + the default | 87.8% | 89.5% | 41 / 32 tok/s | fewer knowledge questions right; long prompts slower |
 | GSQ IQ1_M | 125 GB + the default | 85.5% | - | 42 / 37.5 tok/s | long prompts slower (no fast prompt kernel for IQ1_M) |
@@ -269,7 +274,7 @@ reaches with no route bias (slower):
 | EXL3 2.5 bpw | 185 GB + the default | 94.4% | 95.6% | 25 / - tok/s | below UD-Q2_K_XL on both counts; 192 GB of RAM and an internal NVMe |
 
 On 192 GB of RAM ds4 Q2, UD-IQ2_XXS and UD-IQ1_S write about as fast as anything at the default sampling, and of those
-UD-IQ2_XXS agrees best with DeepSeek.  UD-Q2_K_XL agrees more, ~22% slower than the ds4 Q2 GGUF (31.3 vs 40.0 tok/s,
+UD-IQ2_XXS agrees best with DeepSeek.  UD-Q2_K_XL agrees more, about 21% slower than the ds4 Q2 GGUF (32.2 vs 40.7 tok/s,
 greedy), and UD-IQ3_XXS is the most exact (92.7% / 95.9% at the shipped bias) at 28 tok/s.
 Speed falls once a model's experts (its file without the Engram table) outgrow the RAM (~150-160 GB of them fit at
 192 GB): the rest is read from the SSD on every token.  So on 192 GB the Unsloth quants above
@@ -304,7 +309,7 @@ bias are bit-identical to the default file's (GSQ-RCO only changes the routed ex
   SSD (0.8 GB/s): it starts in about 1 minute instead of 4-5, reads a new 4K-token prompt ~40% faster (168 vs 120
   tok/s) and writes 6-9% faster.  With 128 GB of RAM, more experts come from the SSD, so it matters more.  Use a PCIe
   4.0 or 5.0 NVMe with room to spare (a nearly full SSD slows down) - not a SATA SSD, a hard disk or a USB drive.
-  ~385 GB free during setup and ~371 GB after (a GSQ build adds its 125-159 GB).
+  The model files take 233-395 GB: about 320 GB free for the default, UD-IQ2_XXS (a GSQ build adds its 125-159 GB).
 - Python 3.10, 3.11 or 3.12 (3.11 recommended) - `Start DeepSeek.bat` offers to install it.
 - To build (not needed with the prebuilt engine from the Releases page):
   - Visual Studio 2019 or 2022 (Build Tools are enough) with "Desktop development with C++";
@@ -345,7 +350,7 @@ hand:
    for any x86-64 CPU (SSE4.2).  The launcher takes the first of `build-ds41`, `build-ds41-portable`,
    `build-ds41-compat-avx`, `build-ds41-compat` that this CPU can run.
 3. **Model folder:** `DS41_MODELS` in `ds41-paths.bat`, on your fastest NVMe drive (default: `models\` here).
-4. **Model files:** `setup-ds41-models.bat` (resumable; every large file is checked against its published SHA-256):
+4. **Model files:** `setup-ds41-models.bat` for ds4 Q2, or `Choose Model.bat` for the others (resumable; every large file is checked against its published SHA-256):
    - the ds4 Q2 GGUF from
      [nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF)
      (366 GB): the model, and DeepSeek's Engram tables inline (byte for byte the official ones), which the engine
@@ -355,15 +360,15 @@ hand:
    - the speculative-decoding drafter (the biggest single speed-up), built from DeepSeek's own MTP heads in the same
      repository (three shards, 7.9 GB, removed afterwards) and shrunk to 4.2 GB. The drafter only proposes tokens;
      the main model checks every one.
-5. **Start** with `Start DeepSeek.bat`. Use the model name `/v1/models` shows (`deepseek-v4.1-flash-1017-ds4-q2` for the
-   default, `deepseek-v4.1-flash-1017-ud-iq2_xxs` for UD-IQ2_XXS; the server answers any name) with any
+5. **Start** with `Start DeepSeek.bat`. Use the model name `/v1/models` shows (`deepseek-v4.1-flash-1017-ds4-q2` for
+   ds4 Q2, `deepseek-v4.1-flash-1017-ud-iq2_xxs` for UD-IQ2_XXS; the server answers any name) with any
    OpenAI-compatible client.
 
 ## Settings
 
 - **One setting file:** `Start DeepSeek.bat` sets everything. Each line in it carries a short note.
 - **Paths:** they live in `ds41-paths.bat`.
-- **Model:** the default ds4 Q2, or the one `Choose Model.bat` picked (saved in `model-choice.txt`).
+- **Model:** the one the first start or `Choose Model.bat` picked (saved in `model-choice.txt`).
 - **RAM:** the memory used for experts is sized from your installed RAM at every start: total minus 28 GiB, at most
   140 GiB (on 192 GB-class PCs: 150 for UD-IQ2_XXS, and 158 with 20 GiB kept back for files with bigger experts).
   `DS41_ARENA_GIB` or `DS41_RAM_RESERVE_GIB` in `ds41-paths.bat` override it.
