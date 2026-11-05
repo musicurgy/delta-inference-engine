@@ -211,7 +211,7 @@ pick and saves your choice (`model-choice.txt`); the next start loads it.
   experts this big a 158 GiB arena (20 GiB of RAM kept back instead of 28: close other big programs).  **The 192 GB
   default: Unsloth UD-IQ2_XXS** (301 GB): 91.1% / 94.5% - about a point more than the ds4 Q2 GGUF on general text and on
   code and maths - and about as fast (40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the default sampling).
-  UD-Q2_K_XL and UD-IQ2_XXS: measured on revision 60ad3651 (Unsloth's Dynamic V3.1 files of 10-30), the one Choose Model
+  UD-Q2_K_XL and UD-IQ2_XXS: measured on revision 60ad3651 (Unsloth's files of 10-20; the re-made UD-Q2_K_XL tied them in our test), the one Choose Model
   downloads (UD-IQ1_S: 8a6ec9cf, whose re-made files agree 1.3-1.6 points more than the older ones at the same size; re-download
   to get them), with the default model's exact FP8 Engram tables.  They carry their own (Q5_K, in the last file), which
   the engine reads: as good as the FP8 ones (UD-IQ2_XXS 93.1 vs 92.9% top-1, the same speed), so they need no other
