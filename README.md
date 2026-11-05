@@ -19,7 +19,7 @@ CPUs from before 2013.)
 
 1. Get this folder (**Code > Download ZIP**, or
    `git clone -c core.longpaths=true https://github.com/musicurgy/delta-inference-engine C:\AI\Delta`) somewhere with
-   a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 128 GB+ of RAM,
+   a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 64 GB+ of RAM (128 GB+ recommended),
    ~385 GB free on a fast NVMe drive (its speed matters - see below).
 2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
    asks before anything big:
