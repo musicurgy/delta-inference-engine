@@ -58,11 +58,12 @@ Exact routing (no route bias, slower):
 Decode speed on one RTX 3090. The measurement is `bench_server`: 6 chats of up to 1,500 tokens each, with thinking on, through the release's own server.
 - The 128, 96 and 64 GB columns are the same PC with the spare RAM locked away (so neither Windows' file cache nor the pagefile could use it).
 - Greedy, route bias 0.28, this release's launcher.
+- UD-IQ2_XXS and ds4 Q2 at 192 GB count all six chats.  The other cells count the last six of the engine's log lines, about 1 tok/s lower on the same run.
 
 | Build | 192 GB | 128 GB | 96 GB | 64 GB |
 |---|---|---|---|---|
-| UD-IQ2_XXS | 40.4 | 34.0 | 29.3 | 21.0 |
-| ds4 Q2 | 40.0 | 35.9 | 27 | 20 |
+| UD-IQ2_XXS | 41.1 | 34.0 | 29.3 | 21.0 |
+| ds4 Q2 | 40.7 | 35.9 | 27 | 20 |
 | UD-IQ1_S | 41.0 | 40.6 | 36.5 | 30.6 |
 | UD-Q2_K_XL | 31.3 | 26.6 | 22.9 | 15.2 |
 | UD-IQ3_XXS | 28.2 | 22.8 | 18.3 | 11.7 |

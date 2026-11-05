@@ -36,14 +36,14 @@ GB = 1e9
 # not measured).  The model to recommend on a PC with less than LOW_RAM_GB of RAM:
 LOW_RAM_GB = 110
 LOW_RAM_PICK = "UD-IQ1_S"
-# ... and on one with HIGH_RAM_GB or more (0.93's final cards: UD-IQ2_XXS writes about as fast as the default - 40.4 vs
-# 40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling - agrees more, 91.1 / 94.5% vs 89.9 / 93.1% at the shipped bias, and is 65 GB smaller; at 128 GB it writes 5% slower,
+# ... and on one with HIGH_RAM_GB or more (0.93's final cards: UD-IQ2_XXS writes about as fast as the default - 41.1 vs
+# 40.7 tok/s greedy, 39.7 vs 40.3 at the shipped sampling - agrees more, 91.1 / 94.5% vs 89.9 / 93.1% at the shipped bias, and is 65 GB smaller; at 128 GB it writes 5% slower,
 # 34.0 vs 35.9 tok/s, and the answers are worth that: 57 vs 52 of 99 on the benchmark)
 HIGH_RAM_GB = 120
 HIGH_RAM_PICK = "UD-IQ2_XXS"
 # (menu name, GB on disk, writing tok/s, top-1 agreement with DeepSeek's API on general text: at the shipped route bias 0.28 for
 # the default and Unsloth (rounds 314-325), exact routing for GSQ and EXL3, which were not measured at 0.28)
-DEFAULT = ("ds4 Q2 (the default)", 366, "40 / 36 / 27 / 20", "89.9%")   # 96 / 64: rounds 234 (reserve 28 + read-ahead 8)
+DEFAULT = ("ds4 Q2 (the default)", 366, "41 / 36 / 27 / 20", "89.9%")   # 96 / 64: rounds 234 (reserve 28 + read-ahead 8)
 GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
     "ds41-gsq-iq2_xs.gguf": ("GSQ IQ2_XS", 159, "38 / 26 / - / -", "90.0%", "IQ2_XS"),
     "ds41-gsq-iq2_xxs.gguf": ("GSQ IQ2_XXS", 142, "41 / 32 / - / -", "87.8%", "IQ2_XXS"),
@@ -52,7 +52,7 @@ GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
 UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreement, its Engram tables
     "UD-IQ1_S": (233, "41 / 41 / 36 / 31", "89.1%", "IQ4_NL"),   # 41.0 / 40.6 / 36.5 / 30.6 tok/s (round 325); 89.1 / 91.5 / 95.3%, rev 8a6ec9cf
     "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
-    "UD-IQ2_XXS": (301, "40 / 34 / 29 / 21", "91.1%", "Q5_K"),    # 40.4 / 34.0 / 29.3 / 21.0 tok/s (round 317); 91.1 / 94.5 / 95.9% at bias 0.28
+    "UD-IQ2_XXS": (301, "41 / 34 / 29 / 21", "91.1%", "Q5_K"),    # 41.1 / 34.0 / 29.3 / 21.0 tok/s (round 317); 91.1 / 94.5 / 95.9% at bias 0.28
     "UD-Q2_K_XL": (335, "31 / 27 / 23 / 15", "92.5%", "Q5_K"),    # 31.3 / 26.6 / 22.9 / 15.2 tok/s; 92.5 / 95.3 / 97.0% - the quality pick
     "UD-IQ3_XXS": (395, "28 / 23 / 18 / 12", "92.7%", "the default's"),   # 28.2 / 22.8 / 18.3 / 11.7 tok/s; 92.7 / 95.9 / 97.4%; its Q6_K Engram tables are not read (the default's)
     "UD-IQ3_S": (424, "-", "-", "IQ4_NL"),
@@ -309,7 +309,7 @@ def main():
                 ("  - needs ~192 GB of RAM" if small else "") + room(gb))
     print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, as shipped; exact routing for GSQ and")
     print("  EXL3 (code + maths in the README).  From 120 GB of RAM: Unsloth UD-IQ2_XXS is the pick - on 192 GB it writes about")
-    print("  as fast as the default (40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling), on 128 GB 5% slower (34")
+    print("  as fast as the default (41.1 vs 40.7 tok/s greedy, 39.7 vs 40.3 at the shipped sampling), on 128 GB 5% slower (34")
     print("  vs 36), and it agrees more (91.1%, and 94.5% on code + maths against the default's 89.9 / 93.1%), from 65 GB less")
     print("  disk; Unsloth UD-Q2_K_XL is the")
     print("  quality pick (31 tok/s, 92.5% / 95.3%) - it agrees more than EXL3 2.5 bpw and writes ~25% faster; UD-IQ3_XXS is")
