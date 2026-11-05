@@ -430,8 +430,8 @@ def main():
     # under ~110 GB of RAM the default reads most experts from the SSD (rounds 220 / 225 / 227, an RTX 3090): one line
     # on the model that runs better there
     if total_ram_gib() < 102 and os.path.basename(model) in ("DeepSeek-V4.1-Flash-1017-Q2.gguf", "ds4-q2-slim.gguf"):
-        print("ds41_local: tip - with this much RAM, Unsloth's UD-IQ1_S writes faster than the default (measured 30 / 25.5 "
-              "vs 27 / 20 tok/s at 96 / 64 GB; 89.3 vs 91.5% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
+        print("ds41_local: tip - with this much RAM, Unsloth's UD-IQ1_S writes faster than the default (measured 36 / 31 "
+              "vs 27 / 20 tok/s at 96 / 64 GB; 89.1 vs 89.9% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
     if cfg.get("vision"):
         print(f"ds41_local: pictures on ({'on the GPU' if cfg['vision']['gpu'] else 'on the CPU'})")
     for p in missing:

@@ -51,11 +51,11 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
 
 These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 
-| ds4 Q2 GGUF | 192 GB RAM | 128 GB RAM |
+| UD-IQ2_XXS (the default on 192 GB) | 192 GB RAM | 128 GB RAM |
 |---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **40 tok/s** | **36 tok/s** |
-| Writing, the default sampling (temperature 1, top-p 0.95) | **40 tok/s** | - |
-| Reading a long prompt (25-64k tokens) | **610 tok/s** | **410 tok/s** |
+| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **40 tok/s** | **34 tok/s** |
+| Writing, the default sampling (temperature 1, top-p 0.95) | **38 tok/s** | - |
+| Reading a long prompt (25-64k tokens) | **620-740 tok/s** | **470-600 tok/s** |
 
 The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  Greedy means temperature 0 in the
 request; the default sampling is what a client gets when it sends no temperature.  Sampling accepts fewer of the
@@ -65,9 +65,9 @@ sampled instead of taken as its top pick (`STRATA_DSPARK_SAMPLE` in `Start DeepS
 distribution is unchanged.
 
 **New in 0.93: on 192 GB of RAM the default is Unsloth's UD-IQ2_XXS** (first start offers it on 180 GB or more; the
-ds4 Q2 GGUF stays one answer away).  It writes about as fast as the ds4 Q2 GGUF - 40.4 vs 40.0 tok/s greedy, 38.4 vs
-39.7 at the default sampling - and agrees with DeepSeek's own model more often: 92.5% vs 91.5% on general text, 95.9%
-vs 93.0% on code and maths (below: "Other quants").
+ds4 Q2 GGUF stays one answer away, and writes 36 tok/s on 128 GB).  It writes about as fast as the ds4 Q2 GGUF - 40.4 vs 40.0 tok/s greedy, 38.4 vs
+39.7 at the default sampling - and agrees with DeepSeek's own model more often: 91.1% vs 89.9% on general text, 94.5%
+vs 93.1% on code and maths at the settings that ship (below: "Other quants").
 
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
 long prompts, but the output is the same.
@@ -80,23 +80,33 @@ own model:
 
 | Model | Agreement | 192 GB | 128 GB | **96 GB** | **64 GB** |
 |---|---|---|---|---|---|
-| ds4 Q2 (the default) | 91.5% | 40 | 36 | 27 | 20 |
-| **Unsloth UD-IQ1_S** | 89.3% | 40 | 37.5 | **30** | **25.5** |
-| GSQ IQ1_M | 85.5% | 42 | 37.5 | **34** | **28** |
+| Unsloth UD-IQ2_XXS | 91.1% | 40 | 34 | 29 | 21 |
+| ds4 Q2 (the default) | 89.9% | 40 | 36 | 27 | 20 |
+| **Unsloth UD-IQ1_S** | 89.1% | 41 | 41 | **36** | **31** |
+| Unsloth UD-Q2_K_XL | 92.5% | 31 | 27 | 23 | 15 |
+| Unsloth UD-IQ3_XXS | 92.7% | 28 | 23 | 18 | 12 |
+| GSQ IQ1_M (exact routing) | 85.5% | 42 | 37.5 | **34** | **28** |
 
-- **Under ~110 GB of RAM, use Unsloth's UD-IQ1_S**: one point less agreement and faster.  New prompts take longer
-  than on 192 GB: the default reads a ~180-token prompt in ~8 s at 96 GB and ~12.5 s at 64 GB. The first start offers
+- **Under ~110 GB of RAM, use Unsloth's UD-IQ1_S**: about a point less agreement than ds4 Q2 and much faster.  New prompts
+  take longer than on 192 GB: UD-IQ1_S reads a ~180-token prompt in ~4.3 s at 96 GB and ~8.3 s at 64 GB. The first start offers
   UD-IQ1_S instead of the default on such a PC; `Choose Model.bat` downloads it on an existing install.
 - The default's 96 / 64 GB numbers are this release's launcher as it ships: the expert memory it gives such a PC
   (61 and 31 GiB; it was 51 and 21) and the SSD read-ahead (`STRATA_D3_SPEC=8`, which reads the experts the next
   layers will need while the current ones run - exact, +22% at 64 GB).  Before those two changes the same rows were
-  22 and 16.  The small quants were measured with 58 and 26 GiB, so expect a little more from them now.  The SSD
-  matters most here: the small quants were read from a PCIe 4.0 NVMe (~3.5 GiB/s).
+  22 and 16.  The SSD matters most here: everything was read from a PCIe 4.0 NVMe (~3.5 GiB/s).
 - Below 56 GB of RAM it will probably not start.
 
-On the 192 GB PC, a new 6k-token prompt takes about 18 s and a 25k-token prompt about 42 s. Writing is fastest on
+On the 192 GB PC, a new 6k-token prompt takes about 15 s and a 25k-token prompt about 41 s (UD-IQ2_XXS). Writing is fastest on
 maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the prompt and the thinking, a client sees
 ~39 tok/s.
+
+### A second GPU
+
+The Setup tab in the chat page has a Multi-GPU switch: a helper on a second card of 8 GB or more holds experts the
+main card has no room for.  The main card needs 20 GB or more.  Measured with an RTX 3060 12 GB in an x4 slot beside
+the 3090: about +0-3% writing speed on UD-IQ2_XXS, +1.5% on ds4 Q2.  It does not split the model across cards, so it
+does not scale: for two or more big cards use [Project Maya](https://github.com/mw00/project-maya), which runs
+DeepSeek in tensor parallel.
 
 ## Windows settings for speed
 
@@ -157,7 +167,7 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 | | General | Code + maths |
 |---|---|---|
 | Exact routing | 91.4% | 92.1% |
-| **Route bias 0.28 (the default)** | **90.2%** | **92.4%** |
+| **Route bias 0.28 (the default)** | **89.9%** | **93.1%** |
 | Route bias 0.10 (`DS41_ROUTE_BIAS=0.10`) | 91.8% | 92.8% |
 
 - **Want the most agreement?** Set `DS41_ROUTE_BIAS=0.10` in `ds41-paths.bat`: +1.6 points on general text and +0.4 on
@@ -169,8 +179,8 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
   89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with the refresh).  The test moves
   by about 0.2 points between identical runs.
 - On agentic, tool-calling text (53 transcripts with tools, tool calls and tool results, 46K tokens) the bias costs the
-  same as on prose: exact routing agrees with DeepSeek's own model on 95.98% of next tokens, the default 0.28 on
-  94.83%; inside the tool-call JSON itself the cost is 0.4 points, in the prose between calls 2.9.  There is no
+  same as on prose: exact routing agrees with DeepSeek's own model on 96.05% of next tokens, the default 0.28 on
+  95.10%; inside the tool-call JSON itself the cost is 0.4 points, in the prose between calls 2.9.  There is no
   collapse at this setting (reports of collapse come from a bias of 1.0, which this launcher does not use).
 - `--kv-fp4` (the compressed KV cache, on by default) is exact: the logits are bit-identical with and without it.
 - For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`, or
@@ -195,14 +205,15 @@ pick and saves your choice (`model-choice.txt`); the next start loads it.
   read: it uses the default's, so keep the default for it (Choose Model refuses it without).  To install an Unsloth
   quant INSTEAD of the default: answer N when `Start DeepSeek.bat` offers the default model's download, run
   `Choose Model.bat`, pick the download, then start `Start DeepSeek.bat` again.
-- **The quality mode: Unsloth UD-Q2_K_XL** (Choose Model, 335 GB): 95.0% / 96.8% agreement at 31 tok/s on 192 GB of
-  RAM - more than EXL3 2.5 bpw (94.4 / 95.6) and ~25% faster.  Unsloth UD-IQ3_XXS (395 GB + the default) is the most
-  exact, 95.5% / 97.6% at 28 tok/s; UD-Q2_K_XL stays the faster quality pick.  On 192 GB the launcher gives files with
+- **The quality mode: Unsloth UD-Q2_K_XL** (Choose Model, 335 GB): 92.5% / 95.3% agreement at the shipped bias at 31 tok/s
+  on 192 GB of RAM (95.0% / 96.8% exact routing, more than EXL3 2.5 bpw's 94.4 / 95.6) and ~25% faster than EXL3.  Unsloth
+  UD-IQ3_XXS (395 GB + the default) is the most exact, 92.7% / 95.9% at 28 tok/s; UD-Q2_K_XL stays the faster quality pick.  On 192 GB the launcher gives files with
   experts this big a 158 GiB arena (20 GiB of RAM kept back instead of 28: close other big programs).  **The 192 GB
-  default: Unsloth UD-IQ2_XXS** (301 GB): 92.5% / 95.9% - a point more than the ds4 Q2 GGUF on general text and three
-  more on code and maths - and about as fast (40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the default sampling).
+  default: Unsloth UD-IQ2_XXS** (301 GB): 91.1% / 94.5% - about a point more than the ds4 Q2 GGUF on general text and on
+  code and maths - and about as fast (40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the default sampling).
   UD-Q2_K_XL and UD-IQ2_XXS: measured on revision 60ad3651 (Unsloth's Dynamic V3.1 files of 10-30), the one Choose Model
-  downloads, with the default model's exact FP8 Engram tables.  They carry their own (Q5_K, in the last file), which
+  downloads (UD-IQ1_S: 8a6ec9cf, whose re-made files agree 1.3-1.6 points more than the older ones at the same size; re-download
+  to get them), with the default model's exact FP8 Engram tables.  They carry their own (Q5_K, in the last file), which
   the engine reads: as good as the FP8 ones (UD-IQ2_XXS 93.1 vs 92.9% top-1, the same speed), so they need no other
   file.
 - **EXL3 2.5 bpw** ([bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw](https://huggingface.co/bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw)):
@@ -216,7 +227,19 @@ pick and saves your choice (`model-choice.txt`); the next start loads it.
   most of its experts would come from the drive.  By hand: put
   `exl3/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw` in `model-choice.txt`, or set `DS41_EXL3` to the folder.
 
-Measured here, exact routing, top-1 agreement with DeepSeek's own model (teacher-forced, every token):
+Measured here at the settings that ship (route bias 0.28), top-1 agreement with DeepSeek's own model (teacher-forced,
+every token), and writing speed through the server:
+
+| | download | general | code + maths | agentic | writing, 192 / 128 / 96 / 64 GB RAM |
+|---|---|---|---|---|---|
+| ds4 Q2 (the default) | 366 GB | 89.9% | 93.1% | 95.1% | 40 / 36 / 27 / 20 tok/s |
+| Unsloth UD-IQ1_S | 233 GB | 89.1% | 91.5% | 95.3% | 41 / 41 / 36 / 31 tok/s |
+| **Unsloth UD-IQ2_XXS** (the 192 GB default) | 301 GB | **91.1%** | **94.5%** | **95.9%** | 40.4 / 34 / 29 / 21 tok/s |
+| **Unsloth UD-Q2_K_XL** (the quality mode) | 335 GB | **92.5%** | **95.3%** | **97.0%** | 31 / 27 / 23 / 15 tok/s |
+| Unsloth UD-IQ3_XXS | 395 GB + the default | **92.7%** | **95.9%** | **97.4%** | 28 / 23 / 18 / 12 tok/s |
+
+Two hosts of the full model agreed with each other on 98.3% and 98.9% of the same tokens.  Exact routing, what each file
+reaches with no route bias (slower):
 
 | | download | general | code + maths | writing, 192 / 128 GB RAM | notes |
 |---|---|---|---|---|---|
@@ -224,7 +247,7 @@ Measured here, exact routing, top-1 agreement with DeepSeek's own model (teacher
 | GSQ IQ2_XS | 159 GB + the default | 90.0% | 92.9% | 38 / 26 tok/s | answered our task questions as well as the default |
 | GSQ IQ2_XXS | 142 GB + the default | 87.8% | 89.5% | 41 / 32 tok/s | fewer knowledge questions right; long prompts slower |
 | GSQ IQ1_M | 125 GB + the default | 85.5% | - | 42 / 37.5 tok/s | long prompts slower (no fast prompt kernel for IQ1_M) |
-| Unsloth UD-IQ1_S | 233 GB | 89.3% | 91.1% | 40 / **37.5** tok/s | the pick under 110 GB: IQ1_M's speed, 4 points more agreement |
+| Unsloth UD-IQ1_S (the older files) | 233 GB | 89.3% | 91.1% | 40 / 37.5 tok/s | the pick under 110 GB: IQ1_M's speed, 4 points more agreement |
 | **Unsloth UD-IQ2_XXS** (the 192 GB default) | 301 GB | **92.5%** | **95.9%** | 40.4 / 34 tok/s | +1 point general, +3 on code and maths; about as fast as ds4 Q2 (38.4 vs 39.7 at the default sampling) |
 | **Unsloth UD-Q2_K_XL** (the quality mode) | 335 GB | **95.0%** | **96.8%** | 31 / - tok/s | the faster quality pick; ~25% faster than EXL3 2.5 |
 | Unsloth UD-IQ3_XXS | 395 GB + the default | **95.5%** | **97.6%** | 28 / - tok/s | the most exact measured here; reads the default's Engram tables |
@@ -233,13 +256,13 @@ Measured here, exact routing, top-1 agreement with DeepSeek's own model (teacher
 
 On 192 GB of RAM ds4 Q2, UD-IQ2_XXS and UD-IQ1_S write about as fast as anything at the default sampling, and of those
 UD-IQ2_XXS agrees best with DeepSeek.  UD-Q2_K_XL agrees more, ~22% slower than the ds4 Q2 GGUF (31.3 vs 40.0 tok/s,
-greedy), and UD-IQ3_XXS is the most exact (95.5% / 97.6%) at 28 tok/s.
+greedy), and UD-IQ3_XXS is the most exact (92.7% / 95.9% at the shipped bias) at 28 tok/s.
 Speed falls once a model's experts (its file without the Engram table) outgrow the RAM (~150-160 GB of them fit at
 192 GB): the rest is read from the SSD on every token.  So on 192 GB the Unsloth quants above
 UD-IQ2_XXS (UD-Q2_K_XL: ~190 GB of experts) are slower (above UD-IQ3_XXS: not measured yet) - in exchange UD-Q4_K_XL /
 Q8_K_XL keep DeepSeek's own MXFP4 experts.  On 128 GB the smaller files write fastest (more of their experts fit in
-RAM): Unsloth UD-IQ1_S and GSQ IQ1_M 37.5 vs 36 tok/s for the default - UD-IQ1_S at 2 points less agreement than the
-default, IQ1_M at 6.  UD-IQ1_S also reads long prompts faster than the default (a 16K-token prompt at ~655 vs ~580
+RAM): Unsloth UD-IQ1_S 41 and GSQ IQ1_M 37.5 vs 36 tok/s for the default - UD-IQ1_S at about a point less agreement than
+the default, IQ1_M at 6 (both at exact routing).  UD-IQ1_S also reads long prompts faster than the default (a 16K-token prompt at ~655 vs ~580
 tok/s) and loaded in 25 s vs ~60 s here.  Checked
 against ISTA's files as of 2026-10-25: the merged experts are byte-identical to theirs; their norms, router and router
 bias are bit-identical to the default file's (GSQ-RCO only changes the routed experts).  Unsloth's Engram hash constants
@@ -256,7 +279,7 @@ bias are bit-identical to the default file's (GSQ-RCO only changes the routed ex
   probably does not fit (~9 GB is fixed: dense weights, KV, buffers).  RTX 20 (Titan RTX, Quadro RTX): the engine is
   built for it, not tested here.  GTX 10 series (Pascal) and older cards cannot run it, whatever the driver: CUDA 13
   supports compute capability 7.5 and newer only.  `Start DeepSeek.bat` says so before downloading anything.
-- 128 GB of RAM or more.
+- 64 GB of RAM or more, 128 GB or more recommended.  Below 56 GB it will probably not start.
 - An x86-64 CPU.  AVX2 (Intel from 2013 / Haswell on, any AMD Ryzen, Threadripper or EPYC) is the fast path; newer
   instructions (AVX-512, AVX-VNNI) are used where the CPU has them.  Older CPUs get an engine built for them, picked
   automatically: with AVX but not AVX2 (Sandy / Ivy Bridge Xeons) 38 tok/s, with neither (e.g. Westmere Xeons) 17 -

@@ -28,6 +28,8 @@ UNSLOTH = "unsloth/DeepSeek-V4.1-Flash-1017-GGUF"
 # the revision our numbers were measured on (2026-10-20): Unsloth re-made UD-IQ1_S / UD-IQ1_M / UD-Q2_K_XL on 10-28 with
 # the same sizes and new content - pinned until the new files are measured
 UNSLOTH_REV = "60ad3651"
+# rounds 323 / 325: the re-made UD-IQ1_S is closer to DeepSeek than the pinned one (89.1 / 91.5% vs 87.5 / 90.2% at bias 0.28), same size
+UNSLOTH_REV_OF = {"UD-IQ1_S": "8a6ec9cf"}
 GB = 1e9
 # Writing tok/s through the server at 192 / 128 / 96 / 64 GB of RAM (the 96 / 64 GB columns: 2026-10-28/29, a PC with
 # that much RAM simulated by locking the rest away, so neither Windows' file cache nor the pagefile could use it; "-" =
@@ -35,22 +37,23 @@ GB = 1e9
 LOW_RAM_GB = 110
 LOW_RAM_PICK = "UD-IQ1_S"
 # ... and on one with HIGH_RAM_GB or more (0.93's final cards: UD-IQ2_XXS writes about as fast as the default - 40.4 vs
-# 40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling - agrees more, 92.5 / 95.9% vs 91.5 / 93.0%, and is 65 GB smaller)
+# 40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling - agrees more, 91.1 / 94.5% vs 89.9 / 93.1% at the shipped bias, and is 65 GB smaller)
 HIGH_RAM_GB = 180
 HIGH_RAM_PICK = "UD-IQ2_XXS"
-# (menu name, GB on disk, writing tok/s, top-1 agreement with DeepSeek's API)
-DEFAULT = ("ds4 Q2 (the default)", 366, "40 / 36 / 27 / 20", "91.5%")   # 96 / 64: rounds 234 (reserve 28 + read-ahead 8)
+# (menu name, GB on disk, writing tok/s, top-1 agreement with DeepSeek's API on general text: at the shipped route bias 0.28 for
+# the default and Unsloth (rounds 314-325), exact routing for GSQ and EXL3, which were not measured at 0.28)
+DEFAULT = ("ds4 Q2 (the default)", 366, "40 / 36 / 27 / 20", "89.9%")   # 96 / 64: rounds 234 (reserve 28 + read-ahead 8)
 GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
     "ds41-gsq-iq2_xs.gguf": ("GSQ IQ2_XS", 159, "38 / 26 / - / -", "90.0%", "IQ2_XS"),
     "ds41-gsq-iq2_xxs.gguf": ("GSQ IQ2_XXS", 142, "41 / 32 / - / -", "87.8%", "IQ2_XXS"),
     "ds41-gsq-iq1_m.gguf": ("GSQ IQ1_M", 125, "42 / 37.5 / 34 / 28", "85.5%", "IQ1_M"),
 }
 UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreement, its Engram tables
-    "UD-IQ1_S": (233, "40 / 37.5 / 30 / 25.5", "89.3%", "IQ4_NL"),   # rounds 167, 170, 227
+    "UD-IQ1_S": (233, "41 / 41 / 36 / 31", "89.1%", "IQ4_NL"),   # 41.0 / 40.6 / 36.5 / 30.6 tok/s (round 325); 89.1 / 91.5 / 95.3%, rev 8a6ec9cf
     "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
-    "UD-IQ2_XXS": (301, "40 / 34 / - / -", "92.5%", "Q5_K"),    # 40.4 tok/s (v2 40e42129), 34.2 at 128 GB (round 310); 92.5% / 95.9%
-    "UD-Q2_K_XL": (335, "31 / - / - / -", "95.0%", "Q5_K"),    # the final cards: 31.3 tok/s; 95.0% / 96.8% - the quality pick
-    "UD-IQ3_XXS": (395, "28 / - / - / -", "95.5%", "the default's"),   # the final cards: 28.2 tok/s; 95.5% / 97.6%; its Q6_K Engram tables are not read (the default's)
+    "UD-IQ2_XXS": (301, "40 / 34 / 29 / 21", "91.1%", "Q5_K"),    # 40.4 / 34.0 / 29.3 / 21.0 tok/s (round 317); 91.1 / 94.5 / 95.9% at bias 0.28
+    "UD-Q2_K_XL": (335, "31 / 27 / 23 / 15", "92.5%", "Q5_K"),    # 31.3 / 26.6 / 22.9 / 15.2 tok/s; 92.5 / 95.3 / 97.0% - the quality pick
+    "UD-IQ3_XXS": (395, "28 / 23 / 18 / 12", "92.7%", "the default's"),   # 28.2 / 22.8 / 18.3 / 11.7 tok/s; 92.7 / 95.9 / 97.4%; its Q6_K Engram tables are not read (the default's)
     "UD-IQ3_S": (424, "-", "-", "IQ4_NL"),
     "UD-Q3_K_XL": (485, "-", "-", "exact"),
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
@@ -141,18 +144,19 @@ def download_exl3(m, d):
 def download_unsloth(m, q):
     """hf download unsloth/... --include q/* into <models>/unsloth, then every shard's SHA-256 (hf_verify.py)"""
     from huggingface_hub import HfApi
-    files = [f for f in HfApi().list_repo_files(UNSLOTH, revision=UNSLOTH_REV) if f.startswith(q + "/") and f.endswith(".gguf")]
+    rev = UNSLOTH_REV_OF.get(q, UNSLOTH_REV)
+    files = [f for f in HfApi().list_repo_files(UNSLOTH, revision=rev) if f.startswith(q + "/") and f.endswith(".gguf")]
     if not files:
         sys.exit(f"{UNSLOTH} has no {q} files")
     hf = os.path.join(ROOT, ".venv", "Scripts", "hf.exe")
     py = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
     dst = os.path.join(m, "unsloth")
     os.makedirs(dst, exist_ok=True)
-    r = subprocess.call([hf if os.path.exists(hf) else "hf", "download", UNSLOTH, "--revision", UNSLOTH_REV, "--include", q + "/*", "--local-dir", dst])
+    r = subprocess.call([hf if os.path.exists(hf) else "hf", "download", UNSLOTH, "--revision", rev, "--include", q + "/*", "--local-dir", dst])
     if r != 0:
         sys.exit("The download stopped (above) - start Choose Model.bat again to go on where it was.")
     r = subprocess.call([py if os.path.exists(py) else sys.executable, os.path.join(ROOT, "tools", "v41", "hf_verify.py"),
-                         "--repo", UNSLOTH, "--revision", UNSLOTH_REV, "--dir", dst] + files)
+                         "--repo", UNSLOTH, "--revision", rev, "--dir", dst] + files)
     if r != 0:
         sys.exit("A file differs from its published SHA-256 (above): delete it and start Choose Model.bat again.")
 
@@ -302,14 +306,14 @@ def main():
             small = ram is not None and ram < EXL3_MIN_RAM_GB
             row("download", d, "download " + name.split(" (")[0], gb, tps, agr,
                 ("  - needs ~192 GB of RAM" if small else "") + room(gb))
-    print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, exact routing (code + maths in the")
-    print("  README).  On 192 GB of RAM: Unsloth UD-IQ2_XXS is the pick - it writes about as fast as the default (40.4 vs")
-    print("  40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling) and agrees more (92.5%, and")
-    print("  95.9% on code + maths against the default's 91.5 / 93.0%), from 65 GB less disk; Unsloth UD-Q2_K_XL is the")
-    print("  quality pick (31 tok/s, 95.0% / 96.8%) - it agrees more than EXL3 2.5 bpw and writes ~25% faster; UD-IQ3_XXS is")
-    print("  the most exact (28 tok/s, 95.5% / 97.6%), UD-Q2_K_XL the faster of the two.  With less")
+    print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, as shipped; exact routing for GSQ and")
+    print("  EXL3 (code + maths in the README).  On 192 GB of RAM: Unsloth UD-IQ2_XXS is the pick - it writes about as fast as")
+    print("  the default (40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling) and agrees more (91.1%, and")
+    print("  94.5% on code + maths against the default's 89.9 / 93.1%), from 65 GB less disk; Unsloth UD-Q2_K_XL is the")
+    print("  quality pick (31 tok/s, 92.5% / 95.3%) - it agrees more than EXL3 2.5 bpw and writes ~25% faster; UD-IQ3_XXS is")
+    print("  the most exact (28 tok/s, 92.7% / 95.9%), UD-Q2_K_XL the faster of the two.  With less")
     print("  RAM a smaller file writes faster (more of it fits; the rest is read from the SSD on every token): under")
-    print("  110 GB, Unsloth UD-IQ1_S, 30 / 25.5 tok/s at 96 / 64 GB against the default's 27 / 20, one point lower")
+    print("  110 GB, Unsloth UD-IQ1_S, 36 / 31 tok/s at 96 / 64 GB against the default's 27 / 20, about one point lower")
     print("  agreement.  (Measured on an RTX 3090.)\n")
     if not menu:
         sys.exit("No model yet - run Start DeepSeek.bat first: it downloads the default one.")
