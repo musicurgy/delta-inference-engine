@@ -321,6 +321,61 @@ def ds41_call_end(text: str) -> int:
     return text.find(INVOKE_CLOSE)
 
 
+# ---- a parameter's schema (upstream b48bf015, Basalt #208): `anyOf` / `oneOf` / type lists count, and so does a tool
+# whose parameters are themselves a union.  Without this `anyOf: [integer, null]` read as "no type", so a tag with no
+# string=... came back as the text "7", and string="false" on a text parameter turned "123" into a number.
+def _deref(root, s, depth=0):
+    while isinstance(s, dict) and isinstance(s.get("$ref"), str) and s["$ref"].startswith("#/") and depth < 16:
+        at = root
+        for key in s["$ref"][2:].split("/"):
+            at = at.get(key) if isinstance(at, dict) else None
+        s, depth = at, depth + 1
+    return s
+
+
+def _alternatives(s):
+    return [alt for k in ("anyOf", "oneOf") for alt in (s.get(k) if isinstance(s.get(k), list) else [])]
+
+
+def _param_types(root, s, depth=0) -> set:
+    """The types a parameter may have; empty when nothing says."""
+    s = _deref(root, s)
+    if not isinstance(s, dict) or depth > 16:
+        return set()
+    t = s.get("type")
+    out = set(t) if isinstance(t, list) else {t} if isinstance(t, str) else set()
+    for alt in _alternatives(s):
+        out |= _param_types(root, alt, depth + 1)
+    return out
+
+
+def _tool_props(spec) -> tuple:
+    """(the tool's parameters, its properties by name): a union's variants take part, the first to name one wins."""
+    root = (spec or {}).get("parameters") or {}
+    if not isinstance(root, dict):
+        return {}, {}
+    props, todo, seen = dict(root.get("properties") or {}), _alternatives(root), 0
+    while todo and seen < 256:
+        seen += 1
+        v = _deref(root, todo.pop(0))
+        if isinstance(v, dict):
+            for k, val in (v.get("properties") or {}).items():
+                props.setdefault(k, val)
+            todo += _alternatives(v)
+    return root, props
+
+
+def _param_kind(spec, name) -> str:
+    """"text" when the value stays text, "text?" when the text null is None too, "json" when it is decoded."""
+    root, props = _tool_props(spec)
+    if name not in props:
+        return "json"
+    types = _param_types(root, props[name])
+    if "string" not in types:
+        return "json"
+    return "text?" if "null" in types else "text"
+
+
 def ds41_parse_tool_call(body: str, schema=None):
     m = re.match(r'\s*name="(.*?)">', body, re.DOTALL)
     if not m:
@@ -328,8 +383,11 @@ def ds41_parse_tool_call(body: str, schema=None):
     args = {}
     for key, is_str, value in _P_RE.findall(body[m.end():]):
         value = unescape(value)
-        if is_str == "true":
+        kind = _param_kind(schema, key)
+        if is_str == "true" or kind == "text":
             args[key] = value
+        elif kind == "text?":
+            args[key] = None if value.strip() == "null" else value
         else:
             try:
                 args[key] = json.loads(value)
@@ -390,8 +448,10 @@ def _tag_text(self, text: str, out: list):
 
 def _param_is_string(self, tool: str, name: str) -> str:
     """A parameter tag written without string=...: as the declared type says, a string if nothing does."""
-    props = ((self.schemas.get(tool) or {}).get("parameters") or {}).get("properties") or {}
-    return "true" if (props.get(name) or {}).get("type") in (None, "string") else "false"
+    spec = self.schemas.get(tool)
+    root, props = _tool_props(spec)
+    types = _param_types(root, props.get(name))
+    return "true" if not types or _param_kind(spec, name) == "text" else "false"   # "text?": the parser reads the null
 
 
 def _tag(self, m, out: list) -> bool:

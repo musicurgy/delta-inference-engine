@@ -191,6 +191,50 @@ def t_parser():
     check("DwarfStar escape undone", D.unescape(esc) == "a" + D.P_CLOSE + "b", D.unescape(esc))
 
 
+def t_param_schema():
+    """upstream b48bf015: parameters decode by their schema, unions and nullable strings too; DSML's string= still counts"""
+    null_str = {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]}
+    spec = {"name": "note", "parameters": {"type": "object", "properties": {
+        "path": null_str, "one": {"oneOf": [{"type": "string"}, {"type": "null"}]}, "listed": {"type": ["string", "null"]},
+        "plain": {"type": "string"}, "mixed": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+        "count": {"anyOf": [{"type": "integer"}, {"type": "null"}]}, "n": {"type": "integer"}, "free": {}}}}
+    union = {"name": "auto", "parameters": {"type": "object", "properties": {}, "oneOf": [{"$ref": "#/$defs/v"}, {"$ref": "#/$defs/w"}],
+             "$defs": {"id": {"type": "string"}, "v": {"type": "object", "properties": {"id": {"$ref": "#/$defs/id"}}},
+                       "w": {"oneOf": [{"type": "object", "properties": {"name": {"type": "string"}, "every": {"type": "integer"}}}]}}}}
+
+    def arg(sp, name, value, s="false"):
+        body = f' name="{sp["name"]}">{D.P_OPEN} name="{name}" string="{s}">{value}{D.P_CLOSE}'
+        return D.ds41_parse_tool_call(body, sp).arguments[name]
+    for n in ("path", "one", "listed", "plain", "mixed"):
+        check(f"schema: {n} stays text", arg(spec, n, "123") == "123" and arg(spec, n, "x/y") == "x/y", n)
+    for n in ("path", "one", "listed"):
+        check(f"schema: {n} null is None", arg(spec, n, "null") is None, n)
+    check("schema: null stays text on a plain string", arg(spec, "plain", "null") == "null")
+    check("schema: a number where the type says so", arg(spec, "count", "7") == 7 and arg(spec, "n", "5") == 5 and arg(spec, "count", "null") is None)
+    check("schema: no type decodes JSON", arg(spec, "free", "[1, 2]") == [1, 2])
+    check("schema: string=true wins", arg(spec, "n", "5", "true") == "5")
+    check("schema: without a schema, JSON", D.ds41_parse_tool_call(f' name="x">{D.P_OPEN} name="a" string="false">3{D.P_CLOSE}').arguments == {"a": 3})
+    check("schema: a union's variants type their parameters", arg(union, "id", "42") == "42" and arg(union, "every", "8") == 8 and arg(union, "name", "123") == "123")
+
+    class P:
+        schemas = {"note": spec}
+    for n, want in (("plain", "true"), ("mixed", "true"), ("free", "true"), ("missing", "true"), ("n", "false"), ("count", "false"), ("path", "false")):
+        check(f"schema: a tag without string= on {n}", D._param_is_string(P, "note", n) == want, n)
+    # a tag with no string=: the whole way through the parser
+    for value, want in (("7", 7), ("null", None)):
+        text = f'{D.CALLS_OPEN}\n< invoke name="note">\n< parameter name="count">{value}</ parameter>\n</ invoke>\n{D.CALLS_CLOSE}'
+        p = F.OutputParser(thinking=False, tools=[spec])
+        ev = p.feed(text) + p.finish()
+        got = [e.call.arguments for e in ev if e.kind == "tool_call"]
+        check(f"schema: bare tag decodes {value}", got == [{"count": want}], got)
+
+
+def t_undeclared_call():
+    """upstream 31c02061: a call opened with the DSML token comes back as a call even for a tool the request did not declare"""
+    r, c, k = run_parser(dsml([("bash", {"command": "ls"})]), False, 7)
+    check("a DSML call to an undeclared tool is a call, no markup in the content", [x[0] for x in k] == ["bash"] and "DSML" not in c and "invoke" not in c, (c, k))
+
+
 def t_tokenizer(tok_dir):
     import strata_tokenizer as ST
     tokens = json.load(open(tok_dir / "vocab.json", encoding="utf-8"))   # not the ANSI code page (cp932 failed)
@@ -296,6 +340,8 @@ if __name__ == "__main__":
     t_template()
     t_effort_kwargs()
     t_parser()
+    t_param_schema()
+    t_undeclared_call()
     if len(sys.argv) > 1:
         t_tokenizer(Path(sys.argv[1]))
         t_http(Path(sys.argv[1]))
