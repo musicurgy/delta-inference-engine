@@ -93,3 +93,4 @@ models/
 # the model "Choose Model.bat" picked, and whether pictures are on (this PC only)
 /model-choice.txt
 /vision-choice.txt
+/delta-settings.json

@@ -56,7 +56,7 @@ UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreemen
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
     "UD-Q8_K_XL": (508, "-", "-", "exact"),
 }
-TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ2_XXS": " (192 GB)"}   # the picks the menu text below explains
+TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ3_XXS": " (most exact)", "UD-IQ2_XXS": " (192 GB)"}   # the picks the menu text below explains
 EXL3 = {   # folder in exl3/ -> name, GB to download, speed, agreement, Hugging Face repo
     "DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw": ("EXL3 2.5 bpw", 185, "25 / - / - / -", "94.4%",
                                              "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw"),   # round 238
@@ -180,9 +180,70 @@ def get(q):
     return 0
 
 
+def custom_help(m):
+    print(f"""
+  Your own model: make the folder {os.path.join(m, "custom")} and copy it there, then start again.
+    - a GGUF of DeepSeek-V4.1-Flash-1017 with all 384 experts: one .gguf file, or a split model's files together
+      (a split model carries its own Engram tables; one .gguf file needs the default model installed as well)
+    - or a folder of EXL3 experts (with its config.json), which also needs the default model
+  Start DeepSeek.bat then offers it here, and the Setup card on the chat page lists it.  A file this engine cannot
+  run is refused with the reason.
+""")
+
+
+def first():
+    """--first: no model yet.  Exit 0 = a model is chosen and there, 10 = the default (setup-ds41-models.bat gets it),
+    11 = none: the user brings their own."""
+    import setup_panel as SP
+    m = models_dir()
+    os.makedirs(m, exist_ok=True)
+    ram = ram_gb()
+    rec = SP.recommended(ram)
+    picks = [("default", DEFAULT[0], DEFAULT[1], DEFAULT[2], DEFAULT[3], "")]
+    for q in ("UD-IQ1_S", "UD-IQ2_XXS", "UD-Q2_K_XL", "UD-IQ3_XXS"):
+        gb, tps, agr, eng = UNSLOTH_Q[q]
+        # a model that reads the default's Engram tables needs the default as well: the disk column counts both
+        picks.append((q, "Unsloth " + q + TAG.get(q, ""), gb + (DEFAULT[1] if eng == "the default's" else 0), tps, agr, ""))
+    print("\n  Which model should this PC use?" + (f"  ({ram} GB of RAM)" if ram else ""))
+    print("  Speeds are from an RTX 3090.  You can change this at any time with Choose Model.bat or the chat page.\n")
+    print("       model                                     disk     writing tok/s at             agreement with")
+    print("                                                          192 / 128 / 96 / 64 GB RAM   DeepSeek's API")
+    best = 1
+    for i, (key, name, gb, tps, agr, _) in enumerate(picks, 1):
+        is_rec = key == rec
+        best = i if is_rec else best
+        print(f"   {i}. {name:<39} {gb:>4} GB   {tps:<28} {agr:<8}{'  <- recommended for this PC' if is_rec else ''}")
+    print(f"   {len(picks) + 1}. None: I will use my own model\n")
+    while True:
+        try:
+            a = input(f"  Number (1-{len(picks) + 1}), Enter = {best}: ").strip() or str(best)
+        except EOFError:
+            a = str(best)
+        if a.isdigit() and 1 <= int(a) <= len(picks) + 1:
+            break
+        print("  Please type one of the numbers.")
+    if int(a) == len(picks) + 1:
+        for c in SP.custom_models(m):
+            if c["ok"] and not c["needs_default"]:
+                with open(CHOICE, "w", encoding="utf-8") as f:
+                    f.write(c["id"] + "\n")
+                print(f"  Using your own model: {c['name']}")
+                return 0
+        custom_help(m)
+        return 11
+    key = picks[int(a) - 1][0]
+    if key == "default":
+        return 10
+    rc = get(key)
+    # exit 10 keeps first-start's default download going: this model reads the default's Engram tables
+    return 10 if rc == 0 and UNSLOTH_Q[key][3] == "the default's" else rc
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--get":
         return get(sys.argv[2])
+    if sys.argv[1:] == ["--first"]:
+        return first()
     m = models_dir()
     if not os.path.isdir(m):
         sys.exit(f"No model folder at {m} yet - run Start DeepSeek.bat first: it sets up the default model.")

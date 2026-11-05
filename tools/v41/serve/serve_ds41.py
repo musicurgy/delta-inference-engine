@@ -563,6 +563,99 @@ def _prepare_ds41(self, messages, tools, kwargs, max_new=None, force=None, **kw)
 
 S.Service.prepare = _prepare_ds41
 
+# ---- the chat page's Setup card (setup_panel.py): model, speed or quality, multi-GPU.  Apply needs a new start, because the
+# launcher sizes the memory for each model: the server exits with 75 and Start DeepSeek.bat runs it again; the page waits.
+import subprocess  # noqa: E402
+import setup_panel as _setup  # noqa: E402
+
+
+class _Setup:
+    @staticmethod
+    def get():
+        return _setup.catalog()
+
+    @staticmethod
+    def post(svc, req):
+        with svc.status_lock:
+            if svc.status.get("busy") or svc.status.get("queued"):
+                raise ValueError("a request is running: try again when it has finished")
+        _setup.apply(req)
+
+        def restart():
+            _time.sleep(0.5)                     # the page gets its answer first
+            for close in (getattr(svc.engine, "close", None), svc.vision.shutdown if svc.vision else None):
+                try:
+                    if close:
+                        close()
+                except Exception as e:
+                    print(f"[strata] while stopping for the restart: {e}", flush=True)
+            os._exit(_setup.RESTART_EXIT)
+        _th.Thread(target=restart, daemon=True).start()
+        return {"restarting": True}
+
+
+S.SETUP = _Setup
+
+
+def _watch_started(svc):
+    """The model is up: the page's choice is kept (a failed start goes back to the one before it)."""
+    while not svc.loaded():
+        _time.sleep(2)
+    _setup.started()
+
+
+# ---- multi-GPU: ds41_helper beside the engine.  In a Windows job that ends with this process, so closing the window
+# frees the second card; started before each engine start (an engine that stops tells the helper to stop too).
+_HELPER = None
+_helper_job = None
+
+
+def _start_helper():
+    global _HELPER, _helper_job
+    plan_file = HERE / "local" / "helper.json"
+    if not plan_file.exists() or (_HELPER is not None and _HELPER.poll() is None):
+        return
+    plan = json.loads(plan_file.read_text(encoding="utf-8"))
+    env = {**os.environ, "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": str(plan["gpu"])}
+    log = open(HERE / "local" / "helper.log", "ab")
+    _HELPER = subprocess.Popen([plan["exe"]] + plan["args"], env=env, stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+    print(f"[strata] multi-GPU: helper started on {plan['gpu_name']}", flush=True)
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.windll.kernel32
+        k.CreateJobObjectW.restype = ctypes.c_void_p
+        k.OpenProcess.restype = ctypes.c_void_p
+
+        class Info(ctypes.Structure):      # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+            _fields_ = [("pad0", ctypes.c_byte * 16), ("flags", ctypes.c_uint32), ("rest", ctypes.c_byte * 124)]
+        if _helper_job is None:
+            _helper_job = k.CreateJobObjectW(None, None)
+            info = Info()
+            info.flags = 0x2000            # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            k.SetInformationJobObject(ctypes.c_void_p(_helper_job), 9, ctypes.byref(info), ctypes.sizeof(info))
+        h = k.OpenProcess(0x0101, False, _HELPER.pid)      # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+        k.AssignProcessToJobObject(ctypes.c_void_p(_helper_job), ctypes.c_void_p(h))
+
+
+_engine_init = S.StrataEngine.__init__
+
+
+def _engine_init_helper(self, *a, **k):
+    _start_helper()
+    _engine_init(self, *a, **k)
+
+
+S.StrataEngine.__init__ = _engine_init_helper
+_svc_init_started = S.Service.__init__
+
+
+def _svc_init_watch(self, *a, **k):
+    _svc_init_started(self, *a, **k)
+    _th.Thread(target=_watch_started, args=(self,), daemon=True).start()
+
+
+S.Service.__init__ = _svc_init_watch
+
 # ---- full text log (llama.cpp-style): every request's thinking / answer / tool calls as they are generated, so a run
 # can be watched (`tail -f`) and checked afterwards (loops, what it was thinking).  OFF by default (2026-10-25, the
 # user: nothing from a prompt is written to the machine unless a flag asks for it - prompts and answers live in memory

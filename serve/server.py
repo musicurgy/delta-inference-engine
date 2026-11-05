@@ -797,6 +797,9 @@ def decide_result(options: list, firsts: list[int], scored: dict, bias: dict | N
             "top_token": {"id": scored["top"][0], "logprob": round(scored["top"][1], 6)} if scored.get("top") else None}
 
 
+SETUP = None      # serve_ds41.py: the launcher's Setup card (get() -> its state, post(svc, request) -> the answer)
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -5539,6 +5542,10 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._config_get()
                 return
+            if path == "/setup" and SETUP is not None:       # the Setup card (a launcher's models and switches)
+                if self._authorized():
+                    self._json(200, SETUP.get())
+                return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():
@@ -5662,6 +5669,9 @@ def make_handler(svc: Service):
                 return
             if path == "/config":
                 self._config_post()
+                return
+            if path == "/setup" and SETUP is not None:
+                self._setup_post()
                 return
             if path in ("/unload", "/load") and not self._control_body():
                 return
@@ -5923,6 +5933,16 @@ def make_handler(svc: Service):
                 self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be read: {e}"}})
                 return
             self._json(200, runconfig.view(cfg, svc.config_path))
+
+        def _setup_post(self):
+            """The Setup card's Apply - JSON from this server's own page only, as /config."""
+            body = self._body()
+            if not self._own_page("the setup can be changed"):
+                return
+            try:
+                self._json(200, SETUP.post(svc, json.loads(body or b"{}")))
+            except ValueError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _config_post(self):
             """#564: change a few documented keys of the run config - JSON from Strata's own page only, as

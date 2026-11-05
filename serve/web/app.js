@@ -80,7 +80,7 @@ function showTab(name) {
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
-  if (tab === "about") loadConfig();
+  if (tab === "about") { loadConfig(); loadSetup(); }
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -505,6 +505,67 @@ $("cfg-save").addEventListener("click", async () => {
   } catch (e) {
     $("cfg-msg").textContent = "";
     toast("error", "Not saved", String(e.message || e), 6000);
+  }
+});
+
+// ------------------------------------------------------------------ Setup (GET / POST /setup)
+// The launcher's choices in plain words: the model, speed or quality, the second card.  Apply restarts the server.
+const MODE_NOTE = {fast: "The fastest. A little less close to DeepSeek's own model.",
+  balanced: "Closer to DeepSeek's own model, about 15% slower.", exact: "The closest, about 25% slower."};
+let setupState = null, setupMode = "fast", setupGpu = false;
+function setupPaint() {
+  for (const b of $("setup-mode").querySelectorAll("button")) b.setAttribute("aria-checked", String(b.dataset.v === setupMode));
+  $("setup-mode-note").textContent = setupState && setupState.bias_override ?
+    "DS41_ROUTE_BIAS in ds41-paths.bat is set and wins over this." : MODE_NOTE[setupMode];
+  $("setup-gpu").setAttribute("aria-checked", String(setupGpu));
+  const r = setupState && setupState.models.find((m) => m.id === $("setup-model").value);
+  $("setup-model-note").textContent = !r ? "" : !r.installed ? "Not installed: Choose Model.bat downloads it." : r.blocked || "";
+  $("setup-apply").disabled = !r || !r.installed || !!r.blocked;
+}
+async function loadSetup() {
+  let r;
+  try { r = await fetch("setup", {headers: headers()}); } catch (e) { return; }
+  if (!r.ok) { $("setup-card").hidden = true; return; }      // another launcher, or no key yet
+  const c = setupState = await r.json();
+  const label = (m) => [m.name, m.speed, m.agreement && `${m.agreement} agreement`, m.gb && `${m.gb} GB`, m.recommended && "recommended",
+    m.installed ? "" : "not installed"].filter(Boolean).join(" · ");
+  const group = (name, rows) => rows.length ? `<optgroup label="${name}">` + rows.map((m) =>
+    `<option value="${esc(m.id)}"${m.current ? " selected" : ""}${m.installed ? "" : " disabled"}>${esc(label(m))}</option>`).join("") + "</optgroup>" : "";
+  $("setup-model").innerHTML = group("On this PC", c.models.filter((m) => m.installed)) + group("Can be downloaded with Choose Model.bat", c.models.filter((m) => !m.installed));
+  $("setup-pc").textContent = c.ram_gb ? `${c.ram_gb} GB of RAM` : "";
+  $("setup-folder").textContent = c.custom_folder;
+  $("setup-refused").innerHTML = c.refused.map((x) => `<li>${esc(x.name)}: ${esc(x.why)}</li>`).join("");
+  setupMode = c.mode; setupGpu = c.multi_gpu;
+  $("setup-gpu-row").hidden = !c.helper_gpu;
+  if (c.helper_gpu) $("setup-gpu-note").textContent = `${c.helper_gpu.name} holds part of the model, for more speed`;
+  $("setup-card").hidden = false;
+  setupPaint();
+}
+$("setup-model").addEventListener("change", setupPaint);
+$("setup-refresh").addEventListener("click", loadSetup);
+$("setup-mode").addEventListener("click", (e) => { if (e.target.dataset.v) { setupMode = e.target.dataset.v; setupPaint(); } });
+$("setup-gpu").addEventListener("click", () => { setupGpu = !setupGpu; setupPaint(); });
+$("setup-apply").addEventListener("click", async () => {
+  const body = {model: $("setup-model").value, mode: setupMode, multi_gpu: setupGpu};
+  try {
+    const r = await fetch("setup", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const b = await r.json();
+    if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
+  } catch (e) { toast("error", "Not applied", String(e.message || e), 6000); return; }
+  $("setup-apply").disabled = true;
+  $("setup-msg").textContent = "Restarting with the new setup. This takes a minute or two; the page comes back by itself.";
+  const t0 = Date.now();
+  await new Promise((d) => setTimeout(d, 3000));
+  for (;;) {
+    try {
+      const h = await (await fetch("health")).json();
+      if (h.loaded) { location.reload(); return; }
+    } catch (e) { /* the server is restarting */ }
+    if (Date.now() - t0 > 15 * 60000) {
+      $("setup-msg").textContent = "It has not come back. Look at the DeepSeek window: it says why.";
+      return;
+    }
+    await new Promise((d) => setTimeout(d, 3000));
   }
 });
 
