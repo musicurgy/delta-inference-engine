@@ -192,8 +192,8 @@ if defined VRAM_MIB if %VRAMN% LSS 11800 echo   Note: this card has %VRAM_MIB% M
 set "RAM_GB="
 for /f "usebackq" %%r in (`".venv\Scripts\python.exe" tools\v41\serve\cpu_level.py --ram-gb`) do set "RAM_GB=%%r"
 set /a RAMN=RAM_GB+0 2>nul
-if defined RAM_GB if %RAMN% LSS 120 echo   Note: this PC has %RAM_GB% GB of RAM; DeepSeek needs 128 GB or more ^(README.md, "What you need"^).
-if defined RAM_GB if %RAMN% LSS 120 if %RAMN% GEQ 56 echo         With less it runs, but the experts that do not fit are read from the SSD on every token: measured on an RTX 3090 the default writes ~27 tok/s at 96 GB, ~20 at 64 GB.
+if defined RAM_GB if %RAMN% LSS 120 echo   Note: this PC has %RAM_GB% GB of RAM; 64 GB is the minimum, 128 GB or more is recommended ^(README.md, "What you need"^).
+if defined RAM_GB if %RAMN% LSS 120 if %RAMN% GEQ 56 echo         Under 128 GB it runs, but the experts that do not fit are read from the SSD on every token: measured on an RTX 3090 UD-IQ1_S writes ~36 tok/s at 96 GB and ~31 at 64 GB, the default ~27 and ~20.
 if defined RAM_GB if %RAMN% LSS 56 echo         With this little it will probably not start at all.
 rem no model yet: the user picks one - the one for this PC is marked, any other is fine, or none and their own
 if not defined NEEDMAIN goto picked
