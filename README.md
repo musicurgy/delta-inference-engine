@@ -51,7 +51,7 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
 
 These numbers are from an RTX 3090 with an NVMe SSD, through the server:
 
-| UD-IQ2_XXS (the default on 192 GB) | 192 GB RAM | 128 GB RAM |
+| UD-IQ2_XXS (the default from 128 GB up) | 192 GB RAM | 128 GB RAM |
 |---|---|---|
 | Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **40 tok/s** | **34 tok/s** |
 | Writing, the default sampling (temperature 1, top-p 0.95) | **38 tok/s** | - |
@@ -64,9 +64,9 @@ that gap from ~12%: the drafter's guesses are now
 sampled instead of taken as its top pick (`STRATA_DSPARK_SAMPLE` in `Start DeepSeek.bat`); the answers'
 distribution is unchanged.
 
-**New in 0.93: on 192 GB of RAM the default is Unsloth's UD-IQ2_XXS** (first start offers it on 180 GB or more; the
-ds4 Q2 GGUF stays one answer away, and writes 36 tok/s on 128 GB).  It writes about as fast as the ds4 Q2 GGUF - 40.4 vs 40.0 tok/s greedy, 38.4 vs
-39.7 at the default sampling - and agrees with DeepSeek's own model more often: 91.1% vs 89.9% on general text, 94.5%
+**New in 0.93: from 128 GB of RAM up the default is Unsloth's UD-IQ2_XXS** (first start offers it on 120 GB or more; the
+ds4 Q2 GGUF stays one answer away).  On 192 GB it writes about as fast as the ds4 Q2 GGUF - 40.4 vs 40.0 tok/s greedy, 38.4 vs
+39.7 at the default sampling - and on 128 GB about 5% slower (34.0 vs 35.9 tok/s, greedy).  It agrees with DeepSeek's own model more often: 91.1% vs 89.9% on general text, 94.5%
 vs 93.1% on code and maths at the settings that ship (below: "Other quants").
 
 With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
@@ -186,7 +186,7 @@ How often the top choice matches DeepSeek's own API, on the same prompts:
 - For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`, or
   per request with `"strata_tune": {"route_bias": 0, "route_bias_file": 0}` - about 25% slower.
 
-## Other quants: Unsloth (the 192 GB default and the quality mode), ISTA-DASLab's GSQ-RCO, EXL3
+## Other quants: Unsloth (the default from 128 GB up and the quality mode), ISTA-DASLab's GSQ-RCO, EXL3
 
 Besides the default, the engine runs the two other most-downloaded quant families of 1017, and EXL3 experts.
 **`Choose Model.bat`** lists the models in your model folder and the ones you can add, builds or downloads the one you
@@ -234,7 +234,7 @@ every token), and writing speed through the server:
 |---|---|---|---|---|---|
 | ds4 Q2 (the default) | 366 GB | 89.9% | 93.1% | 95.1% | 40 / 36 / 27 / 20 tok/s |
 | Unsloth UD-IQ1_S | 233 GB | 89.1% | 91.5% | 95.3% | 41 / 41 / 36 / 31 tok/s |
-| **Unsloth UD-IQ2_XXS** (the 192 GB default) | 301 GB | **91.1%** | **94.5%** | **95.9%** | 40.4 / 34 / 29 / 21 tok/s |
+| **Unsloth UD-IQ2_XXS** (the default from 128 GB up) | 301 GB | **91.1%** | **94.5%** | **95.9%** | 40.4 / 34 / 29 / 21 tok/s |
 | **Unsloth UD-Q2_K_XL** (the quality mode) | 335 GB | **92.5%** | **95.3%** | **97.0%** | 31 / 27 / 23 / 15 tok/s |
 | Unsloth UD-IQ3_XXS | 395 GB + the default | **92.7%** | **95.9%** | **97.4%** | 28 / 23 / 18 / 12 tok/s |
 
@@ -248,7 +248,7 @@ reaches with no route bias (slower):
 | GSQ IQ2_XXS | 142 GB + the default | 87.8% | 89.5% | 41 / 32 tok/s | fewer knowledge questions right; long prompts slower |
 | GSQ IQ1_M | 125 GB + the default | 85.5% | - | 42 / 37.5 tok/s | long prompts slower (no fast prompt kernel for IQ1_M) |
 | Unsloth UD-IQ1_S (the older files) | 233 GB | 89.3% | 91.1% | 40 / 37.5 tok/s | the pick under 110 GB: IQ1_M's speed, 4 points more agreement |
-| **Unsloth UD-IQ2_XXS** (the 192 GB default) | 301 GB | **92.5%** | **95.9%** | 40.4 / 34 tok/s | +1 point general, +3 on code and maths; about as fast as ds4 Q2 (38.4 vs 39.7 at the default sampling) |
+| **Unsloth UD-IQ2_XXS** (the default from 128 GB up) | 301 GB | **92.5%** | **95.9%** | 40.4 / 34 tok/s | +1 point general, +3 on code and maths; about as fast as ds4 Q2 (38.4 vs 39.7 at the default sampling) |
 | **Unsloth UD-Q2_K_XL** (the quality mode) | 335 GB | **95.0%** | **96.8%** | 31 / - tok/s | the faster quality pick; ~25% faster than EXL3 2.5 |
 | Unsloth UD-IQ3_XXS | 395 GB + the default | **95.5%** | **97.6%** | 28 / - tok/s | the most exact measured here; reads the default's Engram tables |
 | Unsloth UD-IQ1_M, UD-IQ3_S ... UD-Q8_K_XL | 250-508 GB | - | - | - | load and run (every expert type checked on real weights); not measured |
@@ -261,8 +261,8 @@ Speed falls once a model's experts (its file without the Engram table) outgrow t
 192 GB): the rest is read from the SSD on every token.  So on 192 GB the Unsloth quants above
 UD-IQ2_XXS (UD-Q2_K_XL: ~190 GB of experts) are slower (above UD-IQ3_XXS: not measured yet) - in exchange UD-Q4_K_XL /
 Q8_K_XL keep DeepSeek's own MXFP4 experts.  On 128 GB the smaller files write fastest (more of their experts fit in
-RAM): Unsloth UD-IQ1_S 41 and GSQ IQ1_M 37.5 vs 36 tok/s for the default - UD-IQ1_S at about a point less agreement than
-the default, IQ1_M at about 6 (exact routing).  UD-IQ1_S also reads long prompts faster than the default (a 16K-token prompt at ~655 vs ~580
+RAM): Unsloth UD-IQ1_S 41 and GSQ IQ1_M 37.5 vs 36 tok/s for ds4 Q2 - UD-IQ1_S at about a point less agreement than
+ds4 Q2, IQ1_M at about 6 (exact routing).  UD-IQ1_S also reads long prompts faster than ds4 Q2 (a 16K-token prompt at ~655 vs ~580
 tok/s) and loaded in 25 s vs ~60 s here.  Checked
 against ISTA's files as of 2026-10-25: the merged experts are byte-identical to theirs; their norms, router and router
 bias are bit-identical to the default file's (GSQ-RCO only changes the routed experts).  Unsloth's Engram hash constants

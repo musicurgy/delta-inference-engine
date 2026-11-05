@@ -32,7 +32,7 @@ At the settings that ship (route bias 0.28):
 
 | Build | General | Code + maths | Agentic |
 |---|---|---|---|
-| UD-IQ2_XXS (default on 192 GB) | 91.1% | 94.5% | 95.9% |
+| UD-IQ2_XXS (default from 128 GB up) | 91.1% | 94.5% | 95.9% |
 | ds4 Q2 | 89.9% | 93.1% | 95.1% |
 | UD-Q2_K_XL | 92.5% | 95.3% | 97.0% |
 | UD-IQ3_XXS | 92.7% | 95.9% | 97.4% |

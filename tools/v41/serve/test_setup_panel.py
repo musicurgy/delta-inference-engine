@@ -45,7 +45,8 @@ SP.list_gpus = lambda: [{"index": 0, "name": "RTX 3090", "mib": 24576}, {"index"
 
 # the recommendation follows the RAM
 check("192 GB -> UD-IQ2_XXS", SP.recommended(192) == "UD-IQ2_XXS")
-check("128 GB -> the default", SP.recommended(128) == "default")
+check("128 GB -> UD-IQ2_XXS", SP.recommended(128) == "UD-IQ2_XXS")
+check("115 GB -> the default", SP.recommended(115) == "default")
 check("96 GB -> UD-IQ1_S", SP.recommended(96) == "UD-IQ1_S")
 
 # the custom check
@@ -95,7 +96,7 @@ check("a start that worked keeps the choice", not SP.rollback() and "split" in P
 check("the mode survives", SP.load_settings().get("mode") == "exact")
 
 # the first start's picker, as a user answers it
-env = {**os.environ, "DS41_MODELS": os.path.join(tmp, "m2"), "DS41_RAM_GB": "128"}
+env = {**os.environ, "DS41_MODELS": os.path.join(tmp, "m2"), "DS41_RAM_GB": "115"}
 p = subprocess.run([sys.executable, str(HERE / "pick_model.py"), "--first"], input="1\n", capture_output=True, text=True, env=env)
 check("--first: the default exits 10", p.returncode == 10 and "recommended" in p.stdout, (p.returncode, p.stdout[-300:], p.stderr[-300:]))
 p = subprocess.run([sys.executable, str(HERE / "pick_model.py"), "--first"], input="6\n", capture_output=True, text=True, env=env)

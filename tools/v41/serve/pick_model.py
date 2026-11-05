@@ -37,8 +37,9 @@ GB = 1e9
 LOW_RAM_GB = 110
 LOW_RAM_PICK = "UD-IQ1_S"
 # ... and on one with HIGH_RAM_GB or more (0.93's final cards: UD-IQ2_XXS writes about as fast as the default - 40.4 vs
-# 40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling - agrees more, 91.1 / 94.5% vs 89.9 / 93.1% at the shipped bias, and is 65 GB smaller)
-HIGH_RAM_GB = 180
+# 40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling - agrees more, 91.1 / 94.5% vs 89.9 / 93.1% at the shipped bias, and is 65 GB smaller; at 128 GB it writes 5% slower,
+# 34.0 vs 35.9 tok/s, and the answers are worth that: 57 vs 52 of 99 on the benchmark)
+HIGH_RAM_GB = 120
 HIGH_RAM_PICK = "UD-IQ2_XXS"
 # (menu name, GB on disk, writing tok/s, top-1 agreement with DeepSeek's API on general text: at the shipped route bias 0.28 for
 # the default and Unsloth (rounds 314-325), exact routing for GSQ and EXL3, which were not measured at 0.28)
@@ -59,7 +60,7 @@ UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreemen
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
     "UD-Q8_K_XL": (508, "-", "-", "exact"),
 }
-TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ3_XXS": " (most exact)", "UD-IQ2_XXS": " (192 GB)"}   # the picks the menu text below explains
+TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ3_XXS": " (most exact)", "UD-IQ2_XXS": " (128 GB and up)"}   # the picks the menu text below explains
 EXL3 = {   # folder in exl3/ -> name, GB to download, speed, agreement, Hugging Face repo
     "DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw": ("EXL3 2.5 bpw", 185, "25 / - / - / -", "94.4%",
                                              "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw"),   # round 238
@@ -307,9 +308,10 @@ def main():
             row("download", d, "download " + name.split(" (")[0], gb, tps, agr,
                 ("  - needs ~192 GB of RAM" if small else "") + room(gb))
     print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, as shipped; exact routing for GSQ and")
-    print("  EXL3 (code + maths in the README).  On 192 GB of RAM: Unsloth UD-IQ2_XXS is the pick - it writes about as fast as")
-    print("  the default (40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling) and agrees more (91.1%, and")
-    print("  94.5% on code + maths against the default's 89.9 / 93.1%), from 65 GB less disk; Unsloth UD-Q2_K_XL is the")
+    print("  EXL3 (code + maths in the README).  From 120 GB of RAM: Unsloth UD-IQ2_XXS is the pick - on 192 GB it writes about")
+    print("  as fast as the default (40.4 vs 40.0 tok/s greedy, 38.4 vs 39.7 at the shipped sampling), on 128 GB 5% slower (34")
+    print("  vs 36), and it agrees more (91.1%, and 94.5% on code + maths against the default's 89.9 / 93.1%), from 65 GB less")
+    print("  disk; Unsloth UD-Q2_K_XL is the")
     print("  quality pick (31 tok/s, 92.5% / 95.3%) - it agrees more than EXL3 2.5 bpw and writes ~25% faster; UD-IQ3_XXS is")
     print("  the most exact (28 tok/s, 92.7% / 95.9%), UD-Q2_K_XL the faster of the two.  With less")
     print("  RAM a smaller file writes faster (more of it fits; the rest is read from the SSD on every token): under")
