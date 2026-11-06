@@ -4927,7 +4927,10 @@ void chunk_pstage_issue(Ds41MoeImpl& im, int64_t layer) {
 // routes ~180 of 384 experts a layer and 61% of them serve <= 3 tokens: a 1-token expert is 0.23 ms in the pool and
 // 0.41 ms of PCIe at best (1.2 ms from the arena's unpinned tail, a blocking pageable copy) - C2's prefill profile
 // 2026-11-02, prefill-ttft.md.  STRATA_CHUNK_CPU_PAGEABLE=1 also sends the arena's unpinned experts to the pool (any
-// token count).  The pool's rows land in the same parts rows the card's kernels would have written (scatter_rows_f32),
+// token count).  STRATA_CHUNK_CPU_BIG=k2 (default k): the k of a batch over 1,024 tokens: its experts carry more rows and each
+// still costs a whole PCIe copy, so the right k grows with the batch (round 331: k6 beats k3 from 1.3K tokens, k10 costs
+// 2.6 s on a short prompt).  A fixed k, not a timed split: the same prompt rounds the same way run after run.
+// The pool's rows land in the same parts rows the card's kernels would have written (scatter_rows_f32),
 // so the weighted sum is unchanged; routing is unchanged; the pool's arithmetic rounds differently from the card's
 // (the decode tier's CPU / PCIe mix does the same): same distribution, not bit-identical to the all-PCIe batch.
 struct ChunkCpuBuf {
@@ -5488,16 +5491,18 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     static const int ccpu_k = std::getenv("STRATA_CHUNK_CPU") ? std::max(0, std::atoi(std::getenv("STRATA_CHUNK_CPU"))) : 0;
     static const bool ccpu_pg = std::getenv("STRATA_CHUNK_CPU_PAGEABLE") && std::getenv("STRATA_CHUNK_CPU_PAGEABLE")[0] == '1';
     static const int ccpu_maxn = std::getenv("STRATA_CHUNK_CPU_MAXN") ? std::atoi(std::getenv("STRATA_CHUNK_CPU_MAXN")) : 1024;
+    static const int ccpu_big = std::getenv("STRATA_CHUNK_CPU_BIG") ? std::max(0, std::atoi(std::getenv("STRATA_CHUNK_CPU_BIG"))) : ccpu_k;
+    const int ccpu_now = n > 1024 ? ccpu_big : ccpu_k;
     static bool ccpu_said = false;
     if (first_pass) g_ccpu.off = 0;   // the last layer's rows were consumed before its final sync
     std::thread ccpu_th;
     int64_t ccpu_rows = 0, ccpu_r0 = 0;
     double ccpu_ms = 0;
-    if ((ccpu_k > 0 || ccpu_pg) && n <= ccpu_maxn && im.pool && x_host && !im.cfg.saliency && !arena_e.empty()) {
+    if ((ccpu_now > 0 || ccpu_pg) && n <= ccpu_maxn && im.pool && x_host && !im.cfg.saliency && !arena_e.empty()) {
         std::vector<int32_t> keep, ce;
         int ccls = -1;
         for (int32_t e : arena_e) {
-            bool c = cnt[(size_t) e] <= ccpu_k || (ccpu_pg && !chunk_arena_pinned(gp.arena, layer, e));
+            bool c = cnt[(size_t) e] <= ccpu_now || (ccpu_pg && !chunk_arena_pinned(gp.arena, layer, e));
             const int k = im.g.cls(layer, e);
             if (c && ccls >= 0 && k != ccls) c = false;   // one format (one activation) per pool batch
             if (c) { ccls = k; ce.push_back(e); ccpu_rows += cnt[(size_t) e]; }
@@ -5506,8 +5511,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         if (!ce.empty() && chunk_cpu_reserve(ccpu_rows, NE, H)) {
             if (!ccpu_said) {
                 ccpu_said = true;
-                std::fprintf(stderr, "ds4_moe: STRATA_CHUNK_CPU=%d%s: batch experts of <= %d tokens%s on the CPU pool (batches <= %d tokens)\n",
-                             ccpu_k, ccpu_pg ? " +PAGEABLE" : "", ccpu_k, ccpu_pg ? " and the arena's unpinned ones" : "", ccpu_maxn);
+                std::fprintf(stderr, "ds4_moe: STRATA_CHUNK_CPU=%d%s: batch experts of <= %d tokens (%d over 1,024)%s on the CPU pool (batches <= %d tokens)\n",
+                             ccpu_k, ccpu_pg ? " +PAGEABLE" : "", ccpu_k, ccpu_big, ccpu_pg ? " and the arena's unpinned ones" : "", ccpu_maxn);
             }
             arena_e = std::move(keep);
             ccpu_r0 = g_ccpu.off;
