@@ -86,10 +86,11 @@ rem default sampling (rounds 271-273); greedy (temperature 0) requests are uncha
 set STRATA_DSPARK_SAMPLE=1
 set STRATA_DSPARK_SAMPLE_T=0.5
 set STRATA_DENSE_REQUANT=q6_K
-rem short prompts (under ~1,000 new tokens): experts that 3 or fewer of the prompt's tokens route to run in the CPU
-rem pool while the GPU streams the rest - time to first token -40% (a ~180-token prompt 3.9 -> 2.35 s), decode unchanged
-rem (0.93, measured on all three menu models).  0 turns it off.
+rem new prompts: experts that 3 or fewer of the prompt's tokens route to run in the CPU pool while the GPU streams the
+rem rest - time to first token -40% (a ~180-token prompt 3.9 -> 2.35 s), decode unchanged (0.93, measured on all three
+rem menu models); batches up to 16,384 tokens: 1,300 tokens -15%, 25K -2%, 64K -3.5%, same agreement.  0 turns it off.
 set STRATA_CHUNK_CPU=3
+set STRATA_CHUNK_CPU_MAXN=16384
 rem serving and prompt switches (all exact; README.md, "Settings"):
 rem   rollback 8 - an answer forced after the thinking budget resumes from the live state in ~0.4 s instead of
 rem            re-reading all the thinking (was 9-57 s)
@@ -126,7 +127,7 @@ set STRATA_SERVE_SNAP_STACK=4
 set STRATA_BIAS_REFRESH=1
 set STRATA_SERVE_KEEP_CACHE=1
 set STRATA_SERVE_KEEP_LRU=1
-set STRATA_SERVE_KEEP_MAX=2048
+set STRATA_SERVE_KEEP_MAX=12000
 set "OPENPAGE=--open"
 :serve
 rem this PC's copy of the config: paths filled in, the RAM arena sized (tools\v41\serve\local\, not in git)
