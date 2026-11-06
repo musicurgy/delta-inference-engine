@@ -7644,12 +7644,12 @@ void ds41_cuda_schedule_from_env(int device) {
 // The expert code's ck() ends the engine on it, but the dense half only reports it (ERR, graph compute failed) and the
 // engine stayed up, so every later request failed until a restart by hand (Maya #688 saw it 335K tokens into an agent
 // session).  Asked between requests, it covers every path, and the server already starts a fresh engine for the next
-// request after one that ended.  STRATA_TEST_GPU_FAULT=n: cause a real fault at the nth check, to test all of that.
+// request after one that ended.  STRATA_TEST_GPU_FAULT=<file>: while that file exists, the next check deletes it and causes a real fault.
 void ds41_end_if_gpu_fault() {
 #if defined(DS4_MOE_CUDA)
-    static int test_left = std::getenv("STRATA_TEST_GPU_FAULT") ? std::atoi(std::getenv("STRATA_TEST_GPU_FAULT")) : 0;
-    if (test_left > 0 && --test_left == 0) {
-        strata::kernels::scatter_rows_f32((float*) 64, (float*) 64, (int32_t*) 64, 1, 1, 0);
+    static const char* const test_file = std::getenv("STRATA_TEST_GPU_FAULT");
+    if (test_file && std::remove(test_file) == 0) {
+        strata::kernels::scatter_rows_f32((float*) 64, (float*) 64, (int32_t*) 64, 1, 16, 0);
         (void) cudaDeviceSynchronize();
         (void) cudaGetLastError();
     }
