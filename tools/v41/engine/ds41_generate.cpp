@@ -1965,7 +1965,7 @@ int main(int argc, char ** argv) {
         static const int rewind_gap = std::getenv("STRATA_SERVE_REWIND_GAP") ? std::atoi(std::getenv("STRATA_SERVE_REWIND_GAP")) : 16;
         std::string line;
         bool previous_vision = false;
-        while (next_line(line)) {
+        while ((ds41_end_if_gpu_fault(), next_line(line))) {   // (the check: before every wait for a request, on all the paths that `continue`)
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
             dense.clear_vision();

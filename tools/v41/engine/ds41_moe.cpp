@@ -7640,6 +7640,30 @@ void ds41_cuda_schedule_from_env(int device) {
 #endif
 }
 
+// A fault inside a kernel (an illegal address, ...) leaves the CUDA context returning that error from every later call.
+// The expert code's ck() ends the engine on it, but the dense half only reports it (ERR, graph compute failed) and the
+// engine stayed up, so every later request failed until a restart by hand (Maya #688 saw it 335K tokens into an agent
+// session).  Asked between requests, it covers every path, and the server already starts a fresh engine for the next
+// request after one that ended.  STRATA_TEST_GPU_FAULT=n: cause a real fault at the nth check, to test all of that.
+void ds41_end_if_gpu_fault() {
+#if defined(DS4_MOE_CUDA)
+    static int test_left = std::getenv("STRATA_TEST_GPU_FAULT") ? std::atoi(std::getenv("STRATA_TEST_GPU_FAULT")) : 0;
+    if (test_left > 0 && --test_left == 0) {
+        strata::kernels::scatter_rows_f32((float*) 64, (float*) 64, (int32_t*) 64, 1, 1, 0);
+        (void) cudaDeviceSynchronize();
+        (void) cudaGetLastError();
+    }
+    const cudaError_t e = cudaStreamQuery(0);
+    (void) cudaGetLastError();           // (a query's own result, not an error to carry into the next call)
+    if (e == cudaSuccess || e == cudaErrorNotReady || e == cudaErrorNoDevice || e == cudaErrorInsufficientDriver) return;
+    std::fprintf(stderr, "ds41_generate: the GPU is in a fault (%s) - the engine ends and the next request starts a fresh one\n",
+                 cudaGetErrorString(e));
+    std::fflush(stderr);
+    std::fflush(stdout);
+    std::_Exit(3);                       // (not abort(): a dump of the pinned arena takes minutes)
+#endif
+}
+
 bool ds41_cuda_device_info(int device, std::string& name, size_t& free_bytes, size_t& total_bytes) {
 #if defined(DS4_MOE_CUDA)
     int n = 0;

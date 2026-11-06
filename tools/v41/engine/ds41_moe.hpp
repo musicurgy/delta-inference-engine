@@ -319,6 +319,9 @@ std::vector<std::pair<int32_t, int32_t>> ds41_read_ranked(const std::string& pat
 void ds41_cuda_schedule_from_env(int device = -1);
 /// --gpus: a CUDA device's name and free / total memory (makes its context).  False without CUDA or a bad index.
 bool ds41_cuda_device_info(int device, std::string& name, size_t& free_bytes, size_t& total_bytes);
+/// Between requests: a GPU fault leaves the context failing every later call, so end the engine (exit 3) and the server
+/// starts a fresh one for the next request.  Returns when the GPU is fine.
+void ds41_end_if_gpu_fault();
 /// --gpus: cudaDeviceCanAccessPeer(a, b) - 1 yes, 0 no, -1 unknown (no CUDA, a bad index).  Reported only: the cards
 /// exchange through the host either way (a peer copy can report success and move nothing on some bridges).
 int ds41_cuda_can_peer(int a, int b);
