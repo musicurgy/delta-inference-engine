@@ -5365,7 +5365,7 @@ def make_handler(svc: Service):
                         gone = True
                     except (OSError, ValueError):            # the socket was closed here: the request has ended
                         return
-                    if gone:
+                    if gone and not done.is_set():
                         self._note(outcome="disconnected")
                         cancel.set()
                         return
@@ -5416,6 +5416,8 @@ def make_handler(svc: Service):
                         if key in obj:
                             self.record[key] = obj[key]
             body = json.dumps(obj, ensure_ascii=False).encode()
+            if self.watch_done is not None:                  # upstream #107: the answer is whole; a client that closes on its
+                self.watch_done.set()                        # last byte has not hung up.  A failed send still lands in OSError.
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             for k, v in (headers or {}).items():

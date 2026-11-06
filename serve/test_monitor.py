@@ -108,6 +108,41 @@ class Monitor(unittest.TestCase):
                     else:
                         self.assertNotIn("response", record)
 
+    def test_a_client_closing_on_the_last_byte_has_not_hung_up(self):
+        # upstream #107: the handler waits after delivery, so the disconnect watcher sees the client's close before the
+        # request's cleanup does.  A whole answer stays "completed".
+        import serve.server as server_module
+        left, real_thread = threading.Event(), threading.Thread
+
+        def thread(*args, **kwargs):
+            if kwargs.get("name") == "strata-client-watch":
+                target = kwargs["target"]
+
+                def watched():
+                    try:
+                        target()
+                    finally:
+                        left.set()
+                kwargs["target"] = watched
+            return real_thread(*args, **kwargs)
+
+        handler = self.httpd.RequestHandlerClass
+        deliver = handler._json
+
+        def deliver_then_wait(instance, *args, **kwargs):
+            deliver(instance, *args, **kwargs)
+            self.assertTrue(left.wait(3))
+
+        with mock.patch.object(server_module.threading, "Thread", side_effect=thread),                 mock.patch.object(handler, "_json", deliver_then_wait):
+            self.assertEqual(self.chat()[0], 200)
+            self.assertTrue(left.wait(3))
+        for _ in range(100):
+            record = self.latest()
+            if record.get("finished_at"):
+                break
+            time.sleep(0.02)
+        self.assertEqual(record["state"], "completed")
+
     def test_error_and_engine_death_are_not_successes(self):
         self.assertEqual(self.chat(max_tokens=20000)[0], 400)
         self.assertEqual(self.latest()["state"], "error")
