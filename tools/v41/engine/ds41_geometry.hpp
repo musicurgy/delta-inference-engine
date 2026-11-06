@@ -274,7 +274,7 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
              { ml ? "ple.ngram_size" : "engram_max_ngram_size", &G.engram_ngram },
              { ml ? "engram.pad_token_id" : "engram_pad_token_id", &G.engram_pad },
              { ml ? "engram.compressed_vocab_size" : "engram_compressed_vocab_size", &G.engram_cvocab } })
-        if (!(e = detail::u64(g, P + u.k, *u.v)).empty()) return e;
+        if (!(ml && u.v == &G.engram_cvocab && !g.get(P + u.k)) && !(e = detail::u64(g, P + u.k, *u.v)).empty()) return e;   // (ISTA's GSQ-RCO files leave that key out: the token map gives it)
     struct F { const char * k; double * v; };
     for (const F & f : std::initializer_list<F>{
              { "expert_weights_scale", &G.weights_scale }, { "hyper_connection.epsilon", &G.hc_eps },
@@ -320,7 +320,7 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
         if (!(e = ds41_read_int_array(path, P + "ple.head_vocab_sizes", pr)).empty()) return e;
         if (!(e = ds41_read_int_array(path, P + "ple.layer_multipliers", G.engram_mult)).empty()) return e;
         if (!(e = ds41_read_int_array(path, P + "ple.head_offsets", offs)).empty()) return e;
-        if ((int64_t) tm.size() != G.vocab) return "engram.token_map size";
+        if ((int64_t) tm.size() != G.vocab) return "engram.token_map size"; if (!G.engram_cvocab) G.engram_cvocab = *std::max_element(tm.begin(), tm.end()) + 1;
         if (offs.size() != pr.size()) return "ple.head_offsets / ple.head_vocab_sizes differ in length";
         const int64_t nel = (int64_t) G.engram_layers.size(), nc = (G.engram_ngram - 1) * G.engram_heads;
         if ((int64_t) pr.size() != nel * nc) return "ple.head_vocab_sizes does not match its shape";
