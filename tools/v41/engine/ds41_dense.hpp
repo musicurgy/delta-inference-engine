@@ -154,6 +154,9 @@ public:
     /// STRATA_SHEXP_SPLIT=1: launch this layer's shared expert (its own graph, from o_fn) - call after attn_router, before
     /// the routed tier; a no-op without the switch or for n > 1 (the attention graph then computes it itself).
     bool shexp_launch(int il);
+    /// STRATA_ENGRAM_AHEAD: the next prompt chunk (tokens tids[0..n) at pos0), given right after this chunk's begin_batch(): its Engram
+    /// reads start once this chunk's rows are on the card and become that chunk's batch if it is exactly (pos0, n), else they are drained.
+    void engram_next(const int * tids, int n, int pos0);
     /// Prefetch hint for layer il of a one-token pass (call before attn_router(il)): the layer's router applied to
     /// rms_norm(hc_pre(state, pre)) * ffn_norm.weight, + the selection bias, ranked; top_ids gets n_top (<= 16).
     /// A hint only: the result does not depend on it.

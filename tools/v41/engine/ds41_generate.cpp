@@ -1652,7 +1652,11 @@ int main(int argc, char ** argv) {
                         } else { ferr = dense.last_error(); return false; }
                     }
                     ds41_heapcheck("pre-begin_batch", B);
-                    if (dense.begin_batch(ids + c0, B, pos0 + c0)) { ds41_heapcheck("begin_batch", B); break; }
+                    if (dense.begin_batch(ids + c0, B, pos0 + c0)) {
+                        ds41_heapcheck("begin_batch", B);
+                        if (c0 + B < n) dense.engram_next(ids + c0 + B, std::min(B, n - c0 - B), pos0 + c0 + B);
+                        break;
+                    }
                     if (B > SB) {
                         std::fprintf(stderr, "ds41_generate: batch of %d did not fit (%s) - retrying at %d\n",
                                      B, dense.last_error().c_str(), std::max(SB, B / 2));
