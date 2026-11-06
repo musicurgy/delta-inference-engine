@@ -6188,6 +6188,7 @@ void Ds41MoeTier::release_cache() {
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || !im_->gpu->cache) return;
     cudaDeviceSynchronize();   // no copy or kernel may still read a slot
+    im_->shrunk.clear();
     // warm_reseed (STRATA_WARM_RESEED=1 = on; OFF by default until it shows an effect): before the slots go, record
     // what held them and when it was last used.  The seed after this release puts those experts back first, so a
     // decode that follows a prompt turn starts from the set this conversation routes to instead of the global rank
@@ -6239,7 +6240,8 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     // the regrow; batches read ~50-100 file-tier experts, so few are.
     static const bool keep_lru = std::getenv("STRATA_SERVE_KEEP_LRU") && std::getenv("STRATA_SERVE_KEEP_LRU")[0] == '1';
     if (im_->cfg.vram_lru && !keep_lru) { err = "--vram-lru (STRATA_SERVE_KEEP_LRU=1 allows it)"; return -1; }
-    if (!im_->shrunk.empty()) { err = "still shrunk from the last batch (regrow_cache did not run)"; return -1; }
+    static const bool keep_lazy = std::getenv("STRATA_KEEP_LAZY") && std::atoi(std::getenv("STRATA_KEEP_LAZY")) > 0;   // a turn may start still shrunk
+    if (!keep_lazy && !im_->shrunk.empty()) { err = "still shrunk from the last batch (regrow_cache did not run)"; return -1; }
     strata::core::ExpertCache& c = *im_->gpu->cache;
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "shrink_cache_for: device failed"; return -1; }
     size_t fr = 0, tot = 0;
@@ -6267,6 +6269,8 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     im_->pf_n = 0;   // staged prefetches may point at evicted experts' slots
     im_->pf_next_n = 0;
     im_->pf_next_layer = -1;
+    gone.insert(gone.end(), im_->shrunk.begin(), im_->shrunk.end());   // regrow_cache walks them by slot
+    std::sort(gone.begin(), gone.end());
     im_->shrunk = std::move(gone);
     return n;
 #else

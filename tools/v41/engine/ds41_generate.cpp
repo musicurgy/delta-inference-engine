@@ -873,6 +873,10 @@ int main(int argc, char ** argv) {
     // bias_now: route-bias / file penalty are DECODE levers - before the VRAM seed (the prompt) only the prune part
     // applies, unless --bias-prompt measures them (the prompt's file tier is prefetched; a penalty there buys nothing)
     bool bias_now = a.bias_prompt > 0 || !defer_vram;
+    // STRATA_KEEP_LAZY=K (0 = off): the kept cache's tail comes back only once a turn has written K tokens, not after every batch.
+    // The refill took 340-430 ms a turn (round 343's log), and a short turn's next batch would push the same slots out again.
+    static const int keep_lazy = std::getenv("STRATA_KEEP_LAZY") ? std::max(0, std::atoi(std::getenv("STRATA_KEEP_LAZY"))) : 0;
+    bool regrow_due = false;
     bool bias_set = false;   // a nonzero bias is in the dense half now (--serve turns it off again for the next prompt)
     // Live decode knobs (round 240): the settings an A/B most often flips, read from the environment once here and
     // changeable per request through the serve protocol (GEN ... d3_spec=N d3_spec_ahead=N d3_pf=N pf_p=X
@@ -2307,7 +2311,11 @@ int main(int argc, char ** argv) {
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 static const int keep_max = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
                 if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
-                    const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
+                    // STRATA_KEEP_FIX_GIB=x: the fixed part of need(B) for a batch that fits one pass (up to 512 tokens); default 4.3, the
+                    // value calibrated on long batches.  A short turn gives up about 520 slots of 1,335 for it (round 343's log).  Above 512
+                    // tokens the 4.3 stays: the batch width below is sized from what this leaves free.
+                    static const double keep_fix = std::getenv("STRATA_KEEP_FIX_GIB") ? std::atof(std::getenv("STRATA_KEEP_FIX_GIB")) : 4.3;
+                    const double need = ((dh <= 512 ? keep_fix : 4.3) * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
                                         a.vram_margin_gib * 1073741824.0;
                     std::string kerr;
                     const int64_t g = tier.shrink_cache_for((int64_t) need, kerr);
@@ -2429,7 +2437,11 @@ int main(int argc, char ** argv) {
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
                 std::string kerr;
                 dense.release_pass();   // the batch's pass buffers first (open_cache does the same before a seed)
-                if (tier.regrow_cache(kerr) < 0) {
+                if (keep_lazy > 0) {
+                    regrow_due = true;
+                    bias_now = true;
+                    apply_bias();
+                } else if (tier.regrow_cache(kerr) < 0) {
                     std::fprintf(stderr, "serve: keep-cache regrow: %s - re-seeding\n", kerr.c_str());
                     tier.release_cache();
                     cache_open = false;
@@ -2630,6 +2642,16 @@ int main(int argc, char ** argv) {
             dense.route_meter(true);
             const double td0 = now_ms();
             int gen = 0, pos = total;
+            auto lazy_regrow = [&]() {   // STRATA_KEEP_LAZY: between passes, nothing of the tier in flight
+                if (!regrow_due || gen < keep_lazy) return;
+                regrow_due = false;
+                std::string kerr;
+                if (tier.regrow_cache(kerr) < 0) {   // mid-answer there is no clean way back; the server restarts a dead engine
+                    std::fprintf(stderr, "serve: keep-cache regrow: %s - ending the engine\n", kerr.c_str());
+                    std::exit(3);
+                }
+                apply_bias();
+            };
             const char * finish = "length";
             std::vector<float> lg = last_logits;
 #if defined(DS41_HAVE_DSPARK)
@@ -2671,6 +2693,7 @@ int main(int argc, char ** argv) {
                     return true;
                 };
                 while (emit(t)) {
+                    lazy_regrow();
                     if (stop_pending()) { finish = "cancel"; break; }
                     int k = sp_depth_serve;
                     if (max_new > 0) k = std::min(k, max_new - gen);
@@ -2786,6 +2809,7 @@ int main(int argc, char ** argv) {
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
                 // STRATA_BIAS_REFRESH without a drafter: every N single steps (the verify loop above counts passes)
                 static const int step_refresh = std::getenv("STRATA_BIAS_REFRESH") ? std::max(0, std::atoi(std::getenv("STRATA_BIAS_REFRESH"))) : 0;
+                lazy_regrow();
                 if (step_refresh > 0 && bias_now && bias_set && gen % step_refresh == 0) apply_bias(true);
                 if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok);
