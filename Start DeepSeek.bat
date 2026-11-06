@@ -89,7 +89,10 @@ set STRATA_DENSE_REQUANT=q6_K
 rem new prompts: experts that 3 or fewer of the prompt's tokens route to run in the CPU pool while the GPU streams the
 rem rest - time to first token -40% (a ~180-token prompt 3.9 -> 2.35 s), decode unchanged (0.93, measured on all three
 rem menu models); batches up to 16,384 tokens: 1,300 tokens -15%, 25K -2%, 64K -3.5%, same agreement.  0 turns it off.
+rem Over 1,024 tokens the limit is 6 tokens: its experts carry more rows and each still costs a whole copy over PCIe: 0.6 s
+rem off prompts of 1-13K tokens, same agreement.
 set STRATA_CHUNK_CPU=3
+set STRATA_CHUNK_CPU_BIG=6
 set STRATA_CHUNK_CPU_MAXN=16384
 rem serving and prompt switches (all exact; README.md, "Settings"):
 rem   rollback 8 - an answer forced after the thinking budget resumes from the live state in ~0.4 s instead of

@@ -5492,7 +5492,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     static const bool ccpu_pg = std::getenv("STRATA_CHUNK_CPU_PAGEABLE") && std::getenv("STRATA_CHUNK_CPU_PAGEABLE")[0] == '1';
     static const int ccpu_maxn = std::getenv("STRATA_CHUNK_CPU_MAXN") ? std::atoi(std::getenv("STRATA_CHUNK_CPU_MAXN")) : 1024;
     static const int ccpu_big = std::getenv("STRATA_CHUNK_CPU_BIG") ? std::max(0, std::atoi(std::getenv("STRATA_CHUNK_CPU_BIG"))) : ccpu_k;
-    const int ccpu_now = n > 1024 ? ccpu_big : ccpu_k;
+    const int ccpu_now = ccpu_k > 0 && n > 1024 ? ccpu_big : ccpu_k;   // STRATA_CHUNK_CPU=0 is off at every size (ds41_local.py sets it under 170 GB)
     static bool ccpu_said = false;
     if (first_pass) g_ccpu.off = 0;   // the last layer's rows were consumed before its final sync
     std::thread ccpu_th;
