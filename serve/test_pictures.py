@@ -207,7 +207,8 @@ class Placement(unittest.TestCase):
         v, _ = self.section("cpu", "cpu", ram=63.8)
         self.assertEqual((v["gpu"], v.get("lazy"), v.get("lazy_idle_s")), (False, True, L.VISION_LAZY_IDLE_S))
         self.assertTrue(self.section("cpu", "cpu", ram=95.8)[0].get("lazy"))
-        self.assertNotIn("lazy", self.section("cpu", "cpu", ram=191.8)[0])           # 128 GB and up: resident
+        self.assertTrue(self.section("cpu", "cpu", ram=127.7)[0].get("lazy"))       # 128 GB: the arena is not capped
+        self.assertNotIn("lazy", self.section("cpu", "cpu", ram=191.8)[0])           # 192 GB: resident
         self.assertNotIn("lazy", self.section("cpu", "cpu", ram=63.8, lazy="0")[0])  # DS41_VISION_LAZY decides
         self.assertTrue(self.section("cpu", "cpu", ram=191.8, lazy="1")[0].get("lazy"))
         self.assertNotIn("lazy", self.section("on", "cuda", ram=63.8)[0])            # on a card: as before
@@ -247,7 +248,7 @@ class Placement(unittest.TestCase):
 
     def test_cpu_encoder_lazy_under_110_gib(self):
         # 1107 review: the CPU encoder's 3.9 GB stays out of RAM on a 64 / 96 GB PC until the first picture
-        for gib, want in ((63.8, True), (95.7, True), (127.7, False), (191.8, False)):
+        for gib, want in ((63.8, True), (95.7, True), (127.7, True), (191.8, False)):
             v, _ = self.section("cpu", "cpu", ram=gib)                       # section() patches total_ram_gib
             self.assertEqual(bool(v.get("lazy")), want, gib)
             if want:

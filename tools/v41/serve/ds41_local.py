@@ -499,7 +499,9 @@ def vision_section(m, engine_gpu=None):
     return v
 
 
-VISION_LAZY_BELOW_GIB, VISION_LAZY_IDLE_S = 110, 600
+# 170 (1107 vision review, was 110): a 128 GB PC's arena is total - 28 = ~100 GiB, not capped, so it has the same
+# headroom as a 64 GB one; only from ~168 GiB does the 140 GiB cap leave spare RAM for a resident encoder.
+VISION_LAZY_BELOW_GIB, VISION_LAZY_IDLE_S = 170, 600
 
 
 def vision_lazy():
