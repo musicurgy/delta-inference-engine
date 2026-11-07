@@ -5113,6 +5113,24 @@ def prompt_progress(svc: Service):
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
 
 
+def openai_tool_delta(index: int, call=None, arguments: str | None = None) -> dict:
+    """One entry of a chunk's delta.tool_calls, in the shape strict clients parse (OpenCode reportedly fails on
+    `"name": null`): a call's first entry (`call` given) carries its id, type and function name, the later ones only
+    `arguments`.  No key is ever null: a name that is not known (None, empty) is left out."""
+    out: dict = {"index": index}
+    fn: dict = {}
+    if call is not None:
+        if call.id:
+            out["id"] = call.id
+        out["type"] = "function"
+        if isinstance(call.name, str) and call.name:
+            fn["name"] = call.name
+    if arguments is not None:
+        fn["arguments"] = arguments
+    out["function"] = fn
+    return out
+
+
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
     an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
@@ -5123,6 +5141,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     want_progress = bool(req.get("return_progress"))
 
     def chunk(delta, finish=None):
+        if "tool_calls" in delta and not delta["tool_calls"]:   # never an empty tool_calls array (OpenCode)
+            delta = {k: v for k, v in delta.items() if k != "tool_calls"}
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
@@ -5149,16 +5169,15 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls
                 calls += 1
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
-                                             "function": {"name": ev.call.name, "arguments": ""}}]})
+                yield chunk({"tool_calls": [openai_tool_delta(streamed[ev.call.id], ev.call, "")]})
             elif ev.kind == "tool_args":
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
+                if ev.text:                                 # later pieces: only arguments, never an empty one
+                    yield chunk({"tool_calls": [openai_tool_delta(streamed[ev.call.id], None, ev.text)]})
             elif ev.kind == "tool_call" and ev.call.id in streamed:
                 finished.add(ev.call.id)
             elif ev.kind == "tool_call":
-                yield chunk({"tool_calls": [{"index": calls, "id": ev.call.id, "type": "function",
-                                             "function": {"name": ev.call.name,
-                                                          "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
+                yield chunk({"tool_calls": [openai_tool_delta(calls, ev.call,
+                                                              json.dumps(ev.call.arguments, ensure_ascii=False))]})
                 calls += 1
         else:
             # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
