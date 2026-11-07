@@ -3,10 +3,16 @@ r"""windows_tips.py - Windows settings that make the engine faster, checked at e
 nothing).  Prints one line per setting that is off, pointing at README.md, "Windows settings for speed".  Measured on the
 RTX 3090 PC: the first three together +12% writing speed (21.65 -> 24.25 tok/s), the RAM speed +3%.
 
-    windows_tips.py        prints the tips (exit 0 always)       DS41_NO_TIPS=1: prints nothing"""
+    windows_tips.py        prints the tips (exit 0 always)       DS41_NO_TIPS=1: prints nothing
+The same tips, each with how to fix it, and a page-file check go to local/windows-health.json: the chat page's Setup tab
+shows them as its "This PC's health" card (setup_panel.py's catalog)."""
+import json
 import os
 import subprocess
 import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # the default power plans that park cores and slow the clock ramp (High performance / Ultimate / a custom plan: fine)
 SLOW_PLANS = {"381b4222-f694-41f0-9685-ff5bb260df2e": "Balanced", "a1841308-3541-4fab-bc81-f71556f20b4a": "Power saver"}
@@ -46,10 +52,60 @@ def tips():
     return out
 
 
+# how to fix each tip (README.md, "Windows settings for speed"), by the start of its text
+HOW = [
+    ("power plan", "Win+R, powercfg.cpl, choose High performance (under \"Show additional plans\" if hidden). "
+                   "Part of the +12% the first three settings gave together."),
+    ("hardware-accelerated", "Settings > System > Display > Graphics settings: turn on hardware-accelerated GPU "
+                             "scheduling, then restart Windows."),
+    ("no 'Lock pages", "Win+R, secpol.msc > Local Policies > User Rights Assignment > Lock pages in memory > add your "
+                       "user name; then sign out and in. (Windows Home has no secpol.msc.)"),
+    ("the RAM runs", "In the BIOS turn on XMP / EXPO (or set the rated speed by hand), then check stability: +3% "
+                     "measured."),
+]
+HEALTH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local", "windows-health.json")
+
+
+def page_file():
+    """the page-file tip, or None (docs/DETAILS.md: under ~4 GB the graphics card's allocations can fail)"""
+    try:
+        import drive_check
+        mem = drive_check.memory()
+    except Exception:                      # noqa: BLE001
+        return None
+    if not mem or mem[1] - mem[0] >= 4 * 2**30:
+        return None
+    return {"text": f"the page file is {(mem[1] - mem[0]) / 2**30:.0f} GB: Windows can refuse memory with the model loaded",
+            "how": "Settings > System > About > Advanced system settings > Performance: Settings > Advanced > Virtual "
+                   "memory: Change > Custom size, 65536 MB initial and maximum; then restart Windows."}
+
+
+def health(t=None):
+    """[{"text", "how"}] for the page: the tips with their fixes, and the page file"""
+    out = []
+    for x in (tips() if t is None else t):
+        how = next((h for k, h in HOW if x.startswith(k)), "README.md, \"Windows settings for speed\".")
+        out.append({"text": x, "how": how})
+    pf = page_file()
+    if pf:
+        out.append(pf)
+    return out
+
+
+def save_health(items):
+    try:
+        os.makedirs(os.path.dirname(HEALTH), exist_ok=True)
+        with open(HEALTH, "w", encoding="utf-8") as f:
+            json.dump({"checked": int(time.time()), "items": items}, f, indent=1)
+    except OSError:
+        pass
+
+
 def main():
     if os.name != "nt" or os.environ.get("DS41_NO_TIPS") == "1":
         return 0
     t = tips()
+    save_health(health(t))
     if t:
         print("Faster with these Windows settings (README.md, 'Windows settings for speed'; DS41_NO_TIPS=1 hides this):")
         for x in t:

@@ -152,9 +152,10 @@ exit /b 1
 :configured
 rem the Windows settings that make it faster, if any is off (read only: README.md, "Windows settings for speed")
 ".venv\Scripts\python.exe" tools\v41\serve\windows_tips.py
-rem --open: the chat page opens in the browser once the model is ready (API clients use http://127.0.0.1:8080/v1; the
-rem port is DS41_PORT in ds41-paths.bat)
-".venv\Scripts\python.exe" tools\v41\serve\serve_ds41.py --engine strata --config tools\v41\serve\local\ds41-windows.json --port %DS41_PORT% %OPENPAGE%
+rem --open: the chat page opens in the browser (API clients use http://127.0.0.1:8080/v1; the port is DS41_PORT in
+rem ds41-paths.bat).  --background-load: it opens at once and shows the start's steps while the model loads (a failed
+rem start still ends the server with code 1, as below)
+".venv\Scripts\python.exe" tools\v41\serve\serve_ds41.py --engine strata --config tools\v41\serve\local\ds41-windows.json --port %DS41_PORT% --background-load %OPENPAGE%
 set "SRC=%errorlevel%"
 set "OPENPAGE="
 rem 75: Apply on the chat page's Setup card: the new settings need a new start.  The page waits and comes back by itself.

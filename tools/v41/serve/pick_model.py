@@ -20,6 +20,7 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")   # no usage reports to H
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 CHOICE = os.path.join(ROOT, "model-choice.txt")
@@ -127,22 +128,38 @@ def exl3_ready(m, d):
     return f"exl3/{d}"
 
 
+def _download(hf, args, name):
+    """hf download ARGS through hf_get.py: the PC stays awake, one progress line, a stalled or failed download is
+    started again (it resumes).  -> its exit code"""
+    import hf_get
+    return hf_get.run(args, hf_cmd=hf, label=name)
+
+
+def _done_note(t0, name):
+    """a Windows notification when a download took long (someone may have left it running)"""
+    if time.time() - t0 > 120:
+        import hf_get
+        hf_get.notify(f"DeepSeek: {name} is ready", "Downloaded and checked. Start DeepSeek to use it.")
+
+
 def download_exl3(m, d):
     """hf download REPO --local-dir <models>/exl3/<d>, then every shard's SHA-256 (hf_verify.py)"""
     from huggingface_hub import HfApi
-    repo = EXL3[d][4]
+    name, repo = EXL3[d][0], EXL3[d][4]
     files = [f for f in HfApi().list_repo_files(repo) if f.endswith(".safetensors")]
     hf = os.path.join(ROOT, ".venv", "Scripts", "hf.exe")
     py = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
     dst = os.path.join(m, "exl3", d)
     os.makedirs(dst, exist_ok=True)
-    r = subprocess.call([hf if os.path.exists(hf) else "hf", "download", repo, "--local-dir", dst])
+    t0 = time.time()
+    r = _download([hf if os.path.exists(hf) else "hf"], [repo, "--local-dir", dst], name)
     if r != 0:
         sys.exit("The download stopped (above) - start Choose Model.bat again to go on where it was.")
     r = subprocess.call([py if os.path.exists(py) else sys.executable, os.path.join(ROOT, "tools", "v41", "hf_verify.py"),
                          "--repo", repo, "--dir", dst] + files)
     if r != 0:
         sys.exit("A file differs from its published SHA-256 (above): delete it and start Choose Model.bat again.")
+    _done_note(t0, name)
 
 
 def download_unsloth(m, q):
@@ -156,13 +173,16 @@ def download_unsloth(m, q):
     py = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
     dst = os.path.join(m, "unsloth")
     os.makedirs(dst, exist_ok=True)
-    r = subprocess.call([hf if os.path.exists(hf) else "hf", "download", UNSLOTH, "--revision", rev, "--include", q + "/*", "--local-dir", dst])
+    t0 = time.time()
+    r = _download([hf if os.path.exists(hf) else "hf"], [UNSLOTH, "--revision", rev, "--include", q + "/*",
+                                                         "--local-dir", dst], "Unsloth " + q)
     if r != 0:
         sys.exit("The download stopped (above) - start Choose Model.bat again to go on where it was.")
     r = subprocess.call([py if os.path.exists(py) else sys.executable, os.path.join(ROOT, "tools", "v41", "hf_verify.py"),
                          "--repo", UNSLOTH, "--revision", rev, "--dir", dst] + files)
     if r != 0:
         sys.exit("A file differs from its published SHA-256 (above): delete it and start Choose Model.bat again.")
+    _done_note(t0, "Unsloth " + q)
 
 
 def get(q):
