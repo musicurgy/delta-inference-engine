@@ -69,6 +69,7 @@ from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve.voice import VoiceServer, start_lazy_voice  # noqa: E402  local: the voice sidecar (ASR/TTS)
 from serve import images as images_api  # noqa: E402
+from serve import loadstate  # noqa: E402  the loading screen and Pause / Resume (GET /health)
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -597,6 +598,32 @@ def experts_loading_words(args: list, size: str) -> str:
     return f"loading the experts into RAM ({size}) and locking part of them for the GPU."
 
 
+def start_in_background(svc, say_ready, notes=None, grace_s: float = 10.0) -> threading.Thread:
+    """--background-load: the model loads on a thread while the server already answers (the page shows the steps,
+    GET /health).  A start that fails ends the server with code 1 after `grace_s` (the page shows the reason
+    meanwhile), as a failed start without the flag does - the launcher's rollback and pause work the same."""
+    def run():
+        try:
+            svc.load()
+        except GpuBusy as e:                            # min_free_vram_mib: another program has the card - stays
+            loadstate.failed(str(e))                    # paused; the page's Resume (or a request) tries again
+            print(f"[strata] not loaded: {e}", flush=True)
+            return
+        except Exception as e:                          # noqa: BLE001  EngineDied, a missing file ...
+            loadstate.failed(str(e))
+            print(f"\n[strata] {e}", file=sys.stderr, flush=True)
+            print("[strata] For a bug report: \"Start DeepSeek (debug).bat\" packs this and everything else needed "
+                  "into one zip.", file=sys.stderr, flush=True)
+            time.sleep(grace_s)
+            os._exit(1)
+        if notes:
+            notes()
+        say_ready()
+    t = threading.Thread(target=run, daemon=True, name="strata-background-load")
+    t.start()
+    return t
+
+
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
@@ -612,12 +639,13 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
     t0 = last = time.time()
     said = set()
 
-    def say(key, text):
+    def say(key, text, detail=None):
         nonlocal last
         if key not in said:
             said.add(key)
             last = time.time()
             print(text, flush=True)
+            loadstate.step(key, detail)              # the web page's loading screen shows the same steps
 
     say("weights", "[strata] starting the engine: reading the model's weights ...")
     pos = offset
@@ -638,10 +666,10 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                                  "         Please wait and don't close this window; the browser opens when it is ready.")
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
-                        f" ({time.time() - t0:.0f} s so far)")
+                        f" ({time.time() - t0:.0f} s so far)", line.split(" loaded ", 1)[1].strip())
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
+                    say("cache", f"[strata] filling the GPU's expert cache ({n}) ...", n)
                 elif "session is up" in line:
                     say("up", "[strata] almost ready ...")
         if time.time() - last > heartbeat:
@@ -3546,12 +3574,15 @@ class Service:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[strata] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
+        loadstate.begin()
         try:
             self.engine.restart()
-        except Exception:
+        except Exception as e:
+            loadstate.failed(str(e))
             if vision_started:
                 self.vision.unload()
             raise
+        loadstate.done()
         print("[strata] the engine is running again", flush=True)
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
             images_api.restore_session(self)
@@ -5605,7 +5636,7 @@ def make_handler(svc: Service):
                                  "display_name": getattr(svc, "display_name", None),
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "service": "strata", **loadstate.health(svc)})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -7048,6 +7079,12 @@ def main() -> int:
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded (the engine and the vision encoder start with the first request)")
+    ap.add_argument("--background-load", action="store_true",
+                    help="answer at once and load the model in the background: with --open the chat page opens "
+                         "right away and shows the start's steps (a failed start still ends the server with code 1)")
+    ap.add_argument("--mock-load-s", type=float, default=None, metavar="SECONDS",
+                    help="--engine mock only: the mock can be paused and resumed and takes this long to load "
+                         "(the web page's loading screen and Pause button without a GPU)")
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
                          "memory (also \"api_monitor\": true in the config; off by default)")
@@ -7109,7 +7146,7 @@ def main() -> int:
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
-        lazy = a.lazy or cfg.get("lazy_load") is True
+        lazy = a.lazy or a.background_load or cfg.get("lazy_load") is True
         if cfg.get("vision"):
             elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
@@ -7125,7 +7162,7 @@ def main() -> int:
                 vcfg["elastic"] = False
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env), lazy=lazy)
-        print("model unloaded; the first request loads it ..." if lazy else
+        print("model unloaded; the first request loads it ..." if lazy and not a.background_load else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
         if layer_split_of(cfg):
@@ -7159,15 +7196,21 @@ def main() -> int:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
-        warn_tight_ram(engine.info.get("arena_mib"))
-        note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
-                                 linux_desktop()) if not groups else None
-        if note:                                        # #560 #516: before --open starts a browser on that card
-            print(note, flush=True)
+
+        def engine_notes(engine=engine, groups=groups):
+            warn_tight_ram(engine.info.get("arena_mib"))
+            note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
+                                     linux_desktop()) if not groups else None
+            if note:                                    # #560 #516: before --open starts a browser on that card
+                print(note, flush=True)
+        if not a.background_load:
+            engine_notes()
     else:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
+        if a.mock_load_s is not None:                   # the loading screen and Pause button, without a GPU
+            engine = loadstate.LoadingMock(engine, a.mock_load_s, start_loaded=not a.background_load)
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
@@ -7314,6 +7357,8 @@ def main() -> int:
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
+    if a.config:                                        # how long the last start took (the loading screen's estimate)
+        loadstate.last_start_path = str(Path(a.config).with_suffix("")) + ".last-start.json"
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
@@ -7344,10 +7389,19 @@ def main() -> int:
             start_lazy_voice(svc, servers, float(voice_cfg.get("lazy_idle_s", 120)))
     svc.start_vision_idle()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
-    print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
-          f"context {engine.max_context} tokens{', images on' if vision else ''}"
-          f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
+
+    def say_ready():
+        print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
+              f"context {engine.max_context} tokens{', images on' if vision else ''}"
+              f"{', API key required' if svc.api_key else ''})", flush=True)
+        print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model",
+              flush=True)
+    if a.background_load:
+        print(f"[strata] the chat page is open at http://{here}:{a.port}/ - it shows the start; the model loads now "
+              "(1-3 minutes) ...", flush=True)
+        start_in_background(svc, say_ready, engine_notes if a.engine == "strata" else None)
+    else:
+        say_ready()
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
