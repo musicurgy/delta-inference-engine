@@ -612,6 +612,9 @@ def start_in_background(svc, say_ready, notes=None, grace_s: float = 10.0) -> th
         except Exception as e:                          # noqa: BLE001  EngineDied, a missing file ...
             loadstate.failed(str(e))
             print(f"\n[strata] {e}", file=sys.stderr, flush=True)
+            if "failed to initialize CUDA" in str(e) or "no cuda backend" in str(e):
+                print("[strata] CUDA could not start on this PC: check the NVIDIA driver and that the card is "
+                      "supported (README.md, \"What you need\").", file=sys.stderr, flush=True)
             print("[strata] For a bug report: \"Start DeepSeek (debug).bat\" packs this and everything else needed "
                   "into one zip.", file=sys.stderr, flush=True)
             time.sleep(grace_s)
