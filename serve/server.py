@@ -58,8 +58,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+                            forced_call, image_details_of, images_of, literal_tags, mark_think_literals,
+                            openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
@@ -2548,22 +2548,31 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode_all(self, sources: list, cancel=None) -> list[tuple[Path, int]]:
+    # 0.94: OpenAI's image detail -> this encoder's token cap for the picture ("ENCMAX <n> <image> <out>"); empty: the
+    # encoder has no per-picture cap (strata-vision) and detail is ignored.  The DS41 encoder fills it in.
+    DETAIL_TOKENS: dict = {}
+
+    def encode_all(self, sources: list, cancel=None, details=None) -> list[tuple[Path, int]]:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
         make room for a later one (#1072: with more than 64 unique images the first was deleted before the request
-        had read it).  `cancel` (#1999): a request whose client left does not encode its next pictures."""
+        had read it).  `cancel` (#1999): a request whose client left does not encode its next pictures.  `details`:
+        each picture's detail ("low" / "high" / None), in the same order."""
         out: list[tuple[Path, int]] = []
-        for src in sources:
+        for i, src in enumerate(sources):
             if cancel is not None and cancel.is_set():
                 raise ClientGone()
-            out.append(self.encode(src, keep=[p for p, _ in out]))
+            detail = details[i] if details and i < len(details) else None
+            out.append(self.encode(src, keep=[p for p, _ in out], detail=detail))
         return out
 
-    def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
+    def encode(self, source: str | bytes, keep=(), detail=None) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
-        `keep`: files the caller still needs (never evicted by this call)."""
+        `keep`: files the caller still needs (never evicted by this call).  `detail`: "low" reads the picture with
+        fewer tokens where the encoder can (DETAIL_TOKENS); the cache keeps each size apart."""
         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
-        key = hashlib.sha256(data).hexdigest()[:32]
+        cap = self.DETAIL_TOKENS.get(detail) if detail else None
+        # a capped picture is other rows: its own key, from its first character on (the engine gets key[:16], #2228)
+        key = hashlib.sha256(data + (f"\0ENCMAX {cap}".encode() if cap else b"")).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
@@ -2577,7 +2586,8 @@ class Vision:
                 self._start()
             img.write_bytes(data)
             try:
-                self.proc.stdin.write(f"ENC {img.name} {out.name}\n")      # relative to the encoder's cwd (#480)
+                cmd = f"ENCMAX {cap}" if cap else "ENC"
+                self.proc.stdin.write(f"{cmd} {img.name} {out.name}\n")    # relative to the encoder's cwd (#480)
                 self.proc.stdin.flush()
                 try:
                     line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
@@ -4090,6 +4100,7 @@ class Service:
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
+        details = image_details_of(messages)
         if images:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (pictures are off: run "
@@ -4109,7 +4120,8 @@ class Service:
             with self._turn(cancel):
                 self._vision_up()
                 try:
-                    encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+                    kw = {"details": details} if any(details) else {}   # OpenAI's detail: "low" = fewer tokens
+                    encoded = (self.vision.encode_all(images, cancel, **kw) if hasattr(self.vision, "encode_all")
                                else [self.vision.encode(src) for src in images])
                 finally:
                     self.last_image_at = time.time()
