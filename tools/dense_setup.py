@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")   # no usage reports to Hugging Face (downloads only)
 import shutil
 import subprocess
 import sys

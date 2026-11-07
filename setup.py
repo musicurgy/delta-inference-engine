@@ -45,6 +45,7 @@ import hashlib
 import json
 import math
 import os
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")   # no usage reports to Hugging Face (downloads only)
 import platform
 import re
 import shutil

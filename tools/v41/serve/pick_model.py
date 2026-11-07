@@ -16,6 +16,7 @@ The choice goes into model-choice.txt in this folder (one line: a path in the mo
 reads it.  Delete that file, or pick the default, to go back to the ds4 Q2 GGUF.
 """
 import os
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")   # no usage reports to Hugging Face (downloads only)
 import shutil
 import subprocess
 import sys

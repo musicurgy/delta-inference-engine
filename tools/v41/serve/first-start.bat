@@ -1,4 +1,6 @@
 @echo off
+rem no usage reports to Hugging Face (downloads only)
+set HF_HUB_DISABLE_TELEMETRY=1
 rem first-start.bat - "Start DeepSeek.bat" runs this before every start.  It sets up whatever is missing - the Python
 rem environment, the build, the model files - and asks before anything big.  Once everything is there it only checks
 rem (a fraction of a second).

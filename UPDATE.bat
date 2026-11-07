@@ -1,4 +1,6 @@
 @echo off
+rem no usage reports to Hugging Face (downloads only)
+set HF_HUB_DISABLE_TELEMETRY=1
 rem Update to the newest Delta Inference Engine without starting it: git pull (a git clone), or where to get the new ZIP.
 rem Then "Start DeepSeek.bat" gets a new engine or new Python packages first if the update needs them.  The model files
 rem are not touched.

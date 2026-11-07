@@ -6596,6 +6596,27 @@ def host_allowed(host, names, any_host=False) -> bool:
                            or _name_in(name, names))
 
 
+def this_pc_only(host) -> bool:
+    """True when `host` is reachable from this PC alone: localhost or a loopback address (127.0.0.0/8, ::1)."""
+    h = (host or "").strip().strip("[]").lower()
+    if h in ("localhost", ""):
+        return h == "localhost"
+    try:
+        import ipaddress
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False   # a name other than localhost may resolve anywhere
+
+
+def open_without_key(host, api_key, cfg, env) -> bool:
+    """0.94: True = refuse to start.  Listening beyond this PC (0.0.0.0, a LAN address, a host name) with no API key
+    let anyone on the network use the model and read its requests; it used to be only a warning.  "allow_no_key": true
+    in the config, or STRATA_ALLOW_NO_KEY=1, keeps the old behaviour on a network the user trusts."""
+    if api_key or this_pc_only(host):
+        return False
+    return not (cfg.get("allow_no_key") is True or str(env.get("STRATA_ALLOW_NO_KEY", "")).strip() == "1")
+
+
 def key_list(value) -> list[str]:
     """#1344: the keys a server accepts.  --api-key / STRATA_API_KEY / "api_key" take llama.cpp's form, several keys
     separated by commas ("k1,k2"; spaces around each are dropped), or a list in the config ("api_key": ["k1", "k2"],
@@ -7166,6 +7187,12 @@ def main() -> int:
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    if open_without_key(a.host, svc.api_key, cfg, os.environ):
+        print(f"[strata] refusing to listen on {a.host} without an API key: anyone on your network could use the model "
+              f"and read its requests.  Set \"api_key\" in the config (or STRATA_API_KEY), listen on 127.0.0.1, or - on "
+              f"a network you trust - set \"allow_no_key\": true in the config (or STRATA_ALLOW_NO_KEY=1).",
+              file=sys.stderr, flush=True)
+        return 2
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
