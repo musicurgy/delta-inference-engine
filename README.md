@@ -73,18 +73,24 @@ PASS / FAIL list), starts DeepSeek in a second window with everything it prints 
 it packs it all into `logs\debug-<time>.zip`. Attach that zip to an issue with a line on what went wrong. It holds no
 prompts or answers, and your Windows user name is replaced by `<user>`.
 
-## What's new in 0.93
+## What's new in 0.94
 
-- **A model picker and a Setup tab.** The first start offers the model that suits your RAM, and the Setup tab in the
-  chat page changes the model and the settings without a batch file or a text editor.
-- **A new default from 128 GB of RAM up:** Unsloth's UD-IQ2_XXS, a 301 GB download. It writes 41 tok/s at 192 GB and
-  34 at 128 GB, and got 57 of 99 hard questions right against 52 for the old default, ds4 Q2.
-- **64 and 96 GB of RAM are supported.** The first start offers Unsloth's UD-IQ1_S there: 36 tok/s at 96 GB, 31 at 64 GB.
-- **More models at full speed:** Unsloth's UD-Q2_K_XL and UD-IQ3_XXS for better quality, in `Choose Model.bat`.
-- **A second GPU** can run a helper, a switch on the Setup tab: about 7% more writing speed with an RTX 3060 beside the 3090.
-- **Built in public.** The release zips come from GitHub's own runners, each with a build attestation.
+- **Pictures are on by default.** Paste, drop, screenshot or photograph a picture into the chat. On one graphics card
+  pictures are read on the CPU, so the model keeps all its memory; with a second card they are read there.
+- **Documents:** attach PDF, Word, Excel, PowerPoint and text files to a chat.
+- **Voice (optional, `Enable Voice.bat`):** talk instead of typing, have answers read aloud, or use a hands-free talk mode.
+- **The page opens at once** and shows the model loading. **Pause** frees the memory and the graphics card (for a game)
+  until your next message.
+- **Chat history** (search, pins, export), **use it from your phone** (a QR code), and downloads you can leave alone.
+- **Better with coding agents:** Claude Code's small background requests are fast and never hold up your real ones;
+  pressing Esc no longer makes the next message re-read the whole conversation; chats with pictures no longer re-read
+  everything each turn.
+- **A bit faster:** agent sessions about 5-10%, the first message after a start about 30%, writing about 3%.
+- **Safer:** the server will not open itself to your network without an API key.
 
-The full list is on the [Releases page](https://github.com/musicurgy/delta-inference-engine/releases).
+What was new in 0.93 (a model picker and Setup tab, Unsloth's UD-IQ2_XXS as the default from 128 GB, 64 and 96 GB of
+RAM supported, the second-GPU helper, release zips built by GitHub) and the full list for every version are on the
+[Releases page](https://github.com/musicurgy/delta-inference-engine/releases).
 
 ## Speed
 
