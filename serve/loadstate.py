@@ -28,7 +28,7 @@ STEPS = [
 _KEYS = [k for k, _ in STEPS]
 
 _lock = threading.Lock()
-_state = {"active": False, "t0": None, "step": None, "detail": None, "error": None, "last_s": None}
+_state = {"active": False, "t0": None, "step": None, "detail": None, "error": None, "last_s": None, "reason": None}
 last_start_path: str | None = None          # set by main() from the run config: <config>.last-start.json
 
 
@@ -45,7 +45,13 @@ def _read_last() -> float | None:
 def begin() -> None:
     """an engine start begins (a lazy first load, a Resume, a request after a pause, a restart after a crash)"""
     with _lock:
-        _state.update(active=True, t0=time.time(), step=None, detail=None, error=None, last_s=_read_last())
+        _state.update(active=True, t0=time.time(), step=None, detail=None, error=None, last_s=_read_last(), reason=None)
+
+
+def paused(reason: str) -> None:
+    """the model was unloaded for a reason the page should show (autopause.py: a game took the graphics card)"""
+    with _lock:
+        _state["reason"] = str(reason)[:300]
 
 
 def step(key: str, detail: str | None = None) -> None:
@@ -104,9 +110,12 @@ def health(svc) -> dict:
                          "eta_s": round(max(0.0, last - elapsed), 1) if last else None}}
     if st["error"]:
         return {"model_state": "failed", "load": {"error": st["error"]}}
-    if getattr(engine, "unloaded", False) or not hasattr(engine, "alive"):
-        return {"model_state": "paused", "load": {"last_s": _read_last()}}
-    return {"model_state": "paused", "load": {"last_s": _read_last(), "stopped": True}}
+    load = {"last_s": _read_last()}
+    if st["reason"]:
+        load["reason"] = st["reason"]
+    if not (getattr(engine, "unloaded", False) or not hasattr(engine, "alive")):
+        load["stopped"] = True
+    return {"model_state": "paused", "load": load}
 
 
 class LoadingMock:

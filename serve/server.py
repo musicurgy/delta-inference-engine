@@ -3271,6 +3271,7 @@ class Service:
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
         self.idle_unload_s = 0
+        self.auto_pause_mib = 0                          # opt-in: unload when a game takes the card (autopause.py)
         self.min_free_vram_mib = 0
         self.before_load = None
         self.before_load_timeout_s = 120.0               # #1997: how long the before_load command may run
@@ -5563,7 +5564,8 @@ def make_handler(svc: Service):
                 # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
                 name = path[len("/web/"):]
                 types = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-                         ".svg": "image/svg+xml"}
+                         ".svg": "image/svg+xml", ".png": "image/png",              # the app icons ("Add to Home
+                         ".webmanifest": "application/manifest+json"}               # Screen" on a phone)
                 f = ROOT / "serve" / "web" / name
                 ext = os.path.splitext(name)[1]
                 if "/" in name or "\\" in name or ext not in types or not f.is_file():
@@ -7380,6 +7382,16 @@ def main() -> int:
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    # opt-in: unload when another program (a game) takes the graphics card while this server is idle (autopause.py)
+    try:
+        svc.auto_pause_mib = max(0, int(cfg.get("auto_pause_mib") or 0))
+    except (TypeError, ValueError):
+        raise SystemExit(f"[strata] config \"auto_pause_mib\" must be a number of MiB, not {cfg.get('auto_pause_mib')!r}")
+    from serve import autopause
+    autopause.start(svc)
+    if svc.auto_pause_mib:
+        print(f"[strata] auto-pause: the model unloads when another program takes the graphics card while it is idle "
+              f"({svc.auto_pause_mib} MiB or a steady load)", flush=True)
     if cfg.get("vision") and cfg["vision"].get("lazy"):    # local: lazy vision
         svc.start_lazy_vision(int(cfg["vision"].get("lazy_reserve_mib", 2400)),
                               float(cfg["vision"].get("lazy_idle_s", 300)))
