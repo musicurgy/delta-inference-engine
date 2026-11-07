@@ -73,6 +73,7 @@ from serve import helpers as helper_calls  # noqa: E402
 from serve.helpers import MainFirst  # noqa: E402
 from serve import server_tools as server_tools_api  # noqa: E402
 from serve import toolsearch  # noqa: E402,F401  (registers the tool search server tools)
+from serve import websearch  # noqa: E402  (registers web search / fetch; off until "web_tools" configures them)
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -5171,7 +5172,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                     yield from server_use(x["id"], name, {})
                 block = x.get("block") or {"type": rtype + "_error", "error_code": "unavailable"}
                 key = x.get("usage_key") or (entry[0].usage_key if entry[0] else None)
-                if key and not x.get("skipped"):
+                if key and x.get("ok"):                 # the calls that ran (an error is not a use)
                     srv_uses[key] = srv_uses.get(key, 0) + 1
                 index += 1
                 yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": {
@@ -6326,14 +6327,28 @@ def make_handler(svc: Service):
             def check(text, finish):
                 return validated_json(text, validator, finish)
 
+            server_run = getattr(self, "server_run", None)
+
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+                if server_run:                               # 0.94: the hosted web_search runs here
+                    runner, messages, shown, kw = server_run
+                    source = run_with_mcp(svc, runner, messages, shown, kw, ids, thinking, max_new,
+                                          req.get("max_output_tokens") or 0, req, cancel, runner.names())
+                else:
+                    source = svc.run(ids, thinking, tools, max_new, req, cancel)
+                queries = {}
+                for kind, x in source:
                     if kind == "ping":
                         yield None
                     elif kind == "event":
                         yield from asm.feed(x)
+                    elif kind == "mcp":
+                        if x["event"] == "call":
+                            queries[x["id"]] = (x.get("arguments") or {}).get("query")
+                        elif x["event"] == "result" and not x.get("skipped"):
+                            yield from asm.web_search_call(queries.get(x["id"]), x.get("text") or "")
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
@@ -6398,6 +6413,16 @@ def make_handler(svc: Service):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
+            self.server_run = None
+            web = next((t for t in req.get("tools") or [] if isinstance(t, dict) and t.get("type") in
+                        responses_api.WEB_SEARCH_TOOLS), None) if websearch.searching() else None
+            if web is not None and req.get("tool_choice") != "none" and "web_search" not in names:
+                # 0.94: Codex's hosted web_search runs here (serve/websearch.py) as the server tool web_search
+                wctx = websearch.codex_context(web)
+                kind, entry = wctx.server["web_search"]
+                tools = (tools or []) + [kind.definition(entry, wctx)]
+                skipped = [k for k in skipped if k not in responses_api.WEB_SEARCH_TOOLS]
+                self.server_run = server_tools_api.Runner(wctx, svc.server_tool_rounds)
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
@@ -6445,6 +6470,8 @@ def make_handler(svc: Service):
             except ValueError as e:                          # too long for the context, an image without vision
                 raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
                     from None
+            if self.server_run is not None:
+                self.server_run = (self.server_run, messages, shown, kw)
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
@@ -6489,6 +6516,8 @@ def make_handler(svc: Service):
             max_req = max_new = int(req.get("max_tokens") or 0)        # 0/-1: the rest of the context
             # 0.94 (serve/server_tools.py): the server tools this request declared run here, mid-answer
             runner = server_tools_api.Runner(stx, svc.server_tool_rounds) if stx.server and tools else None
+            if runner is not None:                     # web fetch: only a URL the conversation already names
+                stx.seen = "\n".join(str(m.get("content") or "") for m in messages)
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
@@ -7424,6 +7453,13 @@ def main() -> int:
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
+    try:                                                # 0.94: serve/websearch.py (off unless configured)
+        websearch.configure(cfg.get("web_tools"), public_url=public_url, mcp_hub=hub)
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    if websearch.describe():
+        print(f"[strata] web tools on: {websearch.describe()} (queries leave this PC; see docs/DETAILS.md)",
+              flush=True)
     if hub is not None:
         import atexit
         svc.mcp = hub

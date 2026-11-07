@@ -34,6 +34,9 @@ HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use
                 "code_interpreter", "image_generation", "local_shell", "mcp", "tool_search")
 
 
+WEB_SEARCH_TOOLS = ("web_search", "web_search_preview")   # 0.94: run here when "web_tools" configures a search
+
+
 class ResponsesError(ValueError):
     """A request error in the Responses format: {"error": {"message", "type", "param", "code"}}."""
 
@@ -125,6 +128,11 @@ def _tool_output(item, param):
     return out if isinstance(out, str) else _content(out, param + ".output")
 
 
+def _web_search_on() -> bool:
+    from serve import websearch
+    return websearch.searching()
+
+
 def input_messages(req: dict) -> list[dict]:
     """`instructions` + `input` -> the chat template's messages."""
     messages = []
@@ -190,6 +198,18 @@ def input_messages(req: dict) -> list[dict]:
                                                         "_call_id": item.get("call_id")})
         elif kind in ("function_call_output", "custom_tool_call_output"):
             messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
+            open_turn = None
+            thinking.clear()
+        elif kind == "web_search_call" and _web_search_on():
+            # 0.94: a search this server ran (serve/websearch.py): the call and the text the model read, as run_with_mcp
+            # rendered them (the item carries no results: the text is kept by its id)
+            from serve import websearch
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            target = open_turn if open_turn is not None and not thinking else turn()
+            target["content"] = target["content"].strip() if isinstance(target["content"], str) else target["content"]
+            target.setdefault("tool_calls", []).append({"function": {"name": "web_search", "arguments": {
+                "query": action.get("query") or ""}}})
+            messages.append({"role": "tool", "content": websearch.codex_text(item.get("id"))})
             open_turn = None
             thinking.clear()
         elif kind == "additional_tools":
@@ -631,6 +651,19 @@ class Assembler:
             self.json_text = []
         self.called = True
         return out
+
+    def web_search_call(self, query, text: str) -> list[dict]:
+        """0.94: a web search this server ran mid-answer, as the Responses API's web_search_call item (its results are
+        kept by id for the turn Codex sends back: serve/websearch.remember_codex)."""
+        from serve import websearch
+        out = self.close()
+        item = {"id": new_id("ws"), "type": "web_search_call", "status": "in_progress",
+                "action": {"type": "search", "query": query or ""}}
+        websearch.remember_codex(item["id"], text)
+        out += self._open(item)
+        for step in ("in_progress", "searching", "completed"):
+            out.append(self.event(f"response.web_search_call.{step}", output_index=self.index, item_id=item["id"]))
+        return out + self.close()
 
     def _call_item(self, ev: Event) -> dict:
         namespace, name, kind = self.names.get(ev.call.name, (None, ev.call.name, "function"))

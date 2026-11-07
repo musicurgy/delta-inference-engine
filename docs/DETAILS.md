@@ -1455,6 +1455,35 @@ unmeasured: all the runs above are text.
 
 ---
 
+## Web search and web fetch (off by default, 0.94)
+
+Claude Code's WebSearch, Anthropic's `web_search_*` / `web_fetch_*` tools and Codex's `web_search` need the server to
+run the search. Strata does that once you name a search service in `strata-<model>.json`:
+
+```json
+"web_tools": {
+  "search": "searxng",
+  "searxng_url": "http://127.0.0.1:8888",
+  "fetch": true
+}
+```
+
+- `"search"`: `"searxng"` (your own [SearXNG](https://docs.searxng.org/) with JSON output on; no key, and the most
+  private), `"brave"` with `"brave_api_key"`, `"tavily"` with `"tavily_api_key"`, or `"mcp"` with `"mcp_tool"` (a
+  search tool of one of your MCP servers, `server__tool`).
+- `"fetch": true` lets the model read a web page as text, but only a page whose address is already in the conversation
+  (you wrote it, or a search found it), only on a public address (never this PC or your network, also after a
+  redirect), at most `fetch_max_chars` (20,000) characters.
+- `max_uses` (5 per answer unless the request sets its own), `max_results` (5), `snippet_chars` (500), `timeout_s` (15).
+
+**Privacy.** A search sends the model's query - written from your conversation - to the service you chose, and a
+fetch downloads the page from its site. Nothing leaves the PC until you add this block. Page text can contain
+instructions aimed at the model: treat answers built on web pages as you would the pages themselves.
+
+Each search adds its results to the prompt (about 1-3K tokens), which the model then reads before going on.
+
+---
+
 ## Manage Strata from your AI assistant (MCP server)
 
 `tools/strata_mcp.py` is an MCP server for Claude Code, Claude Desktop, Cursor, VS Code, Codex and other assistants.

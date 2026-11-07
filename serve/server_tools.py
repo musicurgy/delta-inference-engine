@@ -74,6 +74,7 @@ class Context:
     tools: list = field(default_factory=list)
     server: dict = field(default_factory=dict)          # tool name -> (ServerKind, the request's entry)
     uses: dict = field(default_factory=dict)            # tool name -> calls so far
+    seen: str = ""                                      # the conversation's text (web fetch takes only URLs in it)
 
     def by_name(self) -> dict:
         return {t["name"]: t for t in self.tools if isinstance(t, dict) and t.get("name")}
