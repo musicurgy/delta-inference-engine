@@ -686,20 +686,30 @@ def _watch_started(svc):
 
 
 # ---- multi-GPU: ds41_helper beside the engine.  In a Windows job that ends with this process, so closing the window
-# frees the second card; started before each engine start (an engine that stops tells the helper to stop too).
+# frees the second card; started before each engine start (an engine that stops tells the helper to stop too).  A
+# helper that stops never stops the model: ds41_helper_guard.py runs the engine on one card instead.
+import ds41_helper_guard as _hg  # noqa: E402
 _HELPER = None
 _helper_job = None
+_GUARD = _hg.HelperGuard()
 
 
 def _start_helper():
     global _HELPER, _helper_job
     plan_file = HERE / "local" / "helper.json"
-    if not plan_file.exists() or (_HELPER is not None and _HELPER.poll() is None):
+    if _GUARD.off or not plan_file.exists() or (_HELPER is not None and _HELPER.poll() is None):
         return
     plan = json.loads(plan_file.read_text(encoding="utf-8"))
     env = {**os.environ, "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": str(plan["gpu"])}
-    log = open(HERE / "local" / "helper.log", "ab")
-    _HELPER = subprocess.Popen([plan["exe"]] + plan["args"], env=env, stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+    log_path = HERE / "local" / "helper.log"
+    log = open(log_path, "ab")
+    log_at = log.tell()
+    try:
+        _HELPER = subprocess.Popen([plan["exe"]] + plan["args"], env=env, stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+    except OSError as e:                   # no ds41_helper.exe (an engine build without it): one card
+        _GUARD.off = f"{os.path.basename(plan['exe'])}: {e.strerror or e}"
+        _GUARD.say(f"[strata] the second card's helper stopped ({_GUARD.off}): running on one card")
+        return
     print(f"[strata] multi-GPU: helper started on {plan['gpu_name']}", flush=True)
     if os.name == "nt":
         import ctypes
@@ -716,6 +726,7 @@ def _start_helper():
             k.SetInformationJobObject(ctypes.c_void_p(_helper_job), 9, ctypes.byref(info), ctypes.sizeof(info))
         h = k.OpenProcess(0x0101, False, _HELPER.pid)      # PROCESS_SET_QUOTA | PROCESS_TERMINATE
         k.AssignProcessToJobObject(ctypes.c_void_p(_helper_job), ctypes.c_void_p(h))
+    _GUARD.started(_HELPER, log_path, log_at)
 
 
 _engine_init = S.StrataEngine.__init__
@@ -723,7 +734,7 @@ _engine_init = S.StrataEngine.__init__
 
 def _engine_init_helper(self, *a, **k):
     _start_helper()
-    _engine_init(self, *a, **k)
+    _GUARD.init(_engine_init, self, a, k)
 
 
 S.StrataEngine.__init__ = _engine_init_helper
