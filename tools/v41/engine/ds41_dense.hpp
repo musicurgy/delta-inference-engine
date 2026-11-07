@@ -57,6 +57,7 @@ struct Ds41DenseConfig {
     /// --serve: start with max_pass (S) state columns and let set_columns() grow them for a layer-major batch and give
     /// them back after it (the prompt_batch columns are ~2.6 GiB at 8192 - expert slots while decoding).
     bool    elastic_cols = false;
+    bool    win_floor = false;         ///< STRATA_ENC_BOUND: allocate the second window mask (set_window_floor)
     bool    vision = false;            ///< opt-in image embeddings, VL routing and Engram masking
 };
 
@@ -106,6 +107,9 @@ public:
     /// `enc_replay` tokens are all that matters).  Writes no host ids/wts/fn, so batch_ids()/batch_wts()/batch_fn()
     /// are left untouched at these columns.
     bool attn_router_span_kv(int il, int col0, int n);
+    /// STRATA_ENC_BOUND: layers past the last kv source read nothing before position `floor` (-1 = no limit).  Kept for
+    /// later passes; n > 0 also rewrites the current batch's n columns, which start at position pos0.
+    void set_window_floor(int64_t floor, int n = 0, int pos0 = 0);
     /// The batch's host buffers filled by attn_router_span: ids / wts are n_used * B (token-major), fn is n_embd * B.
     const int32_t * batch_ids() const;
     const float * batch_wts() const;

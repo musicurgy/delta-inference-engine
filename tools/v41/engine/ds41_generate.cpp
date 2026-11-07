@@ -527,6 +527,12 @@ int main(int argc, char ** argv) {
     }
     if (enc_skip && PB <= 1) { std::fprintf(stderr, "ds41_generate: --enc-skip needs the layer-major prompt path (--prompt-batch >= 2)\n"); return 2; }
     int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
+    // STRATA_ENC_BOUND=N (0 = off; CHANGES OUTPUT): bounded replay, DeepSeek's own design.  Only a prompt's last N tokens
+    // run the layers past the last kv source, and those layers' windows stop where the replay starts.  N stays at least
+    // one window, so decode never reads a row these layers did not write.  The scorer applies the same limit.
+    const char * enc_bound_env = std::getenv("STRATA_ENC_BOUND");
+    int64_t enc_bound = enc_bound_env ? std::max<int64_t>(0, std::atoll(enc_bound_env)) : 0;
+    dc.win_floor = enc_bound > 0;
     dc.engram_dirs = a.engram;
     dc.engram_hot = a.engram_hot;
     dc.vision = a.vision;
@@ -548,7 +554,12 @@ int main(int argc, char ** argv) {
     for (int64_t s : G.kv_sources) CL = std::max<int>(CL, (int) s);
     // exactness needs every later layer's window reach to stay inside the replay: reach = swa * (n_layer - CL)
     const int64_t reach = (int64_t) G.n_swa * (int64_t) (n_layer - CL);
-    if (enc_skip && ER < reach) {
+    if (enc_bound > 0) {
+        enc_bound = std::max<int64_t>(enc_bound, (int64_t) G.n_swa);
+        if (enc_skip) ER = enc_bound;
+        std::fprintf(stderr, "enc-bound: layers past %d run on the last %lld tokens of a prompt (changes output)\n", CL, (long long) enc_bound);
+    }
+    if (enc_skip && ER < reach && enc_bound == 0) {
         std::fprintf(stderr, "note: --enc-replay %lld < the window reach %lld (swa %lld x %d layers past %d); raised\n",
                      (long long) ER, (long long) reach, (long long) G.n_swa, n_layer - CL, CL);
         ER = reach;
@@ -1631,6 +1642,8 @@ int main(int argc, char ** argv) {
     };
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
+        bool floor_set = false;
+        if (enc_bound > 0) dense.set_window_floor(-1);
         for (int c0 = 0; c0 < n; ) {
             if (stop_prefill()) return false;
             if (PB > 1 && n - c0 >= 2) {
@@ -1676,9 +1689,13 @@ int main(int argc, char ** argv) {
                 int cut = 0;
                 if (enc_skip) {
                     const int64_t gpos = (int64_t) pos0 + c0;
-                    const int64_t ta = (int64_t) pos0 + n - ER - gpos;
+                    const int64_t ta = (int64_t) pos0 + n - ER - (enc_bound > 0 ? tail_keep : 0) - gpos;
                     cut = ta <= 0 ? 0 : ta >= B ? B : (int) ta;
                     cut = (cut / SB) * SB;
+                    if (enc_bound > 0 && !floor_set && cut < B) {   // the first column past the skip: the replay's start
+                        floor_set = true;
+                        if (gpos + cut > pos0) dense.set_window_floor(gpos + cut, B, (int) gpos);
+                    }
                     if (!enc_reported) { enc_reported = true; std::fprintf(stderr, "enc-skip: first batch B=%d, cut=%d (phase A %d cols, phase B %d)\n", B, cut, cut, B - cut); }
                 }
                 double t0 = now_ms();
@@ -2905,6 +2922,7 @@ int main(int argc, char ** argv) {
             if (pr.empty() || tg.empty()) { ++ci; continue; }
             if ((int64_t) (pr.size() + tg.size()) + 1 >= ctx) { std::fprintf(stderr, "case %d exceeds the context\n", ci); ++ci; continue; }
             int pos = 0;
+            if (enc_bound > 0) dense.set_window_floor((int64_t) pr.size() > enc_bound ? (int64_t) pr.size() - enc_bound : -1);
             for (int t : pr) {   // the prompt, token by token (its last step's logits predict the first continuation token)
                 refresh_bias();
                 if (!step(t, pos++)) { std::fprintf(stderr, "case %d: %s\n", ci, ferr.c_str()); return 1; }

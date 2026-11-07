@@ -259,6 +259,9 @@ struct Ds41Dense::Impl {
     ggml_tensor * i_pos = nullptr;        // I32 [NC]
     ggml_tensor * i_widx = nullptr;       // I32 [SWA * NC]   per query: rows of [ring | pass rows]
     ggml_tensor * i_wmask = nullptr;      // F32 [SWA, NC]
+    ggml_tensor * i_wmask_hi = nullptr;   // STRATA_ENC_BOUND only: the mask of the layers past the last kv source
+    int64_t win_floor = -1;               // ... whose windows stop at this position (set_window_floor)
+    int last_kv = -1;                     // the last kv source layer
     ggml_tensor * i_wslot = nullptr;      // I32 [min(NC, RAW)]  ring slots of the pass's last rows
     ggml_tensor * i_nvis[3] = {};         // F32 [NC]   visible compressed rows per query (ratio 1 / 2)
     ggml_tensor * i_cslot[3] = {};        // I32 [NC]   compressed row each token writes (spare if its group is open)
@@ -379,7 +382,7 @@ struct Ds41Dense::Impl {
         ggml_tensor * x_state = nullptr, * pre_state = nullptr, * hap = nullptr, * post_f = nullptr, * comb_f = nullptr;
         ggml_tensor * shexp = nullptr, * o_fn = nullptr, * o_ids = nullptr, * o_wts = nullptr, * o_xids = nullptr;
         ggml_tensor * o_xwts = nullptr, * routed = nullptr, * cand = nullptr;
-        ggml_tensor * i_emb = nullptr, * i_pos = nullptr, * i_img = nullptr, * i_widx = nullptr, * i_wmask = nullptr;
+        ggml_tensor * i_emb = nullptr, * i_pos = nullptr, * i_img = nullptr, * i_widx = nullptr, * i_wmask = nullptr, * i_wmask_hi = nullptr;
         ggml_tensor * i_wslot = nullptr, * i_sidx = nullptr, * i_sslot = nullptr, * i_lastblk = nullptr;
         ggml_tensor * i_nvis[3] = {}, * i_cslot[3] = {}, * i_cpos[3] = {}, * i_eng[2] = {};
         std::vector<std::pair<ggml_tensor *, ggml_tensor *>> sel;   // per layer: sel, selm
@@ -436,6 +439,7 @@ struct Ds41Dense::Impl {
         std::swap(i_img, o.i_img);
         std::swap(i_widx, o.i_widx);
         std::swap(i_wmask, o.i_wmask);
+        std::swap(i_wmask_hi, o.i_wmask_hi);
         std::swap(i_wslot, o.i_wslot);
         std::swap(i_sidx, o.i_sidx);
         std::swap(i_sslot, o.i_sslot);
@@ -1031,7 +1035,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // F16 key path for this graph only when the zero index covers its padding (255 pad rows x n queries at most)
     const bool f16 = im.f16_gather && 255 * n <= im.zidx->ne[0];
     ggml_tensor * Kw = ggml_reshape_3d(gc, rows_as(gc, wsrc, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4), f16), DH, SWA, n);
-    ggml_tensor * Mw = b.cols2(im.i_wmask, SWA, n, col0);
+    ggml_tensor * Mw = b.cols2(im.i_wmask_hi && il > im.last_kv ? im.i_wmask_hi : im.i_wmask, SWA, n, col0);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
         ggml_tensor * last = ggml_view_2d(gc, kv2, DH, k, kv2->nb[1], (size_t) (n - k) * kv2->nb[1]);
@@ -1604,6 +1608,7 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.i_widx = ggml_new_tensor_1d(c, GGML_TYPE_I32, im.SWA * NC);
     im.span_memo_pos0 = -1;   // new tensors: nothing uploaded yet
     im.i_wmask = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.SWA, NC);
+    im.i_wmask_hi = im.cfg.win_floor ? ggml_new_tensor_2d(c, GGML_TYPE_F32, im.SWA, NC) : nullptr;
     im.i_wslot = ggml_new_tensor_1d(c, GGML_TYPE_I32, std::min<int64_t>(NC, im.RAW));
     for (int r = 1; r <= 2; ++r) {
         im.i_nvis[r] = ggml_new_tensor_1d(c, GGML_TYPE_F32, NC);
@@ -1745,6 +1750,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         auto & L = im.ly[(size_t) l];
         L.ratio = G.ratio[(size_t) l];
         L.kv_src = G.is_kv_source(l);
+        if (L.kv_src) im.last_kv = std::max(im.last_kv, (int) l);
         L.idx_src = G.is_index_source(l);
         L.cand_src = l == G.cand_layer;
         L.uses_cand = G.cand_layer >= 0 && l > G.cand_layer && L.idx_src;
@@ -2006,6 +2012,28 @@ static bool engram_ahead_take(Ds41Dense::Impl & im, int64_t pos0, int n, bool & 
     return im.engram.wait(b, im.err);
 }
 
+// STRATA_ENC_BOUND: the window mask of the layers past the last kv source.  A row at or past the floor sees nothing
+// before it: those rows never ran these layers, so their ring slots hold older positions.  A row before the floor
+// (the scorer runs them, nothing reads them) keeps its own row, so its attention is never empty.
+static void upload_wmask_hi(Ds41Dense::Impl & im, int n, int pos0) {
+    const int64_t SWA = im.SWA;
+    std::vector<float> wm((size_t) (SWA * n));
+    for (int t = 0; t < n; ++t) {
+        const int64_t p = (int64_t) pos0 + t, lo = std::min(im.win_floor, p);
+        for (int64_t j = 0; j < SWA; ++j) {
+            const int64_t q = p - SWA + 1 + j;
+            wm[(size_t) (t * SWA + j)] = (q < 0 || q < lo) ? NEG_INF : 0.0f;
+        }
+    }
+    dset(im.i_wmask_hi, wm.data(), 0, wm.size() * 4);
+}
+
+void Ds41Dense::set_window_floor(int64_t floor, int n, int pos0) {
+    Impl & im = *p_;
+    im.win_floor = floor;
+    if (im.i_wmask_hi && n > 0) upload_wmask_hi(im, n, pos0);
+}
+
 // Per-token inputs of n tokens at positions pos0.. (embeddings, positions, the window / compressed / indexer index
 // maps, the Engram rows and the per-pass ring slots).  Shared by begin() and begin_batch().
 bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
@@ -2054,6 +2082,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     }
     dset(im.i_widx, widx.data(), 0, widx.size() * 4);
     dset(im.i_wmask, wm.data(), 0, wm.size() * 4);
+    if (im.i_wmask_hi) upload_wmask_hi(im, n, pos0);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
         std::vector<int32_t> ws((size_t) k);
