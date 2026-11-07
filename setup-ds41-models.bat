@@ -2,9 +2,11 @@
 rem no usage reports to Hugging Face (downloads only)
 set HF_HUB_DISABLE_TELEMETRY=1
 rem Download and prepare the model files into DS41_MODELS (ds41-paths.bat).  "Start DeepSeek.bat" runs this for you when
-rem files are missing.  Safe to re-run: finished steps are skipped, the Hugging Face downloads resume, and every large
-rem file is checked against the SHA-256 its repository publishes before it is used.  Downloads ~375 GB; needs ~385 GB
-rem free while it runs and ~371 GB when done.  Needs .venv (README.md, Setup step 1) and the build (step 2).
+rem files are missing.  The downloads run through tools\v41\serve\hf_get.py: the PC stays awake, a stalled download is
+rem started again, a failed one is tried again after a pause, and one line shows the progress.  Safe to re-run:
+rem finished steps are skipped, the Hugging Face downloads resume, and every large file is checked against the SHA-256
+rem its repository publishes before it is used.  Downloads ~375 GB; needs ~385 GB free while it runs and ~371 GB when
+rem done.  Needs .venv (README.md, Setup step 1) and the build (step 2).
 setlocal
 cd /d "%~dp0"
 call "%~dp0ds41-paths.bat"
@@ -49,7 +51,7 @@ if exist "%M%\engram\tokenizer.json" set "D=%M%\engram"
 set "GET="
 for %%f in (model.safetensors.index.json config.json tokenizer.json tokenizer_config.json) do if not exist "%D%\%%f" set "GET=1"
 if defined GET (
-  "%HF%" download %DS% model.safetensors.index.json config.json tokenizer.json tokenizer_config.json --local-dir "%D%" || exit /b 1
+  "%PY%" tools\v41\serve\hf_get.py %DS% model.safetensors.index.json config.json tokenizer.json tokenizer_config.json --local-dir "%D%" || exit /b 1
 )
 
 rem 3. The tokenizer tables the server reads
@@ -65,7 +67,7 @@ rem    VRAM first-start sets DS41_NO_DRAFTER).
 if defined DS41_NO_DRAFTER goto main
 if exist "%M%\V41-1017-MTP-iq2xxs.gguf" goto main
 if exist "%M%\V41-1017-MTP.gguf" goto requant
-"%HF%" download %DS% model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors --local-dir "%D%" || exit /b 1
+"%PY%" tools\v41\serve\hf_get.py %DS% model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors --local-dir "%D%" || exit /b 1
 "%PY%" tools\v41\hf_verify.py --repo %DS% --dir "%D%" model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors || exit /b 1
 set "V41_SRC=%D%"
 set "V41_SRC_NAME=DeepSeek V4.1 Flash 1017"
@@ -101,7 +103,7 @@ if defined DS41_VISION set "VIS=%DS41_VISION%"
 if /i not "%VIS%"=="cpu" if /i not "%VIS%"=="gpu" goto mainmodel
 set "VG=DeepSeek-V4.1-Flash-1017-Vision.gguf"
 if exist "%M%\%VG%.ok" goto vision_torch
-"%HF%" download nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %VG% --local-dir "%M%" || exit /b 1
+"%PY%" tools\v41\serve\hf_get.py nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %VG% --local-dir "%M%" || exit /b 1
 "%PY%" tools\v41\hf_verify.py --repo nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF --dir "%M%" %VG% || exit /b 1
 :vision_torch
 rem PyTorch: any build does for "cpu"; "gpu" needs a CUDA one (a CPU build there is replaced)
@@ -117,9 +119,13 @@ rem not --force-reinstall: that would also replace its dependencies (jinja2 is p
 rem 6. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 GB, checked).  It also carries the
 rem    Engram tables - DeepSeek's own bytes - and the engine reads them straight from it.
 if defined SKIPMAIN goto done
-"%HF%" download nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %Q2% --local-dir "%M%" || exit /b 1
-"%PY%" tools\v41\hf_verify.py --repo nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF --dir "%M%" %Q2% || exit /b 1
+set "BIGDL=1"
+"%PY%" tools\v41\serve\hf_get.py nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %Q2% --local-dir "%M%" || exit /b 1
+rem the SHA-256 check reads all 366 GB (minutes): the PC stays awake for it too
+"%PY%" tools\v41\serve\hf_get.py --awake "%PY%" tools\v41\hf_verify.py --repo nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF --dir "%M%" %Q2% || exit /b 1
 
 :done
 echo Setup finished.
+rem the big download is done: a Windows notification, for whoever left it running
+if defined BIGDL "%PY%" tools\v41\serve\hf_get.py --notify "DeepSeek is set up" "The model is downloaded and checked. DeepSeek starts now; the chat page opens by itself."
 exit /b 0
