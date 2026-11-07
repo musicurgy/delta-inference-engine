@@ -190,15 +190,49 @@ class Placement(unittest.TestCase):
         with mock.patch.object(L, "vision_choice", lambda: "off"), mock.patch.object(L, "torch_build", lambda: "cuda"):
             self.assertEqual(L.vision_plan(), "off cuda")
 
-    def section(self, mode, build, multi=True):
+    def section(self, mode, build, multi=True, ram=192.0, lazy=None):
+        env = {"DS41_GGUF": "model.gguf", "DS41_VISION_LAZY": lazy or ""}
         with mock.patch.object(L, "vision_choice", lambda: mode), mock.patch.object(L, "torch_build", lambda: build), \
                 mock.patch.object(L, "page_settings", lambda: {"multi_gpu": multi}), \
                 mock.patch.dict(sys.modules, {"setup_panel": SimpleNamespace(list_gpus=lambda: GPUS,
                                                                              helper_gpu=lambda g, e: GPUS[1])}), \
                 mock.patch.object(L.os.path, "exists", lambda p: True), \
-                mock.patch.dict(os.environ, {"DS41_GGUF": "model.gguf"}), \
+                mock.patch.object(L, "total_ram_gib", lambda: ram), \
+                mock.patch.dict(os.environ, env), \
                 mock.patch("sys.stdout", new_callable=io.StringIO) as said:
             return L.vision_section("models", 0), said.getvalue()
+
+    def test_section_cpu_is_lazy_below_110_gib(self):
+        # 64 / 96 GB PCs: the CPU encoder (~2.4 GB resident, ~4.3 GB while it loads) starts with the first picture
+        v, _ = self.section("cpu", "cpu", ram=63.8)
+        self.assertEqual((v["gpu"], v.get("lazy"), v.get("lazy_idle_s")), (False, True, L.VISION_LAZY_IDLE_S))
+        self.assertTrue(self.section("cpu", "cpu", ram=95.8)[0].get("lazy"))
+        self.assertNotIn("lazy", self.section("cpu", "cpu", ram=191.8)[0])           # 128 GB and up: resident
+        self.assertNotIn("lazy", self.section("cpu", "cpu", ram=63.8, lazy="0")[0])  # DS41_VISION_LAZY decides
+        self.assertTrue(self.section("cpu", "cpu", ram=191.8, lazy="1")[0].get("lazy"))
+        self.assertNotIn("lazy", self.section("on", "cuda", ram=63.8)[0])            # on a card: as before
+
+    def test_lazy_cpu_encoder_leaves_the_expert_cache(self):
+        # reserve_mib 0 (the CPU encoder): starting it must not shrink the engine's VRAM expert cache
+        calls = []
+        svc = SimpleNamespace(vision=SimpleNamespace(lazy_vision=True, on_start=None, alive=lambda: False, last_used=0.0),
+                              engine=SimpleNamespace(vram=lambda mib: calls.append(mib) or {}, info={}),
+                              loaded=lambda: True, vram_reserve=0, fifo=threading.Lock())
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            Service.start_lazy_vision(svc, 0, 3600.0)
+            svc.vision.on_start()
+            self.assertEqual(calls, [])
+            Service.start_lazy_vision(svc, 2400, 3600.0)                           # on a card: room is made as before
+            svc.vision.on_start()
+        self.assertEqual(calls, [2400])
+
+    def test_drafter_keeps_64_experts_below_80_gib(self):
+        on = {"STRATA_SERVE_DSPARK": "d.gguf"}
+        self.assertEqual(L.drafter_keep(63.8, on), L.DSPARK_KEEP_SMALL)               # the launcher's KEEP-all on 64 GB
+        self.assertEqual(L.drafter_keep(63.8, {**on, "STRATA_DSPARK_KEEP": ""}), L.DSPARK_KEEP_SMALL)
+        self.assertIsNone(L.drafter_keep(95.8, on))                                    # 96 GB and up: all 128
+        self.assertIsNone(L.drafter_keep(63.8, {**on, "STRATA_DSPARK_KEEP": "x.txt:32"}))   # a set value stays
+        self.assertIsNone(L.drafter_keep(63.8, {}))                                    # no drafter
 
     def test_section_on_the_second_card(self):
         v, said = self.section("on", "cuda")

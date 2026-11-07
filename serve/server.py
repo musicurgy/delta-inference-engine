@@ -3824,7 +3824,9 @@ class Service:
         v = self.vision
         if v is None or not getattr(v, "lazy_vision", False):
             return
-        elastic = hasattr(self.engine, "vram") and bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic", True))
+        # reserve_mib 0 (an encoder on the CPU): nothing to make room for on the card - the expert cache stays as it is
+        elastic = reserve_mib > 0 and hasattr(self.engine, "vram") and \
+            bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic", True))
 
         def make_room():
             if not elastic or not self.loaded():
@@ -8393,7 +8395,7 @@ def main() -> int:
         print(f"[strata] auto-pause: the model unloads when another program takes the graphics card while it is idle "
               f"({svc.auto_pause_mib} MiB or a steady load)", flush=True)
     if cfg.get("vision") and cfg["vision"].get("lazy"):    # local: lazy vision
-        svc.start_lazy_vision(int(cfg["vision"].get("lazy_reserve_mib", 2400)),
+        svc.start_lazy_vision(int(cfg["vision"].get("lazy_reserve_mib", 2400)) if cfg["vision"].get("gpu") else 0,
                               float(cfg["vision"].get("lazy_idle_s", 300)))
     voice_cfg = cfg.get("voice") or {}                     # local: the voice sidecar (ASR/TTS)
     if voice_cfg:

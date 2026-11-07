@@ -47,6 +47,8 @@ import cpu_level  # noqa: E402  (same folder)
 
 ROOT =os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 ARENA_CAP_GIB = 140
+KEEP_ALL_RAM_GIB = 80                                             # below: the drafter keeps 64 experts per block
+DSPARK_KEEP_SMALL = "tools/v41/serve/dspark_expert_counts.txt:64"  # Start DeepSeek.bat's value for cards under 22 GB
 # engine settings for this model, carried in the config's "env" (the server starts the engine with them - this script's
 # own environment does not reach it)
 ENGINE_ENV = {}
@@ -89,6 +91,14 @@ def total_ram_gib():
         ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
         return m.total / 2**30
     return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+
+
+def drafter_keep(ram_gib, env):
+    """STRATA_DSPARK_KEEP for the engine, or None (as the launcher left it): the 64 most-used experts per block below
+    KEEP_ALL_RAM_GIB when the launcher asked for all 128 (the variable unset or empty) and the drafter runs."""
+    if ram_gib < KEEP_ALL_RAM_GIB and env.get("STRATA_SERVE_DSPARK") and not env.get("STRATA_DSPARK_KEEP", "").strip():
+        return DSPARK_KEEP_SMALL
+    return None
 
 
 def env_gib(name, default):
@@ -283,6 +293,13 @@ def expand(cfg):
     # also serves the file tier and prompts read ~3.5% slower at k=3 (B2's lowk, 11-03) - off below 192 GB-class RAM
     if total_ram_gib() < 170 and os.environ.get("STRATA_CHUNK_CPU", "") not in ("", "0"):
         ENGINE_ENV["STRATA_CHUNK_CPU"] = "0"
+    # Start DeepSeek.bat keeps all 128 drafter experts per block on a card of 22 GB or more (STRATA_DSPARK_KEEP unset;
+    # round 358, at 192 GB: ~+3% writing).  The 1.8 GB more of VRAM comes out of the expert cache, and on a 64 GB PC the
+    # cache's misses come from the SSD: the placement simulator prices 194 fewer slots at -5.7% there and -0.8% at 96 GB
+    # (trace-r244-64 / r231-96, review_lowram.md).  Below KEEP_ALL_RAM_GIB: 0.93's 64 most-used, until a 64 GB run decides.
+    keep = drafter_keep(total_ram_gib(), os.environ)
+    if keep:
+        ENGINE_ENV["STRATA_DSPARK_KEEP"] = keep
     if ENGINE_ENV:
         out["env"] = {**(out.get("env") or {}), **ENGINE_ENV}
     # DS41_GPU (ds41-paths.bat: the card with the most VRAM unless set): the server starts the engine on the config's
@@ -369,6 +386,12 @@ VISION_GPU_GIB = 2.0
 # read-aloud (Kokoro, onnxruntime CUDA) on the helper's card: "about 1.5 GB" (voice_section's note); without this the
 # helper's 2.5 GiB of headroom was all that was left for it
 VOICE_GPU_GIB = 1.5
+# Pictures on the CPU below this much RAM: the encoder starts with the first picture and stops after VISION_LAZY_IDLE_S
+# without one.  Resident it holds ~2.4 GB (4.0 GB committed) and peaks at ~4.3 GB while it loads, beside the engine's
+# own load (measured 11-07, docs/win3090/brainstorm_1107/review_lowram.md) - RAM the 28 GiB reserve does not count, on a
+# 64 / 96 GB PC that has ~11 GB left after a long prompt.  DS41_VISION_LAZY=1 / 0 decides on any PC.
+LAZY_VISION_RAM_GIB = 110
+VISION_LAZY_IDLE_S = 300
 
 
 def vision_choice():
@@ -472,6 +495,9 @@ def vision_section(m, engine_gpu=None):
         v["where"] = note
     else:   # i5-13600K: 6 threads 8.1 s for a 1024x701 photo, 14 threads 9.2 s (the E-cores slow it down)
         v["threads"] = max(1, min(6, os.cpu_count() or 1))
+        lz = os.environ.get("DS41_VISION_LAZY", "").strip()
+        if lz == "1" or (lz != "0" and total_ram_gib() < LAZY_VISION_RAM_GIB):
+            v["lazy"], v["lazy_idle_s"] = True, VISION_LAZY_IDLE_S
     return v
 
 
@@ -628,6 +654,8 @@ def main():
               "vs 27 / 20 tok/s at 96 / 64 GB; 89.1 vs 89.9% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
     if cfg.get("vision"):
         where = (cfg["vision"].get("where") or "on the GPU") if cfg["vision"]["gpu"] else "on the CPU"
+        if cfg["vision"].get("lazy"):
+            where += ", loaded with the first picture"
         print(f"ds41_local: pictures on ({where}); Disable Pictures.bat turns them off")
     if cfg.get("voice"):
         env = cfg["voice"]["tts"].get("env") or {}
