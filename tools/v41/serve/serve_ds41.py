@@ -311,10 +311,9 @@ _start_lazy_vision = S.Service.start_lazy_vision
 
 
 def _start_lazy_vision_ds41(self, reserve_mib, idle_s):
-    # 1107 review: lazy mode (a CPU encoder on a 64 / 96 GB PC, ds41_local.vision_lazy) asks an "elastic" engine to
-    # shrink its expert cache before the encoder starts and to grow it after (`VRAM <mib>`), and takes an engine as
-    # elastic unless its info says otherwise.  ds41_generate has no VRAM command: each picture's start would wait
-    # 120 s for an answer and then take the engine for dead.  The encoder only starts and stops here.
+    # ds41_generate has no VRAM command: lazy mode's make-room step (an encoder on the engine's own card) would wait
+    # 120 s for an answer and then take the engine for dead.  The engine says it is not elastic; the encoder only
+    # starts and stops (on the engine's card it then needs the room --vram-margin leaves).
     self.engine.info["vram_elastic"] = False
     _start_lazy_vision(self, reserve_mib, idle_s)
 

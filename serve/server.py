@@ -2721,6 +2721,16 @@ class Vision:
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
+def lazy_vision_reserve(cfg: dict) -> int:
+    """The VRAM (MiB) a lazy encoder's start asks the engine's expert cache to free: its "lazy_reserve_mib" (2400)
+    only when the encoder runs on the engine's own card.  On the CPU, or on another card ("cuda_device" not one of the
+    engine's, e.g. the multi-GPU helper's), there is nothing of the engine's to give back: 0."""
+    v = cfg.get("vision") or {}
+    dev = v.get("cuda_device")
+    shares = bool(v.get("gpu")) and (dev is None or dev in gpu_list(cfg))
+    return int(v.get("lazy_reserve_mib", 2400)) if shares else 0
+
+
 def gpu_list(cfg: dict) -> list[int]:
     """The config's "gpu": one card (2), or several for a layer split ([0, 2] or "0,2"), numbered as nvidia-smi
     numbers them; [] when it names none."""
@@ -8407,8 +8417,7 @@ def main() -> int:
         print(f"[strata] auto-pause: the model unloads when another program takes the graphics card while it is idle "
               f"({svc.auto_pause_mib} MiB or a steady load)", flush=True)
     if cfg.get("vision") and cfg["vision"].get("lazy"):    # local: lazy vision
-        svc.start_lazy_vision(int(cfg["vision"].get("lazy_reserve_mib", 2400)) if cfg["vision"].get("gpu") else 0,
-                              float(cfg["vision"].get("lazy_idle_s", 300)))
+        svc.start_lazy_vision(lazy_vision_reserve(cfg), float(cfg["vision"].get("lazy_idle_s", 300)))
     voice_cfg = cfg.get("voice") or {}                     # local: the voice sidecar (ASR/TTS)
     if voice_cfg:
         servers = {kind: VoiceServer(kind, voice_cfg[kind]) for kind in ("asr", "tts")

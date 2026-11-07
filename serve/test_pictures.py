@@ -334,6 +334,48 @@ class Ds41Detail(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         self.assertEqual(json.loads(r.stdout.strip().splitlines()[-1]), [{"low": 256}, {}])
 
+    def test_lazy_on_this_engine(self):
+        """A lazy encoder that cannot start is the picture's 400 (not an internal error), and lazy mode never sends
+        ds41_generate a VRAM command (it has none: the request would wait 120 s and take the engine for dead)."""
+        code = (
+            "import sys, io, json, threading, types; sys.path.insert(0, sys.argv[1]); import serve_ds41 as D\n"
+            "from PIL import Image\n"
+            "v = D.Ds41Vision({'exe': 'x', 'mmproj': 'm', 'model': 'g', 'lazy': True}, lazy=True)\n"
+            "def broken(): raise RuntimeError('the vision encoder did not start: ERR ModuleNotFoundError')\n"
+            "v._start = broken\n"
+            "calls = []\n"
+            "eng = types.SimpleNamespace(info={}, vram=lambda *a, **k: calls.append(a) or {})\n"
+            "svc = types.SimpleNamespace(vision=v, engine=eng, fifo=threading.Lock(), loaded=lambda: True, vram_reserve=None)\n"
+            "D.S.Service.start_lazy_vision(svc, 2400, 600)\n"
+            "b = io.BytesIO(); Image.new('RGB', (40, 30), (9, 9, 9)).save(b, 'PNG')\n"
+            "try:\n"
+            "    v.encode(b.getvalue()); err = None\n"
+            "except Exception as e:\n"
+            "    err = [type(e).__name__, str(e)]\n"
+            "print(json.dumps([err, calls, eng.info.get('vram_elastic')])); v.shutdown()\n")
+        r = subprocess.run([sys.executable, "-c", code, str(V41_SERVE)], capture_output=True, text=True, cwd=ROOT,
+                           timeout=120)
+        if r.returncode and "No module named" in r.stderr:
+            self.skipTest(r.stderr.strip().splitlines()[-1])
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        err, calls, elastic = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(err[0], "ValueError")
+        self.assertIn("pictures are not working", err[1])
+        self.assertEqual((calls, elastic), ([], False))
+
+
+class LazyReserve(unittest.TestCase):
+    """server.lazy_vision_reserve: the engine's cache makes room only for an encoder on the engine's own card."""
+
+    def test_reserve(self):
+        f = server.lazy_vision_reserve
+        self.assertEqual(f({"gpu": 0, "vision": {"gpu": False, "lazy": True}}), 0)                       # CPU
+        self.assertEqual(f({"gpu": 0, "vision": {"gpu": True, "lazy": True}}), 2400)                     # its own card
+        self.assertEqual(f({"gpu": 0, "vision": {"gpu": True, "cuda_device": 0, "lazy_reserve_mib": 900}}), 900)
+        self.assertEqual(f({"gpu": 0, "vision": {"gpu": True, "cuda_device": 1}}), 0)                    # the helper's
+        self.assertEqual(f({"gpu": [0, 2], "vision": {"gpu": True, "cuda_device": 2}}), 2400)            # a split card
+        self.assertEqual(f({"gpu": 0}), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
