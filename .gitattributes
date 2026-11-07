@@ -14,3 +14,6 @@ tests/data/native_experts/** -text
 
 # the quant yardstick's text set: tokenized byte for byte (set.ids.json), never convert its line endings
 data/quant_quality/** -text
+
+# the drafter importance matrix shipped with the engine (setup-ds41-models.bat): bytes, never converted
+tools/v41/serve/drafter-imatrix.bin binary

@@ -6,7 +6,8 @@ r"""make_release.py - the prebuilt-engine zips for the GitHub Releases page (fir
 Zips build-ds41-portable\, build-ds41-compat-avx\ and build-ds41-compat\ (build-ds41.bat portable / compat-avx /
 compat) - only what the engine needs: its .exe and .dll files and cpu-level.txt, under the folder's name, plus the
 license texts the binaries carry (LICENSE.txt: this project's MIT license; THIRD-PARTY-NOTICES.txt: ggml's MIT license
-and NVIDIA's CUDA runtime DLLs) - and prints each zip's size and SHA-256.  Upload all three to a release; get_engine.py
+and NVIDIA's CUDA runtime DLLs) and the drafter's importance matrix (tools/v41/serve/drafter-imatrix.bin, read by
+setup-ds41-models.bat beside v41_sidecar_requant.exe) - and prints each zip's size and SHA-256.  Upload all three to a release; get_engine.py
 takes them from .../releases/latest/download/."""
 import hashlib
 import os
@@ -14,6 +15,7 @@ import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+IMATRIX = "drafter-imatrix.bin"   # tools/v41/serve/, packed beside the exe (dspark_think_blocks.py imatrix, 11-07)
 NVIDIA_NOTE = ("cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll: NVIDIA CUDA runtime libraries, Copyright NVIDIA\n"
                "Corporation, redistributed unmodified under the NVIDIA CUDA Toolkit End User License Agreement\n"
                "(https://docs.nvidia.com/cuda/eula/).\n")
@@ -49,6 +51,9 @@ def main():
         with zipfile.ZipFile(zpath + ".part", "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
             for f in files:
                 z.write(os.path.join(src, f), f"{folder}/{f}")
+            # the drafter's importance matrix, beside v41_sidecar_requant.exe: setup-ds41-models.bat quantizes the drafter's
+            # experts with it (0.94: +0.6% accepted drafts vs uniform weights at the same size)
+            z.write(os.path.join(ROOT, "tools", "v41", "serve", IMATRIX), f"{folder}/{IMATRIX}")
             z.writestr(f"{folder}/LICENSE.txt", lic)
             z.writestr(f"{folder}/THIRD-PARTY-NOTICES.txt", third)
         os.replace(zpath + ".part", zpath)
@@ -56,7 +61,7 @@ def main():
         with open(zpath, "rb") as f:
             for b in iter(lambda: f.read(1 << 20), b""):
                 h.update(b)
-        print(f"{zpath}: {os.path.getsize(zpath) / 1e6:.0f} MB, {len(files) + 2} files, sha256 {h.hexdigest()}")
+        print(f"{zpath}: {os.path.getsize(zpath) / 1e6:.0f} MB, {len(files) + 3} files, sha256 {h.hexdigest()}")
         made += 1
     return 0 if made else 1
 

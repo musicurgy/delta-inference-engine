@@ -5,10 +5,14 @@ The steps that are not done yet run one after another; each leaves some files an
 its three source shards and the repacked copy, then both are removed).  The peak over that sequence (a download in
 progress counts as far as it got) is compared with the drive's free space.  Exit 0 if it fits, 1 with an explanation if
 not - so the setup stops before a download fills the drive (the Hugging Face downloader only warns).
-DS41_SKIP_SPACE_CHECK=1 skips the check."""
+DS41_SKIP_SPACE_CHECK=1 skips the check.
+
+    setup_space.py --drafter-plan MODEL_FOLDER   prints what the drafter step will do: none / make / upgrade / opt-in
+                                                 (first-start.bat asks; setup-ds41-models.bat follows the same rules)"""
 import glob
 import os
 import shutil
+import subprocess
 import sys
 
 GB = 1e9
@@ -17,6 +21,8 @@ Q2_NAME = "DeepSeek-V4.1-Flash-1017-Q2.gguf"
 Q2 = 365.7 * GB                                 # the ds4 Q2 GGUF: the model and its Engram tables
 MTP_SHARDS, SIDECAR, DRAFTER = 7.9 * GB, 7.9 * GB, 4.2 * GB
 VISION = 0.97 * GB                             # pictures: DeepSeek-V4.1-Flash-1017-Vision.gguf
+# the drafter: 0.94's (experts shrunk with drafter-imatrix.bin, +0.6% drafts accepted), 0.93's (uniform), their source
+IMX_NAME, UNIFORM_NAME, SOURCE_NAME = "V41-1017-MTP-iq2xxs-imx.gguf", "V41-1017-MTP-iq2xxs.gguf", "V41-1017-MTP.gguf"
 VOICE = 1.08 * GB                              # voice: speech\ (Parakeet TDT 0.6B v3 int8, Kokoro-82M v1.0, Silero VAD)
 
 
@@ -32,7 +38,52 @@ def partial(folder):
     return sum(size(p) for p in glob.glob(os.path.join(folder, ".cache", "huggingface", "download", "*.incomplete")))
 
 
+def imatrix_usable():
+    """setup-ds41-models.bat's rule: drafter-imatrix.bin beside the engine build's v41_sidecar_requant.exe (or in
+    tools/v41/serve of a source checkout), and an exe that knows --imatrix (one from before 0.94 answers "unknown arg")"""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.path.insert(0, os.path.join(root, "tools", "v41", "serve"))
+    try:
+        import cpu_level
+        folder = cpu_level.pick_build()[0] or "build-ds41"
+    except Exception:  # noqa: BLE001
+        folder = "build-ds41"
+    req = os.path.join(root, folder, "v41_sidecar_requant.exe")
+    imx = os.path.join(root, folder, "drafter-imatrix.bin")
+    if not os.path.exists(imx):
+        imx = os.path.join(root, "tools", "v41", "serve", "drafter-imatrix.bin")
+    if not os.path.exists(imx):
+        return False
+    if not os.path.exists(req):
+        return True   # no engine yet: first-start fetches the current one, which knows it
+    try:
+        r = subprocess.run([req, "--imatrix", "probe"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "unknown arg" not in (r.stdout + r.stderr)
+
+
+def drafter_plan(m):
+    """none (not used here, 0.94's is there, or 0.93's is there and this engine cannot make the new one) / make (no
+    drafter yet) / upgrade (0.93's is there and 0.94's is made now: from the full-size drafter still on disk, or - asked
+    for with setup-ds41-models.bat drafter-imx / DS41_DRAFTER_IMX=1 - after downloading its 7.9 GB of shards again) /
+    opt-in (0.93's is there and kept: the 7.9 GB download for ~0.3% speed is the user's call)"""
+    if os.environ.get("DS41_NO_DRAFTER") == "1" or os.path.exists(os.path.join(m, IMX_NAME)):
+        return "none"
+    has_uniform = os.path.exists(os.path.join(m, UNIFORM_NAME))
+    if not has_uniform:
+        return "make"
+    if not imatrix_usable():
+        return "none"
+    if os.path.exists(os.path.join(m, SOURCE_NAME)) or os.environ.get("DS41_DRAFTER_IMX") == "1":
+        return "upgrade"
+    return "opt-in"
+
+
 def main():
+    if sys.argv[1:2] == ["--drafter-plan"]:
+        print(drafter_plan(sys.argv[2]))
+        return 0
     m = sys.argv[1]
     os.makedirs(m, exist_ok=True)
     steps = []   # (what, GB more while it runs, GB more once done), in the setup's order
@@ -49,8 +100,8 @@ def main():
     if pick and os.path.exists(pick if os.path.isabs(pick) else os.path.join(m, pick)):
         old = True
     # the drafter first (setup-ds41-models.bat builds it before the main model's download); none under 14 GB of VRAM
-    if os.environ.get("DS41_NO_DRAFTER") != "1" and not os.path.exists(os.path.join(m, "V41-1017-MTP-iq2xxs.gguf")):
-        if os.path.exists(os.path.join(m, "V41-1017-MTP.gguf")):
+    if drafter_plan(m) in ("make", "upgrade"):   # "opt-in": nothing is done unless asked
+        if os.path.exists(os.path.join(m, SOURCE_NAME)):
             steps.append(("drafter", DRAFTER, DRAFTER - SIDECAR))
         else:
             steps.append(("drafter (while it is built)", MTP_SHARDS + SIDECAR, DRAFTER))

@@ -8,7 +8,9 @@
 // verified by the trunk - only the acceptance rate.  So we want the smallest expert format whose acceptance stays
 // close to MXFP4's.  MXFP4 -> F32 (ggml's own dequantizer) -> target (ggml_quantize_chunk), so the emitted blocks
 // are exactly what ggml-cuda's mul_mat_id takes on the MMVQ path (the 5-token draft pass: ne2 = 5 <= the type's
-// get_mmvq_mmid_max_batch on sm_89).  Types that need an imatrix (IQ2_XXS / IQ2_XS) are rejected here.
+// get_mmvq_mmid_max_batch on sm_89).  Types that need an imatrix (IQ2_XXS / IQ2_XS) take --imatrix FILE (the shipped
+// drafter-imatrix.bin: per-expert importance from the drafter's own activations, +0.6% accepted drafts and +1.2% on
+// prose thinking vs uniform weights at the same size, dspark-think 11-07) or, as before, --uniform-imatrix.
 //
 // The source GGUF is loaded through ggml's gguf API (params.ctx != NULL): the whole data blob is read into a ggml
 // context and one proper ggml_tensor per tensor is created there, its ->data pointing into the blob.  The output is
@@ -25,6 +27,8 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <fstream>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,6 +55,12 @@ int main(int argc, char ** argv) {
     // the drafter's acceptance can move (every draft is verified), and the drafter's precision barely moved it so far
     // (iq3_xxs / q2_K / MXFP4 all tied): the smaller type frees VRAM for the trunk's expert cache.
     bool uniform = false;
+    // --imatrix FILE (dspark_think_blocks.py imatrix): per routed-expert tensor, one importance row per expert (the mean
+    // squared input of that expert's matmul, from the drafter's own forward).  Each expert is quantized with its own row;
+    // an expert never picked (all-zero row) gets uniform weights.  Format: int32 n, then n x {int32 len, name, int32
+    // n_expert, int32 row, n_expert x row floats}.
+    std::string imf;
+    int nthreads = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto nx = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
@@ -58,10 +68,12 @@ int main(int argc, char ** argv) {
         else if (a == "--out") out = nx();
         else if (a == "--type") ts = nx();
         else if (a == "--uniform-imatrix") uniform = true;
+        else if (a == "--imatrix") imf = nx();
+        else if (a == "--threads") nthreads = std::atoi(nx().c_str());   // default: every core (keep <= 2 while a timing round runs)
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (in.empty() || out.empty() || ts.empty()) {
-        std::fprintf(stderr, "usage: v41_sidecar_requant --in SRC.gguf --out DST.gguf --type Q3_K\n");
+        std::fprintf(stderr, "usage: v41_sidecar_requant --in SRC.gguf --out DST.gguf --type Q3_K [--imatrix FILE | --uniform-imatrix] [--threads N]\n");
         return 2;
     }
     const ggml_type target = parse_type(ts);
@@ -69,8 +81,26 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "unknown type %s\n", ts.c_str());
         return 2;
     }
+    struct Im { int ne = 0, row = 0; std::vector<float> w; };
+    std::map<std::string, Im> imx;
+    if (!imf.empty()) {
+        std::ifstream fi(imf, std::ios::binary);
+        int32_t n = 0;
+        if (!fi.read((char *) &n, 4)) { std::fprintf(stderr, "cannot read %s\n", imf.c_str()); return 1; }
+        for (int32_t k = 0; k < n; ++k) {
+            int32_t len = 0, ne = 0, row = 0;
+            fi.read((char *) &len, 4);
+            std::string nm((size_t) len, '\0');
+            fi.read(&nm[0], len);
+            fi.read((char *) &ne, 4); fi.read((char *) &row, 4);
+            Im m; m.ne = ne; m.row = row; m.w.resize((size_t) ne * row);
+            if (!fi.read((char *) m.w.data(), (std::streamsize) (m.w.size() * 4))) { std::fprintf(stderr, "%s: truncated at %s\n", imf.c_str(), nm.c_str()); return 1; }
+            imx[nm] = std::move(m);
+        }
+        std::fprintf(stderr, "imatrix %s: %zu tensors\n", imf.c_str(), imx.size());
+    }
     const bool needs_im = ggml_quantize_requires_imatrix(target);
-    if (needs_im && !uniform) {
+    if (needs_im && !uniform && imx.empty()) {
         std::fprintf(stderr, "type %s requires an imatrix - not available (--uniform-imatrix: all-equal weights)\n", ts.c_str());
         return 3;
     }
@@ -111,14 +141,22 @@ int main(int argc, char ** argv) {
         const size_t rs_dst = ggml_row_size(target, nprow);
 
         std::vector<uint8_t> dst(rs_dst * (size_t) nrows);
-        const int64_t chunk = std::max<int64_t>(1, (16 * 1024 * 1024) / (nprow * 4));   // ~64 MB of f32 at a time
+        // with an imatrix: one expert per job (its own importance row); else ~64 MB of f32 at a time
+        const auto imi = imx.find(nm);
+        const Im * im = imi == imx.end() ? nullptr : &imi->second;
+        const int64_t per_e = t->ne[2] > 1 ? t->ne[1] : nrows;   // rows per expert ([row, out, n_expert])
+        if (im && (im->row != nprow || (int64_t) im->ne * per_e != nrows)) {
+            std::fprintf(stderr, "%s: imatrix %d x %d does not match %lld rows of %lld\n", nm, im->ne, im->row, (long long) nrows, (long long) nprow);
+            return 1;
+        }
+        const int64_t chunk = im ? per_e : std::max<int64_t>(1, (16 * 1024 * 1024) / (nprow * 4));
         const ggml_to_float_t src_to_f32 = ggml_get_type_traits(GGML_TYPE_MXFP4)->to_float;
-        const std::vector<float> ones(needs_im ? (size_t) nprow : 0, 1.0f);
+        const std::vector<float> ones(needs_im || !imx.empty() ? (size_t) nprow : 0, 1.0f);
         // the i-quant search is slow (~minutes single-threaded for 3.4 G weights): chunks over the CPU threads
         const int64_t nchunks = (nrows + chunk - 1) / chunk;
         std::atomic<int64_t> next { 0 };
         std::atomic<bool> bad { false };
-        const int nth = std::max(1u, std::thread::hardware_concurrency());
+        const int nth = nthreads > 0 ? nthreads : (int) std::max(1u, std::thread::hardware_concurrency());
         std::vector<std::thread> th;
         for (int w = 0; w < nth; ++w)
             th.emplace_back([&]() {
@@ -126,8 +164,20 @@ int main(int argc, char ** argv) {
                 for (int64_t c; (c = next.fetch_add(1)) < nchunks;) {
                     const int64_t r0 = c * chunk, nr = std::min(chunk, nrows - r0);
                     src_to_f32((const char *) t->data + (size_t) r0 * rs_src, f32.data(), nr * nprow);
-                    const size_t wrote = ggml_quantize_chunk(target, f32.data(), dst.data() + (size_t) r0 * rs_dst, 0, nr, nprow,
-                                                             needs_im ? ones.data() : nullptr);
+                    const float * qw = needs_im || im ? ones.data() : nullptr;
+                    std::vector<float> wrow;
+                    if (im) {   // this job is expert r0 / per_e: its own row, or uniform if it was never picked
+                        const float * w = im->w.data() + (size_t) (r0 / per_e) * (size_t) nprow;
+                        double sum = 0;
+                        for (int64_t c2 = 0; c2 < nprow; ++c2) sum += w[c2];
+                        if (sum > 0) {
+                            wrow.assign(w, w + nprow);
+                            const float eps = (float) (1e-6 * sum / (double) nprow);   // no zero weights
+                            for (float & v : wrow) v += eps;
+                            qw = wrow.data();
+                        }
+                    }
+                    const size_t wrote = ggml_quantize_chunk(target, f32.data(), dst.data() + (size_t) r0 * rs_dst, 0, nr, nprow, qw);
                     if (wrote != (size_t) nr * rs_dst) bad = true;
                 }
             });
