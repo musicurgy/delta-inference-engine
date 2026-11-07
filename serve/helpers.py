@@ -88,21 +88,91 @@ def classify(req: dict) -> str | None:
     return None
 
 
-def quota_events(model: str):
-    """The quota probe's answer as Anthropic stream events (anthropic_collect reads them for a JSON reply): one
-    word, max_tokens reached - what a model asked for one token gives, without the model."""
+def text_events(model: str, text: str, stop: str = "end_turn", input_tokens: int = 1, output_tokens: int = 1):
+    """A finished answer as Anthropic stream events (anthropic_collect reads them for a JSON reply)."""
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": model, "content": [],
-        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}}
+        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}}
     yield "content_block_start", {"type": "content_block_start", "index": 0,
                                   "content_block": {"type": "text", "text": ""}}
     yield "content_block_delta", {"type": "content_block_delta", "index": 0,
-                                  "delta": {"type": "text_delta", "text": "ok"}}
+                                  "delta": {"type": "text_delta", "text": text}}
     yield "content_block_stop", {"type": "content_block_stop", "index": 0}
-    yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": "max_tokens", "stop_sequence": None},
-                            "usage": {"input_tokens": 1, "cache_read_input_tokens": 0, "output_tokens": 1}}
+    yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+                            "usage": {"input_tokens": input_tokens, "cache_read_input_tokens": 0,
+                                      "output_tokens": output_tokens}}
     yield "message_stop", {"type": "message_stop"}
+
+
+def quota_events(model: str):
+    """The quota probe's answer: one word, max_tokens reached - what a model asked for one token gives, without
+    the model."""
+    return text_events(model, "ok", "max_tokens")
+
+
+# ------------------------------------------------------------------------------------------------ the helper lane
+LANE_CLASSES = (TITLE, TOPIC, FILE_PATHS)       # the Bash prefix check decides permissions: the main model's
+
+
+class HelperLane:
+    """0.94 (opt-in): a small local model (serve/embeddings.Sidecar: an OpenAI-compatible server on a second card or
+    the CPU) answers Claude Code's small helper calls, so they neither wait for nor park the main conversation.
+
+        "helper_lane": {"cmd": "llama-server", "args": ["-m", "Qwen3-1.7B-Q8_0.gguf", "--jinja", "-c", "8192",
+                        "-ngl", "99", "--port", "{port}"], "model": "qwen3-1.7b",
+                        "classes": ["title", "topic", "file_paths"]}
+
+    The Bash command-prefix check is not sent there unless listed: Claude Code uses its answer to decide whether a
+    command needs your permission, and a small model gets that wrong more often.  A lane that fails falls back to
+    the main model."""
+
+    def __init__(self, sidecar, classes=None, max_tokens: int = 512):
+        self.sidecar = sidecar
+        classes = list(classes) if classes is not None else list(LANE_CLASSES)
+        bad = [c for c in classes if c not in THINKING_OFF]
+        if bad:
+            raise ValueError(f"helper_lane.classes: {', '.join(map(str, bad))} cannot go to the helper lane "
+                             f"(choose from {', '.join(THINKING_OFF)})")
+        self.classes = set(classes)
+        self.max_tokens = int(max_tokens)
+
+    def takes(self, kind) -> bool:
+        return kind in self.classes
+
+    def chat_request(self, req: dict) -> dict:
+        """An Anthropic helper request -> the sidecar's OpenAI chat request (text only: helpers carry no tools)."""
+        system = req.get("system")
+        system = system if isinstance(system, str) else _text_of(system) if isinstance(system, list) else ""
+        msgs = [{"role": "system", "content": system}] if system else []
+        for m in req.get("messages") or []:
+            c = m.get("content")
+            msgs.append({"role": m.get("role"), "content": c if isinstance(c, str) else _text_of(c)})
+        cap = req.get("max_tokens")
+        cap = min(int(cap), self.max_tokens) if isinstance(cap, int) and cap > 0 else self.max_tokens
+        out = {"model": self.sidecar.model, "messages": msgs, "max_tokens": cap, "stream": False,
+               "chat_template_kwargs": {"enable_thinking": False}}
+        for k in ("temperature", "top_p", "stop"):
+            if req.get(k) is not None:
+                out[k] = req[k]
+        if req.get("stop_sequences"):
+            out["stop"] = req["stop_sequences"]
+        return out
+
+    def answer(self, req: dict) -> tuple[str, str, dict] | None:
+        """(text, Anthropic stop reason, usage) from the lane, or None when it failed (then the main model answers)."""
+        try:
+            status, out = self.sidecar.post("/v1/chat/completions", self.chat_request(req))
+        except RuntimeError as e:
+            print(f"[strata] helper lane: {e}; the main model answers", flush=True)
+            return None
+        if status != 200 or not isinstance(out, dict) or not out.get("choices"):
+            print(f"[strata] helper lane answered {status}; the main model answers", flush=True)
+            return None
+        choice = out["choices"][0]
+        text = (choice.get("message") or {}).get("content") or ""
+        stop = "max_tokens" if choice.get("finish_reason") == "length" else "end_turn"
+        return text, stop, out.get("usage") or {}
 
 
 def apply(kind: str | None, req: dict, kwargs: dict) -> tuple[dict, dict]:

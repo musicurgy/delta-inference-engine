@@ -3269,6 +3269,7 @@ class Service:
         self.main_first = MainFirst()
         self.server_tool_rounds = 8                      # 0.94: server tool rounds (tool search, web) in one answer
         self.sidecars: dict = {}                         # 0.94: "embeddings" / "rerank" (serve/embeddings.py), lazy
+        self.helper_lane = None                          # 0.94 (opt-in): serve/helpers.HelperLane, a small model
         # 0.94: stored and background Responses (in memory, bounded; STRATA_RESPONSES_* limits).  Kept only when a
         # request sends "store": true, unless the config's "responses_store_default": true follows OpenAI's default
         self.response_limits = store_api.limits_from_env()
@@ -6744,13 +6745,24 @@ def make_handler(svc: Service):
                 print(f"[strata] helper call: {helper}", flush=True)
                 if self.record is not None:
                     self.record["helper"] = helper
+            events = None
             if helper == helper_calls.QUOTA:              # answered here: the model is not needed (nor started)
                 events = helper_calls.quota_events(svc.model_for(req))
+            elif svc.helper_lane is not None and svc.helper_lane.takes(helper):
+                got = svc.helper_lane.answer(req)          # 0.94 (opt-in): the small model beside the main one
+                if got is not None:
+                    text, stop, usage = got
+                    print(f"[strata] helper call: {helper} answered by the helper lane", flush=True)
+                    events = helper_calls.text_events(svc.model_for(req), text, stop,
+                                                      int(usage.get("prompt_tokens") or 1),
+                                                      int(usage.get("completion_tokens") or 1))
+            if events is not None:
                 if not req.get("stream"):
                     return self._json(200, anthropic_collect(events))
                 self._sse()
                 for name, e in events:
-                    self.wfile.write(f"event: {name}\n".encode() + b"data: " + json.dumps(e).encode() + b"\n\n")
+                    self.wfile.write(f"event: {name}\n".encode() + b"data: " +
+                                     json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                 self.wfile.flush()
                 return
             svc.load()
@@ -7713,6 +7725,17 @@ def main() -> int:
                 raise SystemExit(f"[strata] config {kind}: {e}")
             side = svc.sidecars[kind]
             print(f"[strata] /v1/{kind}: {side.model} on {side.where()}, started with the first request", flush=True)
+    if cfg.get("helper_lane"):                          # 0.94 (opt-in): Claude Code's titles on a small model
+        lane_cfg = cfg["helper_lane"]
+        try:
+            side = embeddings_api.Sidecar("helper", lane_cfg, gpu_list(cfg) or [0])
+            svc.helper_lane = helper_calls.HelperLane(side, lane_cfg.get("classes"),
+                                                      int(lane_cfg.get("max_tokens", 512)))
+        except (ValueError, TypeError) as e:
+            raise SystemExit(f"[strata] config helper_lane: {e}")
+        svc.sidecars["helper"] = side
+        print(f"[strata] helper lane: {side.model} on {side.where()} answers Claude Code's "
+              f"{', '.join(sorted(svc.helper_lane.classes))} calls (started with the first one)", flush=True)
     embeddings_api.start_idle_stop(svc.sidecars)
     try:                                                # 0.94: serve/websearch.py (off unless configured)
         websearch.configure(cfg.get("web_tools"), public_url=public_url, mcp_hub=hub)

@@ -235,6 +235,38 @@ class Http(unittest.TestCase):
         self.assertLess(b2["usage"]["output_tokens"], 80)   # stopped part-way
         self.assertEqual(b["usage"]["output_tokens"], 5)
 
+    def test_helper_lane(self):
+        import socket
+
+        from serve.embeddings import Sidecar
+        with socket.socket() as so:
+            so.bind(("127.0.0.1", 0))
+            port = so.getsockname()[1]
+        side = Sidecar("helper", {"cmd": sys.executable, "args": [str(ROOT / "serve" / "embeddings_fake_server.py"),
+                                                                  "--port", "{port}"], "port": port, "gpu": "cpu",
+                                  "model": "tiny"})
+        self.addCleanup(side.stop)
+        self.svc.helper_lane = H.HelperLane(side)
+        self.addCleanup(setattr, self.svc, "helper_lane", None)
+        before = self.engine.calls
+        s, b = self.post(TITLE)
+        self.assertEqual(s, 200, b)
+        got = json.loads(b["content"][0]["text"])
+        self.assertEqual(got, {"title": "fix the failing unit", "thinking": False, "system": "system"})
+        self.assertEqual((b["usage"]["input_tokens"], b["usage"]["output_tokens"]), (11, 4))
+        s, text = self.post(dict(TOPIC, stream=True), raw=True)
+        self.assertIn("now look at the READ", text)                 # streamed from the lane as well
+        self.assertEqual(self.engine.calls, before)                  # the main model was not used
+        s, b = self.post(BASH)                                       # permissions: the main model's, by default
+        self.assertEqual(self.engine.calls, before + 1)
+        side.stop()
+        side.cmd = "strata-no-such-program"                          # a lane that fails: the main model answers
+        s, b = self.post(TITLE)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.engine.calls, before + 2)
+        with self.assertRaises(ValueError):
+            H.HelperLane(side, ["suggestion"])
+
 
 if __name__ == "__main__":
     unittest.main()

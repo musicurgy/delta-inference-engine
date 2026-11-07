@@ -851,6 +851,14 @@ print(r.choices[0].message.content)
   most 256 tokens, and gives way to the main conversation: a main request that arrives goes first, and a running
   suggestion is stopped (at its first token if it is still reading its prompt). Any other request is served as
   before. `"claude_code_helpers": false` in `strata-<model>.json` turns all of this off.
+- **A helper lane for those calls (opt-in, 0.94).** A `"helper_lane"` block names a small chat model's server (any
+  OpenAI-compatible one, e.g. `llama-server` with Qwen3-1.7B and `--jinja`), set up like the embeddings server
+  [below](#embeddings-and-rerank-v1embeddings-v1rerank-off-by-default-094) (`cmd`, `args`, `model`, `gpu`,
+  `idle_s`). The session title, the new-topic check and the file-path extraction then go to it, without thinking,
+  and never wait for or interrupt the main conversation. The Bash command-prefix check stays with the main model
+  unless you add it to `"classes"`: Claude Code uses that answer to decide whether a command needs your permission.
+  If the lane fails, the main model answers. Measured with Qwen3-1.7B Q8_0 on the CPU (Core i5-13600K, 4 threads):
+  the first call takes 17 s including the start, a later file-path answer 0.2 s.
 - **Tool search: deferred tools stay out of the prompt (0.94).** Claude Code marks its MCP tools
   `"defer_loading": true` and finds them with a search when it needs one. The server now leaves those tools out of the
   tool list at the top of the prompt (with many MCP servers that is 10-50K tokens less on every new session) and

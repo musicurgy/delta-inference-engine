@@ -164,6 +164,8 @@ compact your conversation early.
   ```
 
   Without the last `set`, Claude Code assumes 200K tokens and compacts there.
+  Claude Code's WebSearch works once you give the server a search service (`"web_tools"`, off by default; see
+  [docs/DETAILS.md](docs/DETAILS.md#web-search-and-web-fetch-off-by-default-094)).
 - **OpenCode**, in `opencode.jsonc` (in your project, or `~/.config/opencode/`):
 
   ```jsonc
