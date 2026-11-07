@@ -212,7 +212,7 @@ class LauncherVoiceSection(unittest.TestCase):
         self.put(self.L.VOICE_TTS, "model.onnx")
         two = [{"index": 0, "name": "RTX 3090", "mib": 24576}, {"index": 1, "name": "RTX 3060", "mib": 12288}]
         cfg, _ = self.section("gpu", gpus=two, cuda=True)
-        self.assertEqual(cfg["tts"]["env"], {"CUDA_VISIBLE_DEVICES": "1"})      # read-aloud on the second card
+        self.assertEqual(cfg["tts"]["env"], {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "1"})  # read-aloud on the second card
         self.assertIn("cuda", cfg["tts"]["args"])
         self.assertIn("cpu", cfg["asr"]["args"])                               # dictation stays on the CPU
         self.assertNotIn("env", cfg["asr"])

@@ -255,9 +255,11 @@ def pc_health():
 
 
 def list_gpus() -> list:
-    """[{index, name, mib}] from nvidia-smi, in PCI bus order; [] without it"""
+    """[{index, name, mib, display, cc, lanes}] from nvidia-smi, in PCI bus order (cc: compute capability as 8.6, lanes:
+    the PCIe link's current width; None when not read); [] without it"""
     try:
-        o = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,display_active", "--format=csv,noheader,nounits"],
+        o = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,pcie.link.width.current,display_active",
+                            "--format=csv,noheader,nounits"],
                            capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
         return []
@@ -265,18 +267,28 @@ def list_gpus() -> list:
     for line in o.splitlines():
         a = [x.strip() for x in line.split(",")]
         if len(a) >= 3 and a[0].isdigit() and a[2].isdigit():
-            out.append({"index": int(a[0]), "name": a[1], "mib": int(a[2]), "display": a[-1].lower() == "enabled"})
+            cc = lanes = None
+            if len(a) >= 6:
+                try:
+                    cc = float(a[3])
+                except ValueError:
+                    pass
+                lanes = int(a[4]) if a[4].isdigit() else None
+            out.append({"index": int(a[0]), "name": a[1], "mib": int(a[2]), "display": a[-1].lower() == "enabled",
+                        "cc": cc, "lanes": lanes})
     return out
 
 
 def helper_gpu(gpus, engine_gpu=None):
-    """the second card for the helper: the largest one that is not the engine's, 8 GB or more, a card without a display
-    before one with; None if there is none"""
+    """the second card for the helper: the largest one that is not the engine's, 8 GB or more, RTX 20 or newer (compute
+    7.5: the CUDA 13 builds - the engine zips, PyTorch cu130 for pictures - have no code for older cards), a card without
+    a display before one with, then the wider PCIe link (two 3060s here: x1 and x4; Windows reports display_active
+    Disabled for the card driving the screen too, so the link is what tells them apart); None if there is none"""
     if engine_gpu is None:
         g = os.environ.get("DS41_GPU", "").strip()
         engine_gpu = int(g) if g.isdigit() else (max(gpus, key=lambda x: x["mib"])["index"] if gpus else 0)
-    rest = [x for x in gpus if x["index"] != engine_gpu and x["mib"] >= 7800]
-    return max(rest, key=lambda x: (x["mib"], not x.get("display"))) if rest else None
+    rest = [x for x in gpus if x["index"] != engine_gpu and x["mib"] >= 7800 and (x.get("cc") or 7.5) >= 7.5]
+    return max(rest, key=lambda x: (x["mib"], not x.get("display"), x.get("lanes") or 0)) if rest else None
 
 
 def apply(req: dict) -> dict:
@@ -295,7 +307,7 @@ def apply(req: dict) -> dict:
     if mode is not None and mode not in MODES:
         raise ValueError("mode must be fast, balanced or exact")
     if req.get("multi_gpu") and not cat["helper_gpu"]:
-        raise ValueError("no second NVIDIA card with 8 GB or more was found")
+        raise ValueError("no second NVIDIA card (RTX 20 or newer, 8 GB or more) was found")
     if "auto_pause_mib" in req and req["auto_pause_mib"] not in AUTO_PAUSE_CHOICES:
         raise ValueError(f"auto_pause_mib must be one of {', '.join(map(str, AUTO_PAUSE_CHOICES))}")
     if model is not None:

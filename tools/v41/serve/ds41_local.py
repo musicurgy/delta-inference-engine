@@ -300,8 +300,11 @@ def expand(cfg):
         else:
             a += ["--vram-margin", f"{margin:g}"]
     vision = vision_section(m, out.get("gpu"))
-    # the chat page's multi-GPU switch: the helper on the second card (serve_ds41.py starts it beside the engine)
-    plan = share_card(helper_plan(out, a), vision)
+    # the chat page's multi-GPU switch: the helper on the second card (serve_ds41.py starts it beside the engine), with
+    # room left for the picture encoder and read-aloud when they share its card
+    plan = helper_plan(out, a)
+    voice = voice_section(m, out.get("gpu"), bool(plan))
+    plan = share_card(plan, vision, voice)
     hf =os.path.join(os.path.dirname(os.path.abspath(__file__)), "local", "helper.json")
     if plan:
         os.makedirs(os.path.dirname(hf), exist_ok=True)
@@ -315,16 +318,22 @@ def expand(cfg):
         out["vision"] = vision
         if "--vision" not in a:   # here, not by the server: it would add --vram-reserve-mib, which this engine refuses
             a.append("--vision")
-    voice = voice_section(m, out.get("gpu"), bool(plan))
     if voice:
         out["voice"] = voice
     return out
 
 
-def share_card(plan, vision):
-    """The helper's plan with VISION_GPU_GIB fewer experts when the picture encoder runs on its card (else unchanged)."""
-    if plan and vision and vision.get("cuda_device") == plan["gpu"]:
-        plan = {**plan, "gib": plan["gib"] - VISION_GPU_GIB, "args": list(plan["args"])}
+def share_card(plan, vision, voice=None):
+    """The helper's plan with VISION_GPU_GIB fewer experts when the picture encoder runs on its card, VOICE_GPU_GIB fewer
+    when read-aloud does (else unchanged)."""
+    if not plan:
+        return plan
+    less = VISION_GPU_GIB if vision and vision.get("cuda_device") == plan["gpu"] else 0
+    tts_env = ((voice or {}).get("tts") or {}).get("env") or {}
+    if tts_env.get("CUDA_VISIBLE_DEVICES") == str(plan["gpu"]):
+        less += VOICE_GPU_GIB
+    if less:
+        plan = {**plan, "gib": plan["gib"] - less, "args": list(plan["args"])}
         plan["args"][plan["args"].index("--gib") + 1] = f"{plan['gib']:g}"
     return plan
 
@@ -357,6 +366,9 @@ VISION_OFF = ("off", "0", "no", "none", "false", "disable", "disabled")
 # what the encoder holds on a card: 1.4 GiB after its warm-up (bf16, a 1,001-token picture) + the CUDA context, 1.5 GiB
 # measured on an RTX 3060 (11-07); the multi-GPU helper keeps this much fewer experts when they share its card
 VISION_GPU_GIB = 2.0
+# read-aloud (Kokoro, onnxruntime CUDA) on the helper's card: "about 1.5 GB" (voice_section's note); without this the
+# helper's 2.5 GiB of headroom was all that was left for it
+VOICE_GPU_GIB = 1.5
 
 
 def vision_choice():
@@ -531,7 +543,8 @@ def voice_section(m, engine_gpu=None, helper_on=False):
             print("ds41_local: voice on a second card needs sherpa-onnx's CUDA build (Enable Voice.bat gpu) - "
                   "voice on the CPU")
         else:
-            env, device = {"CUDA_VISIBLE_DEVICES": str(gpu)}, "cuda"
+            # nvidia-smi's numbering, as the helper and the picture encoder use (not CUDA's fastest-first)
+            env, device = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": str(gpu)}, "cuda"
             if helper_on:
                 print(f"ds41_local: voice shares GPU {gpu} with the multi-GPU helper (about 1.5 GB of it)")
     py = sys.executable.replace("\\", "/")
