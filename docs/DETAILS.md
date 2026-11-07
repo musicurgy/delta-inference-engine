@@ -879,6 +879,7 @@ print(r.choices[0].message.content)
   in the list is not measured yet.
 - **Loop guard (0.94, on by default).** When an agent makes the same tool call (same name and arguments) 4 times in a row, the server adds one short note before the model's next turn telling it to try something else or stop, and logs `loop guard: <tool> repeated N times`; `"loop_guard": {"repeats": N}` or `false` in `strata-<model>.json` (other requests are rendered exactly as before).
 - **Streamed tool calls in the strict shape (0.94).** On `/v1/chat/completions` a call's first delta carries its id, type and function name and the later ones only `arguments`; no field is ever `null` and no `tool_calls` array is empty (OpenCode reportedly fails on both).
+- **Effort changes are logged (0.94).** DeepSeek V4.1's template puts `Reasoning Effort: N` at the start of the prompt, so changing the effort, or turning thinking on or off, inside a conversation reads it all again; the server logs `effort changed (high -> max): the whole conversation is read again` when that happens (nothing else changes).
 - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out (on `/v1/messages` a `ping` event at least every

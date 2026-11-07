@@ -3244,6 +3244,28 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+# C11 / R4: DeepSeek V4.1's template puts the effort at the very start ("Reasoning Effort: 75 (range 1-100, ...)\n\n"
+# in the first system turn; none with thinking off), so a request that only changes the effort or turns thinking on
+# or off reads its whole conversation again.  Service.effort_check logs it; nothing else changes.
+EFFORT_HEADER = re.compile(r"Reasoning Effort: ([0-9]+|[A-Za-z]+)[^\n]*\n*")
+EFFORT_HEADER_WITHIN = 512     # the header is looked for in the prompt's first this many characters only
+EFFORT_NAMES = {50: "low", 62: "medium", 75: "high", 100: "max"}    # serve_ds41.py's levels
+EFFORT_MATCH_CHARS = 1024      # two prompts are the same conversation when this much of their start matches
+EFFORT_KEEP = 8                # the last requests' starts kept to compare with (helper calls come in between)
+
+
+def effort_header(prompt: str) -> tuple[str, str, int]:
+    """A rendered prompt -> (its effort: "high", "max", a number, or "off" without the header; the start of the prompt
+    without the header, EFFORT_MATCH_CHARS long at most; the length of the prompt without it)."""
+    m = EFFORT_HEADER.search(prompt, 0, EFFORT_HEADER_WITHIN)
+    if m is None:
+        return "off", prompt[:EFFORT_MATCH_CHARS], len(prompt)
+    v = m.group(1)
+    label = (EFFORT_NAMES.get(int(v)) or str(int(v))) if v.isdigit() else v.lower()
+    a, b = m.span()
+    return label, (prompt[:a] + prompt[b:b + EFFORT_MATCH_CHARS])[:EFFORT_MATCH_CHARS], len(prompt) - (b - a)
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -3343,6 +3365,9 @@ class Service:
         # 0.94 (serve/loop_guard.py): the same tool call this many times in a row gets a note before the next turn
         # (the config's "loop_guard"; 0: off)
         self.loop_guard_repeats = loop_guard.REPEATS
+        self.effort_seen = collections.deque(maxlen=EFFORT_KEEP)   # C11: (effort, start, length) of recent prompts
+        self.effort_lock = threading.Lock()
+        self.rendered = threading.local()               # the prompt text encode_prompt rendered last (this thread)
         self.note_role = None                             # the loop guard note's role (_loop_note_role)
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -4101,6 +4126,7 @@ class Service:
         tools = server_tools_api.shown(tools)          # 0.94: deferred tools (defer_loading) are not in the list
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
+        self.rendered.text = prompt                     # C11: for prepare's effort_check
         if not changed:
             return self.tok.encode(prompt, parse_special=True)
         prompt, plain = unmark_think_literals(prompt, self.literals)
@@ -4180,7 +4206,11 @@ class Service:
         # between pictures and raise ClientGone
         messages = self._loop_guard(messages)
         fetched = self._note_unreadable_tool_images(messages, cancel)
+        self.rendered.text = None
         ids = self.encode_prompt(messages, tools, kwargs)
+        if self.rendered.text is not None:
+            self.effort_check(self.rendered.text)       # C11: a log line only
+            self.rendered.text = None
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
@@ -4327,6 +4357,25 @@ class Service:
                   f"(common start {n})", flush=True)
             return {}
         return {"tokens": n}
+
+    def effort_check(self, prompt: str) -> str | None:
+        """C11 / R4 (log only): when the effort header (effort_header) of this prompt differs from the one of the latest
+        recent request whose prompt starts the same without it - the same conversation, its effort or thinking
+        switched - say that the whole conversation is read again.  -> the line, or None."""
+        label, head, length = effort_header(prompt)
+        with self.effort_lock:
+            prev = None
+            for e in reversed(self.effort_seen):
+                k = min(EFFORT_MATCH_CHARS, e[2] // 2, length // 2)
+                if k > 0 and e[1][:k] == head[:k]:
+                    prev = e
+                    break
+            self.effort_seen.append((label, head, length))
+        if prev is None or prev[0] == label:
+            return None
+        line = f"[strata] effort changed ({prev[0]} -> {label}): the whole conversation is read again"
+        print(line, flush=True)
+        return line
 
     def _loop_guard(self, messages):
         """0.94 (serve/loop_guard.py, BACKLOG #69): a request that answers the results of a tool call the model has made
