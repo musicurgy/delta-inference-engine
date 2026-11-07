@@ -461,7 +461,18 @@ def make_handler(kind: str, model, log, token: str = ""):
             else:
                 return False
             if post:
-                self.close_connection = True             # the body is not read
+                self.close_connection = True
+                # read a small body before answering: closing a Windows socket with unread data sends a reset, and the
+                # caller then sees "connection aborted" instead of this 403.  A large one is left unread (no work for it)
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    n = 0
+                if 0 < n <= 1 << 20:
+                    try:
+                        self.rfile.read(n)
+                    except OSError:
+                        pass
             self.error(403, why, "permission_error")
             return True
 
