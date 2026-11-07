@@ -418,8 +418,10 @@ WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
 # and markers can differ within one call.  As text those calls reached clients as the answer, which ends an agent's run.
 # Every tag goes through here first and comes out in the one spelling the rest of this file reads.  Without the real
 # token a tag opens a call only inside a calls block, for a declared tool, or at the start of a line outside code, so
-# `< invoke name="rm">` in prose stays text; `<invoke>` (no marker) is never a tag.
-_M = r"(?P<tok>｜DSML｜\s*)?(?(tok)|(?:[\\＼｜]DSML[\\＼｜]\s*|[\\＼]\s*|\s+))"
+# `< invoke name="rm">` in prose stays text; `<invoke>` (no marker) is never a tag.  A stray short word in the marker's
+# place - `<name invoke name="read_file">`, the UD-IQ2_XXS default's first tag in round 359's agent trace (greedy, bias
+# 0.28) - is a tag only between a calls block's other tags (the calls / invoke states), never in prose or in a value.
+_M = r"(?P<tok>｜DSML｜\s*)?(?(tok)|(?:[\\＼｜]DSML[\\＼｜]\s*|[\\＼]\s*|(?P<stray>[A-Za-z_]{1,12})?\s+))"
 _ANY_TAG = re.compile(rf'<(?P<end>/?){_M}(?:(?:tool_|function_)?(?P<calls>calls)|(?P<word>invoke|parameter)'
                       r'(?:\s+name\s*=\s*"(?P<name>[^"]*)")?(?:\s+string\s*=\s*"(?P<s>true|false)")?)\s*>')
 _TAG_HEAD = re.compile(r"^</?(?:｜(?:D(?:S(?:M(?:L(?:｜)?)?)?)?)?|[\\＼](?:D(?:S(?:M(?:L(?:[\\＼｜])?)?)?)?)?)?$")   # "<", "<｜DS", "</＼DSM"
@@ -428,14 +430,14 @@ _TAG_WORDS = ("calls", "tool_calls", "function_calls", "invoke", "parameter")
 _TAG_MAX = 600                  # a longer `<...` is text, not held any further
 
 
-def _maybe_tag(s: str) -> bool:
-    """`s` starts with '<' and has no '>' yet: it may still become a tag."""
+def _maybe_tag(s: str, inside: bool = False) -> bool:
+    """`s` starts with '<' and has no '>' yet: it may still become a tag (`inside`: between a calls block's tags)."""
     if len(s) > _TAG_MAX:
         return False
-    if _TAG_HEAD.match(s):
+    if _TAG_HEAD.match(s) or (inside and re.fullmatch(r"</?[A-Za-z_]{1,12}", s)):
         return True
     m = _TAG_REST.match(s)
-    if m is None:
+    if m is None or (m["stray"] and not inside):
         return False
     rest = m.group("rest")
     if any(w.startswith(rest) for w in _TAG_WORDS):
@@ -463,6 +465,8 @@ def _param_is_string(self, tool: str, name: str) -> str:
 def _tag(self, m, out: list) -> bool:
     """The tag `m` at this state -> its one spelling in `out`, True; False when here it is not a tag."""
     word, end, st = "calls" if m["calls"] else m["word"], bool(m["end"]), self.tag_state
+    if m["stray"] and st not in ("calls", "invoke"):
+        return False
     if st == "param":
         if word == "parameter" and end:
             out.append(P_CLOSE); self.tag_state = "invoke"
@@ -513,7 +517,7 @@ def _spell_tags(self, delta: str, final: bool) -> str:
         if lt:
             _tag_text(self, buf[:lt], out); buf = buf[lt:]
         gt = buf.find(">")
-        if gt < 0 and _maybe_tag(buf):
+        if gt < 0 and _maybe_tag(buf, self.tag_state in ("calls", "invoke")):
             if final:
                 _tag_text(self, buf, out); buf = ""
             break
