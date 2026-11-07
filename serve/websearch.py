@@ -357,16 +357,13 @@ def fetch(url, allowed=None, blocked=None, seen: str = "") -> dict:
     elif ctype.startswith("text/") or ctype in ("application/json", "application/xml", "application/x-yaml", ""):
         title, text = "", body.decode(charset, "replace")
     elif ctype == "application/pdf":
-        try:
-            import io
-
-            import pypdf  # optional
-            text = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(io.BytesIO(body)).pages)
-            title = ""
-        except ImportError:
-            raise WebError("unsupported_content_type", "PDF pages need the optional pypdf package") from None
-        except Exception as e:  # noqa: BLE001
-            raise WebError("unsupported_content_type", f"the PDF could not be read: {e}") from None
+        # 0.94: read like any other document - in serve/documents.py's reader process, with its time and memory
+        # limits - never parsed in the server (a hostile PDF could hang or crash it there)
+        name = urllib.parse.urlsplit(final or url).path.rsplit("/", 1)[-1][:100] or "page.pdf"
+        doc = documents.extract(body, name, "application/pdf")
+        if doc.error:
+            raise WebError("unsupported_content_type", f"the PDF could not be read: {doc.error}")
+        title, text = "", doc.text + (f"\n\n[{doc.note}]" if doc.note else "")
     else:
         raise WebError("unsupported_content_type", ctype)
     cap = int(CONFIG["fetch_max_chars"])

@@ -5,6 +5,7 @@ mock web site on 127.0.0.1 and the mock engine: no real search is sent, no GPU.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 import threading
@@ -55,6 +56,9 @@ class Site(BaseHTTPRequestHandler):
             return
         elif u.path == "/private":
             body, ctype = b"secret", "text/plain"
+        elif u.path == "/doc.pdf":
+            from serve.test_documents import make_pdf
+            body, ctype = make_pdf(["Hello PDF world"]), "application/pdf"
         else:
             self.send_response(404)
             self.end_headers()
@@ -187,6 +191,17 @@ class Functions(Base):
                 with self.assertRaises(W.WebError) as e:
                     W.fetch(target, seen=seen)
                 self.assertEqual(e.exception.code, code)
+
+    @unittest.skipUnless(importlib.util.find_spec("pypdfium2"), "pypdfium2 is not installed")
+    def test_a_pdf_is_read_in_the_reader_process(self):
+        # 0.94: not pypdf in the server (it is blocked here), but documents.extract's time-limited child
+        url = self.root + "/doc.pdf"
+        with mock.patch.dict(sys.modules, {"pypdf": None}), mock.patch("builtins.print"), \
+                mock.patch.object(W.documents, "extract", wraps=W.documents.extract) as extract:
+            page = W.fetch(url, seen=url)
+        extract.assert_called_once()
+        self.assertEqual(extract.call_args.args[1:], ("doc.pdf", "application/pdf"))
+        self.assertIn("Hello PDF world", page["text"])
 
     def test_fetch_refuses_this_pc_with_the_real_check(self):
         W.configure({"fetch": True}, public_url=public_url)
