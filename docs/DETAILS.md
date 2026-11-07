@@ -695,7 +695,10 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
 | OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
-| Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
+| Model list / health | `GET /v1/models`, `GET /models`, `GET /health` (`HEAD /api/hello` answers 200: Claude Code's warm-up probe) |
+| Count a request's prompt tokens (the model does not run) | `POST /v1/messages/count_tokens` (Anthropic), `POST /v1/responses/input_tokens` (OpenAI Responses) |
+| llama.cpp's text tools: text to tokens and back, a chat request to its prompt text | `POST /tokenize`, `POST /detokenize`, `POST /apply-template` |
+| A Codex model catalog ([below](#the-responses-api-and-codex-cli)) | `GET /v1/codex/models.json` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (busy or idle, with `n_prompt_tokens`; one entry per slot with `--batch`) |
 | Save / restore the conversation to a file (session files, below) | `POST /slots/0?action=save\|restore` |
@@ -728,7 +731,11 @@ token, time between tokens and request duration (p50 / p95), the prompt cache an
 own panels (state, batch slots, rates, expert cache hit rate, GPU and RAM). Its first row uses only vLLM's names, so
 it also reads a vLLM server.
 
-`/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `/slots` uses llama.cpp's names: `n_ctx` and `n_prompt_tokens` (the running request's prompt size, kept after it ends: what a front-end's context meter divides by `n_ctx`). `total_slots` in `/props` is the number of `--batch` slots (1 without). `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
+`/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. Each entry also
+carries the names other tools read: the context as `context_length`, `max_context_length`, `max_model_len`,
+`context_window` and `max_input_tokens` (`max_output_tokens` is the same number: an answer may use what its prompt
+leaves), Anthropic's `type`, `display_name` and `created_at`, and `capabilities` (tools, structured output, vision, ...);
+the list has Anthropic's `has_more`, `first_id` and `last_id`. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `/slots` uses llama.cpp's names: `n_ctx` and `n_prompt_tokens` (the running request's prompt size, kept after it ends: what a front-end's context meter divides by `n_ctx`). `total_slots` in `/props` is the number of `--batch` slots (1 without). `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
 
 `chat_template_caps` uses llama.cpp's field names. Strata checks them when loading the active template by rendering
 small requests; a rejected or omitted feature is `false`, and a template that fails a probe in any way only turns that
@@ -843,9 +850,22 @@ print(r.choices[0].message.content)
   helper calls (a session title in a few dozen tokens) need; its real turns ask for thinking when it is on there.
 - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
-  long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
+  long prompt the stream sends keep-alives, so agents do not time out (on `/v1/messages` a `ping` event at least every
+  15 s, as Anthropic's API sends; SSE comments in between and on the other APIs); the server window prints progress every
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
   connection or pressing stop in your app really stops the model, so the next request starts at once.
+- **Tools the provider runs (Anthropic server tools).** `web_search_*`, `web_fetch_*`, `code_execution_*` and
+  `tool_search_tool_*` tools on `/v1/messages` are run by Anthropic's servers, not by the client. This server cannot run
+  them yet, so they are left out of the prompt (one line in the server window per kind) instead of being offered to the
+  model as tools nobody can run. Client tools (your own, and Anthropic's `bash`, `text_editor`, `memory`, ...) stay.
+- **One tool call per turn.** `"parallel_tool_calls": false` (chat completions, Responses) or Anthropic's
+  `tool_choice.disable_parallel_tool_use: true` ends the answer at its first complete tool call.
+- **`strict` tools.** A tool marked `"strict": true` has its call's arguments checked against its schema (with the
+  `jsonschema` package installed, as for the [JSON response formats](#json-response-formats)). A call that does not
+  match ends the request with a 502 `structured_output_failed` error (an error event once a stream has started) instead
+  of reaching the client as a good call. Without `strict`, or without the package, calls go out as before.
+- **Errors on `/v1/messages`** use Anthropic's form: `{"type": "error", "error": {"type": "invalid_request_error",
+  "message": ...}}` (the server's own kind, such as `model_busy`, is in `error.code`).
 - **Tool calls in other forms (opt-in).** `"tool_call_recovery": true` in `strata-<model>.json` reads a call of a
   tool the request declared also when the model writes it as `<parameter=NAME>` instead of `<function=NAME>`, as JSON
   (`{"name": ..., "arguments": ...}`) inside `<tool_call>`, as a `<function=NAME>` block at the start of a line
@@ -1295,9 +1315,10 @@ are refused with an error that says so.
 | --- | --- |
 | `input` as a string, or as items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)` |
 | `instructions` | The system message (with leading `developer` messages; later ones become user messages, as on the chat path) |
-| `tools` | `function` tools, `namespace` tools (the model sees `namespace.name`; calls come back with `namespace` and `name`), `custom` tools (one free-form `input` string). Hosted tools (`web_search`, `file_search`, ...) are left out: the model cannot run them |
-| `tool_choice` | `"none"` hides the tools; anything else lets the model choose (it cannot be forced) |
-| `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the config's `reasoning_effort` (0.1.44.1; 0.1.44 ignored it here), else the model's default (high) |
+| `tools` | `function` tools, `namespace` tools (the model sees `namespace.name`; calls come back with `namespace` and `name`), `custom` tools (one free-form `input` string). Hosted tools (`web_search`, `file_search`, ...) are left out: the model cannot run them. `"strict": true` function tools are checked (above) |
+| `tool_choice` | `"none"` hides the tools; `"auto"` lets the model choose; `"required"` and `{"type": "function", "name": ...}` (also `allowed_tools` with `mode: "required"`) make it call a tool, as on the chat path |
+| `parallel_tool_calls` | `false`: the answer ends at its first complete call |
+| `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh` (and `max` where the model has it: DeepSeek V4.1); without it the config's `reasoning_effort` (0.1.44.1; 0.1.44 ignored it here), else the model's default (high) |
 | `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`) |
 | `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
 | `thread_source` `thread_title` in `client_metadata["x-codex-turn-metadata"]` | Codex's thread-title request (opt-in: `"codex_thread_titles": true` in `strata-<model>.json`, off by default), sent beside each user turn from another session with `tools: []`: answered without the engine as `{"title": "<the user's line, cut to 36 characters>"}`, so the conversation keeps the prompt cache. The title is the user's line, not one the model wrote |
@@ -1340,6 +1361,15 @@ name; that is expected. Measured with Codex CLI 0.160.0 and Q2_0 on an RTX 5070:
 tool descriptions) was 9,443 tokens, read in 10 s; in a tool loop, each later turn reused about 96% of the prompt from
 the cache and read only the new part in 1-2 s. On Windows, Codex's sandbox rejected every shell command in that test
 until it was started with `-c 'windows.sandbox="unelevated"'` (a Codex setting, not Strata's).
+
+**Codex model catalog (optional).** `GET /v1/codex/models.json` answers a catalog in the shape Codex's
+`model_catalog_json` reads (and DeepSeek's Codex guide ships): the model's name, its context window, its reasoning
+levels, the freeform `apply_patch` tool and parallel tool calls. Save it (`curl http://127.0.0.1:8080/v1/codex/models.json
+-o ~/.codex/models.json`), set `model_catalog_json = "~/.codex/models.json"` and use the model's name as `model`.
+Codex wants its base instructions inside a catalog entry (`base_instructions`): point
+`"codex_base_instructions_file"` in `strata-<model>.json` at a text file with them (for example the instructions
+from the `models.json` Codex or DeepSeek ship), or paste them into the saved file. An empty `base_instructions` gives
+Codex no system prompt, so do not use the catalog without them.
 
 **Codex's compaction (opt-in: `"codex_compaction_cache": true` in `strata-<model>.json`).** When the context fills up (or
 on `/compact`), Codex sends the conversation once more with a request to summarize it, and with `tools: []`. The template
@@ -1981,7 +2011,8 @@ times out, the server keeps ownership and reports an error rather than claiming 
 
 ### JSON response formats
 
-`POST /v1/chat/completions` accepts `response_format: {"type":"json_object"}` or
+`POST /v1/chat/completions` (and `/v1/responses` as `text.format`, and `/v1/messages` as Anthropic's
+`output_config.format: {"type": "json_schema", "schema": {...}}`) accepts `response_format: {"type":"json_object"}` or
 `{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}`.
 The schema must accept only JSON objects at its root: `"type":"object"`, or an `anyOf`/`oneOf` whose branches are all
 object schemas (an `allOf` with an object member, or a local `$ref` to one, also counts), as apps written for
@@ -1994,8 +2025,14 @@ server says so once.
 This is **schema prompting followed by server validation**, not grammar-constrained decoding. One generation
 is made per request, with no hidden retry. Successful responses contain a validated JSON object. Malformed JSON,
 duplicate keys, non-finite numbers, schema violations and incomplete generations return **502** with
-`error.code: structured_output_failed`; invalid request schemas return **400**. JSON formats combined with
-tools/MCP are refused explicitly. Without `response_format`, ordinary text and tool behavior stays the same.
+`error.code: structured_output_failed`; invalid request schemas return **400**. With tools the format is for the
+final answer: a turn that calls a tool comes back as a tool call, unchecked, and the JSON is what the model writes once
+it is done with the tools. JSON formats with the web page's MCP tools are refused. Without `response_format`,
+ordinary text and tool behavior stays the same.
+
+The format's instruction (the schema, in words) goes at the end of the last user turn, so a conversation whose turns
+switch between a format and none keeps its prompt cache up to there. Through 0.93 it went into the first system
+message; `"format_instruction": "start"` in `strata-<model>.json` puts it back there.
 
 Structured SSE buffers the answer while sending keep-alive comments. It emits content only after validation,
 then usage/timings and `[DONE]`; failures emit an SSE error and `[DONE]` without invalid content deltas.

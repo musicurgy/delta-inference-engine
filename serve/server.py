@@ -216,6 +216,7 @@ LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 ANTHROPIC_PING_S = 15.0     # C8: a quiet /v1/messages stream turns its next keep-alive into a ping event after this
+COUNT_CACHE_MAX = 32        # R8: token counts kept (count_tokens, /v1/responses/input_tokens)
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
@@ -3270,6 +3271,7 @@ class Service:
         self.format_instruction = "end"                   # C4: where a JSON format's instruction goes (structured.py)
         self.count_cache = collections.OrderedDict()      # R8: request body hash -> token count (count_tokens)
         self.count_cache_lock = threading.Lock()
+        self.codex_base_instructions_file = None          # the Codex catalog's base instructions (a text file)
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -3973,7 +3975,9 @@ class Service:
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True},
+                                  "constrained_decoding": False, "stream_buffered": True,
+                                  # C4: a format with tools is for the final answer; strict tools' calls are checked
+                                  "with_tools": True, "strict_tools": True, "instruction": self.format_instruction},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -5249,6 +5253,81 @@ def anthropic_error(code: int, obj):
     return {**{k: v for k, v in obj.items() if k != "error"}, "type": "error", "error": err}
 
 
+# ------------------------------------------------------------------------------------------------ model metadata
+STARTED_AT = int(time.time())       # /v1/models' "created": when this server started
+
+
+def model_fields(svc) -> dict:
+    """The fields agents read from a /v1/models entry beside OpenAI's id/object: Anthropic's (type, display_name,
+    created_at), the context under the names the OpenAI ecosystem uses (context_length: OpenRouter / LM Studio,
+    max_model_len: vLLM, context_window / max_input_tokens / max_output_tokens: LiteLLM and agents) and what the
+    model can do.  max_output_tokens is the context: a request's answer may use whatever its prompt leaves."""
+    ctx, started = svc.reported_ctx(), int(getattr(svc, "started_at", None) or STARTED_AT)
+    return {"created": started, "owned_by": "strata", "type": "model",
+            "display_name": getattr(svc, "display_name", None) or svc.model,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+            "context_length": ctx, "max_context_length": ctx, "max_model_len": ctx, "context_window": ctx,
+            "max_input_tokens": ctx, "max_output_tokens": ctx,
+            "capabilities": {"chat": True, "streaming": True, "tools": True, "tool_choice": True,
+                             "parallel_tool_calls": True, "reasoning": True, "structured_output": True,
+                             "vision": svc.vision is not None, "embeddings": False}}
+
+
+def effort_levels() -> list[str]:
+    """The reasoning levels a request can name that differ from each other (frontend.effort_kwargs, which a model
+    adapter replaces with its own): low / medium / high, and max where it is more than high (DeepSeek V4.1)."""
+    import serve.frontend as fe
+    levels, seen = [], []
+    for name in ("low", "medium", "high", "max"):
+        try:
+            kw = fe.effort_kwargs(name)
+        except ValueError:
+            continue
+        if kw not in seen:
+            seen.append(kw)
+            levels.append(name)
+    return levels
+
+
+CODEX_LEVEL_TEXT = {"low": "Fast responses with lighter reasoning", "medium": "Balanced reasoning",
+                    "high": "Thorough reasoning (the model's default)", "max": "The most reasoning the model does"}
+
+
+def codex_catalog(svc) -> dict:
+    """A Codex model catalog ({"models": [ModelInfo]}, Codex's `model_catalog_json`), in the shape DeepSeek's Codex
+    guide ships: the context window Codex should plan with, the reasoning levels, the freeform apply_patch tool,
+    shell_command and parallel calls.  Codex needs base instructions for a catalog model: the config's
+    "codex_base_instructions_file" (a text file) gives them, else the entry has none (DETAILS.md says what to do)."""
+    ctx = svc.reported_ctx()
+    levels = effort_levels()
+    default = svc.effort_default()
+    default = default if default in levels else "high" if "high" in levels else (levels[-1] if levels else None)
+    base = ""
+    path = getattr(svc, "codex_base_instructions_file", None)
+    if path:
+        try:
+            base = Path(path).read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"[strata] codex_base_instructions_file: {e}", flush=True)
+    entries = []
+    for slug in [svc.model, *svc.aliases]:
+        entries.append({
+            "slug": slug, "display_name": getattr(svc, "display_name", None) or slug,
+            "description": "Served by Strata on this PC", "default_reasoning_level": default,
+            "supported_reasoning_levels": [{"effort": x, "description": CODEX_LEVEL_TEXT[x]} for x in levels],
+            "shell_type": "shell_command", "visibility": "list", "supported_in_api": True, "priority": 1,
+            "availability_nux": None, "upgrade": None, "base_instructions": base,
+            "supports_reasoning_summaries": False, "default_reasoning_summary": "none",
+            "support_verbosity": False, "default_verbosity": None, "apply_patch_tool_type": "freeform",
+            "web_search_tool_type": "text", "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "supports_parallel_tool_calls": True, "supports_image_detail_original": False,
+            "context_window": ctx, "max_context_window": ctx, "effective_context_window_percent": 95,
+            "experimental_supported_tools": [],
+            "input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
+            "prefer_websockets": False, "supports_search_tool": False})
+    return {"models": entries}
+
+
 def structured_anthropic(events, validator):
     """C4: `output_config.format` on /v1/messages - the events held until the answer is checked, as
     structured_chunks does for chat.  The text blocks become one text block holding the validated JSON (after the
@@ -5327,6 +5406,7 @@ def make_handler(svc: Service):
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
         body_read = False                                   # whether a handler took this request's body
+        raw_body = None                                     # R8: the JSON body as it came (count_tokens' memo key)
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
 
         def log_message(self, fmt, *args):
@@ -5547,6 +5627,22 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def do_HEAD(self):
+            """A reachability probe (Claude Code's `HEAD /api/hello` warm-up): 200 with no body for /api/hello, the
+            root page, /health and /v1/models; 404 for anything else.  The API key is checked as GET checks it (a 401,
+            no body); the Host check ran in parse_request."""
+            path = self.path.split("?")[0].rstrip("/")
+            if path not in ("", "/api/hello", "/health", "/api/health", "/v1/models", "/models"):
+                code = 404
+            elif path not in ("", "/health", "/api/health") and not self._key_ok():
+                code = 401
+            else:
+                code = 200
+            self.send_response(code)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def _json(self, code, obj, headers=None):
             if code >= 400 and getattr(self, "path", "").split("?")[0].rstrip("/") in ANTHROPIC_PATHS:
                 obj = anthropic_error(code, obj)            # Anthropic's envelope on its own endpoints
@@ -5601,12 +5697,16 @@ def make_handler(svc: Service):
                 server.touch()
             self._raw(status, out, ctype)
 
-        def _authorized(self) -> bool:
+        def _key_ok(self) -> bool:
+            """No API key is set, or the request carries it (Authorization: Bearer, or x-api-key)."""
             if not svc.api_key:
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if key_matches(given, svc.api_key):
+            return key_matches(given, svc.api_key)
+
+        def _authorized(self) -> bool:
+            if self._key_ok():
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -5742,7 +5842,8 @@ def make_handler(svc: Service):
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
                              "meta": {"n_ctx": svc.reported_ctx()},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
-                                              "output_modalities": ["text"]}}
+                                              "output_modalities": ["text"]},
+                             **model_fields(svc)}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
                         loaded = True
@@ -5753,7 +5854,13 @@ def make_handler(svc: Service):
                     if svc.images is not None:            # the image model: POST /v1/images/generations
                         data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
                                      "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
-                    self._json(200, {"object": "list", "data": data})
+                    # Anthropic's list fields beside OpenAI's (Claude Code's gateway model discovery reads this list)
+                    self._json(200, {"object": "list", "data": data, "has_more": False,
+                                     "first_id": data[0]["id"] if data else None,
+                                     "last_id": data[-1]["id"] if data else None})
+            elif path == "/v1/codex/models.json":            # a Codex model catalog (model_catalog_json)
+                if self._authorized():
+                    self._json(200, codex_catalog(svc))
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -5804,7 +5911,8 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
-            if path.startswith("/v1/") and self._foreign_page():
+            if (path.startswith("/v1/") or path in ("/tokenize", "/detokenize", "/apply-template")) \
+                    and self._foreign_page():
                 return
             if path in ("/v1/audio/transcriptions", "/v1/audio/speech"):   # local: the voice sidecar
                 self._audio(path)
@@ -5846,9 +5954,16 @@ def make_handler(svc: Service):
                                headers={"Retry-After": int(ra)} if ra else None)
                 return
             try:
-                req = json.loads(self._body() or b"{}")
+                self.raw_body = self._body() or b"{}"
+                req = json.loads(self.raw_body)
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if path == "/v1/responses/input_tokens":     # OpenAI's token count for a Responses request
+                    self._input_tokens(req)
+                    return
+                if path in ("/tokenize", "/detokenize", "/apply-template"):   # llama.cpp's text tools
+                    self._text_tools(path, req)
+                    return
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -6498,14 +6613,105 @@ def make_handler(svc: Service):
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req, force, strict
 
+        def _counted(self, api, count) -> int:
+            """R8: a token count, memoized by the request body and what else shapes the prompt (the shared Chat
+            settings, the config's effort and format placement).  A count renders and tokenizes the whole prompt on
+            the request's thread, where it competes with a running request's prepare() for the GIL; agents ask for
+            the same count again and again (Claude Code's context figure), so the answer is kept (a small LRU)."""
+            key = hashlib.sha256(json.dumps([api, svc.shared, svc.config_effort, svc.format_instruction,
+                                             svc.anthropic_think_unasked], sort_keys=True, default=str).encode()
+                                 + b"\0" + (self.raw_body or b"")).hexdigest()
+            with svc.count_cache_lock:
+                if key in svc.count_cache:
+                    svc.count_cache.move_to_end(key)
+                    return svc.count_cache[key]
+            n = count()
+            with svc.count_cache_lock:
+                svc.count_cache[key] = n
+                while len(svc.count_cache) > COUNT_CACHE_MAX:
+                    svc.count_cache.popitem(last=False)
+            return n
+
+        def prompt_text(self, messages, tools, kw) -> str:
+            """The prompt as text: what encode_prompt tokenizes (a literal tag in a message stays that text)."""
+            marked, marked_tools, changed = mark_think_literals(messages, tools, svc.literals)
+            prompt = svc.render_prompt(marked, marked_tools, kw)
+            return unmark_think_literals(prompt, svc.literals)[0] if changed else prompt
+
+        def _input_tokens(self, req):
+            """POST /v1/responses/input_tokens: OpenAI's token count of a Responses request - the prompt /v1/responses
+            would read (instructions, input, tools, text.format), rendered and tokenized; the model does not run."""
+            def count():
+                responses_api.check_request(req)
+                messages = responses_api.input_messages(req)
+                tools, _names, _skipped = responses_api.request_tools(req)
+                kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
+                try:
+                    messages, _ = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools),
+                                                 position=svc.format_instruction)
+                except ValueError as e:
+                    raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
+                return len(svc.encode_prompt(messages, tools, kw))
+            try:
+                n = self._counted("responses", count)
+            except ResponsesError as e:
+                return self._json(e.status, e.body())
+            except ValueError as e:
+                return self._json(400, responses_error_body(str(e)))
+            self._json(200, {"object": "response.input_tokens", "input_tokens": n})
+
+        def _text_tools(self, path, req):
+            """llama.cpp's /tokenize {"content", "parse_special" (true), "with_pieces" (false)} -> {"tokens"};
+            /detokenize {"tokens"} -> {"content"}; /apply-template {"messages", "tools", ...} (a chat request) ->
+            {"prompt"}: the prompt this server would read for it, as text.  No model is needed."""
+            tok = svc.tok
+            if path == "/tokenize":
+                content = req.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("content: the text to tokenize (a string)")
+                ids = tok.encode(content, parse_special=req.get("parse_special", True) is not False)
+                if not req.get("with_pieces"):
+                    return self._json(200, {"tokens": ids})
+                piece_bytes = getattr(tok, "token_bytes", None)
+                out = []
+                for i in ids:
+                    raw = piece_bytes(i) if piece_bytes else tok.decode([i]).encode("utf-8")
+                    try:
+                        piece = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        piece = list(raw)                    # a piece that is part of a character: its bytes
+                    out.append({"id": i, "piece": piece})
+                return self._json(200, {"tokens": out})
+            if path == "/detokenize":
+                ids, size = req.get("tokens"), len(getattr(tok, "tokens", ()) or ())
+                if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) and i >= 0
+                                                        and (not size or i < size) for i in ids):
+                    raise ValueError("tokens: a list of token ids" + (f" (0 to {size - 1})" if size else ""))
+                return self._json(200, {"content": tok.decode(ids)})
+            messages, tools, kw = openai_to_messages(req)
+            if tool_choice_of(req.get("tool_choice"))[0] == "none":
+                tools = None
+            messages, _ = prepare_format(req.get("response_format"), messages, with_tools=bool(tools),
+                                         position=svc.format_instruction)
+            self._json(200, {"prompt": self.prompt_text(messages, tools, kw)})
+
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
-            req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            stop_strings(req)                                 # the same 400 as the request itself would get
-            check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
-            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+            def count():
+                shared = svc.with_shared(req, "anthropic")
+                messages, tools, kw = anthropic_to_messages(shared, svc.anthropic_think_unasked)
+                stop_strings(shared)                          # the same 400 as the request itself would get
+                check_request_sampling(shared)                # ... likewise a sampling field of the wrong type
+                if tool_choice_of(shared.get("tool_choice"))[0] == "none":   # as _anthropic renders it
+                    tools = None
+                try:
+                    messages, _ = prepare_format(anthropic_format(shared), messages, with_tools=bool(tools),
+                                                 position=svc.format_instruction)
+                except ValueError as e:
+                    raise ValueError(str(e).replace("response_format", "output_config.format")) from None
+                return len(svc.encode_prompt(messages, tools, kw))
+            self._json(200, {"input_tokens": self._counted("anthropic", count)})
 
         def _anthropic(self, req):
             svc.load()
@@ -7418,6 +7624,8 @@ def main() -> int:
     if position not in DIRECTIVE_POSITIONS:
         raise SystemExit(f"[strata] config format_instruction must be \"end\" or \"start\", not {position!r}")
     svc.format_instruction = position
+    cbi = cfg.get("codex_base_instructions_file")         # /v1/codex/models.json: Codex's base instructions
+    svc.codex_base_instructions_file = str(Path(cfg.get("cwd") or ".") / cbi) if isinstance(cbi, str) and cbi else None
     recovery =cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")

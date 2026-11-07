@@ -273,6 +273,13 @@ class ResponsesToolChoice(Http):
                 self.assertTrue(self.tok.decode(self.engine.prompts[-1]).endswith("<function=")
                                 or self.tok.decode(self.engine.prompts[-1]).endswith("<function=search>\n"))
 
+    def test_effort_uses_the_models_own_table(self):
+        # a model adapter (serve_ds41.py) replaces frontend.effort_kwargs: /v1/responses reads the replacement too,
+        # so Codex's "max" is the model's max, as on the chat and messages routes
+        from serve.responses import template_kwargs
+        with mock.patch.object(frontend, "effort_kwargs", lambda v: {"reasoning_effort": {"max": 100}.get(v, 75)}):
+            self.assertEqual(template_kwargs({"reasoning": {"effort": "max"}}, {}), {"reasoning_effort": 100})
+
     def test_namespaced_tool_by_its_own_name(self):
         from serve.responses import request_tools, tool_choice
         req = {"tools": [{"type": "namespace", "name": "mcp__fs", "tools": [{"type": "function", "name": "read"}]}],
@@ -453,6 +460,146 @@ class AnthropicPings(Http):
         self.assertEqual(code, 200)
         self.assertIn(": keep-alive", raw)
         self.assertNotIn("ping", raw)
+
+
+# ------------------------------------------------------------------------------------------------ endpoints
+class Endpoints(Http):
+    def test_responses_input_tokens_is_the_prompt_responses_reads(self):
+        body = {"model": "m", "instructions": "Be brief.", "input": "how many tokens?",
+                "tools": [{"type": "function", "name": "search", "parameters": SEARCH}]}
+        code, b, _ = self.request("/v1/responses/input_tokens", body)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["object"], "response.input_tokens")
+        code, r, _ = self.request("/v1/responses", {**body, "max_output_tokens": 20})
+        self.assertEqual(code, 200, r)
+        self.assertEqual(b["input_tokens"], r["usage"]["input_tokens"])
+        code, b, _ = self.request("/v1/responses/input_tokens", {"input": "x", "previous_response_id": "resp_1"})
+        self.assertEqual(code, 400)
+        self.assertEqual(b["error"]["param"], "previous_response_id")
+        # other /v1/responses/... paths still say nothing is stored
+        self.assertEqual(self.request("/v1/responses/resp_1/cancel", {})[0], 404)
+
+    def test_tokenize_detokenize(self):
+        code, b, _ = self.request("/tokenize", {"content": "hi there"})
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["tokens"], self.tok.encode("hi there", parse_special=True))
+        code, p, _ = self.request("/tokenize", {"content": "hé", "with_pieces": True})
+        self.assertEqual(code, 200, p)
+        self.assertEqual([x["id"] for x in p["tokens"]], self.tok.encode("hé", parse_special=True))
+        self.assertEqual(p["tokens"][0]["piece"], "h")
+        code, d, _ = self.request("/detokenize", {"tokens": b["tokens"]})
+        self.assertEqual((code, d), (200, {"content": "hi there"}))
+        self.assertEqual(self.request("/detokenize", {"tokens": ["a"]})[0], 400)
+        self.assertEqual(self.request("/tokenize", {"content": 5})[0], 400)
+
+    def test_apply_template_is_the_prompt_chat_reads(self):
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        code, b, _ = self.request("/apply-template", {"messages": msgs})
+        self.assertEqual(code, 200, b)
+        self.request("/v1/chat/completions", {"model": "m", "messages": msgs, "max_tokens": 5})
+        self.assertEqual(self.tok.encode(b["prompt"], parse_special=True), self.engine.last_prompt)
+
+    def test_models_metadata(self):
+        code, b, _ = self.request("/v1/models")
+        self.assertEqual(code, 200, b)
+        m = b["data"][0]
+        ctx = self.svc.reported_ctx()
+        for key in ("context_length", "max_context_length", "max_model_len", "context_window", "max_input_tokens"):
+            self.assertEqual(m[key], ctx, key)
+        self.assertEqual((m["type"], m["object"], m["id"]), ("model", "model", self.svc.model))
+        self.assertTrue(m["display_name"])
+        self.assertRegex(m["created_at"], r"^\d{4}-\d\d-\d\dT")
+        self.assertTrue(m["capabilities"]["tools"])
+        self.assertFalse(m["capabilities"]["vision"])
+        self.assertEqual(m["meta"]["n_ctx"], ctx)               # the old fields stay
+        self.assertEqual((b["has_more"], b["first_id"], b["last_id"]), (False, m["id"], b["data"][-1]["id"]))
+
+    def test_codex_catalog(self):
+        code, b, _ = self.request("/v1/codex/models.json")
+        self.assertEqual(code, 200, b)
+        m = b["models"][0]
+        self.assertEqual(m["slug"], self.svc.model)
+        self.assertEqual(m["context_window"], self.svc.reported_ctx())
+        # the fields Codex's ModelInfo requires (no serde default)
+        for key in ("slug", "display_name", "description", "supported_reasoning_levels", "shell_type", "visibility",
+                    "supported_in_api", "priority", "availability_nux", "upgrade", "support_verbosity",
+                    "default_verbosity", "apply_patch_tool_type", "truncation_policy", "experimental_supported_tools",
+                    "base_instructions"):
+            self.assertIn(key, m)
+        self.assertEqual([x["effort"] for x in m["supported_reasoning_levels"]], ["low", "medium", "high"])
+        self.assertEqual(m["default_reasoning_level"], "high")
+        self.assertEqual(m["apply_patch_tool_type"], "freeform")
+
+    def test_codex_catalog_levels_follow_the_models_effort_table(self):
+        def ds41(value):                                     # V4.1's table: max is more than high
+            return {"reasoning_effort": {"low": 50, "medium": 62, "high": 75, "max": 100}[value]}
+        with mock.patch.object(frontend, "effort_kwargs", ds41):
+            self.assertEqual(server_mod.effort_levels(), ["low", "medium", "high", "max"])
+
+    def test_head_probe(self):
+        for path, want in (("/api/hello", 200), ("/", 200), ("/health", 200), ("/nothing", 404)):
+            with self.subTest(path=path):
+                code, body, _ = self.request(path, method="HEAD")
+                self.assertEqual((code, body), (want, ""))
+        self.svc.api_key = "k"
+        self.addCleanup(setattr, self.svc, "api_key", None)
+        self.assertEqual(self.request("/api/hello", method="HEAD")[0], 401)
+        self.assertEqual(self.request("/api/hello", method="HEAD", headers={"x-api-key": "k"})[0], 200)
+        self.assertEqual(self.request("/health", method="HEAD")[0], 200)
+
+    def test_anthropic_errors_use_the_envelope(self):
+        code, b, _ = self.request("/v1/messages", {"model": "m", "messages": "nope"})
+        self.assertEqual(code, 400)
+        self.assertEqual(b["type"], "error")
+        self.assertEqual(b["error"]["type"], "invalid_request_error")
+        self.svc.api_key = "k"
+        self.addCleanup(setattr, self.svc, "api_key", None)
+        code, b, _ = self.request("/v1/messages?beta=true", {"model": "m", "messages": []})
+        self.assertEqual((code, b["type"], b["error"]["type"]), (401, "error", "authentication_error"))
+        code, b, _ = self.request("/v1/chat/completions", {"model": "m", "messages": []})
+        self.assertNotIn("type", b)                         # OpenAI's routes keep OpenAI's shape
+        self.assertEqual(server_mod.anthropic_error(409, {"error": {"type": "model_busy", "message": "busy"}}),
+                         {"type": "error", "error": {"type": "api_error", "code": "model_busy", "message": "busy"}})
+        self.assertEqual(server_mod.anthropic_error(503, {"error": {"type": "server_error", "message": "x"}})
+                         ["error"]["type"], "overloaded_error")
+
+
+# ------------------------------------------------------------------------------------------------ R8
+class CountTokensMemo(Http):
+    BODY = {"model": "m", "messages": [{"role": "user", "content": "count me"}]}
+
+    def test_the_same_body_is_counted_once(self):
+        with mock.patch.object(self.svc, "encode_prompt", wraps=self.svc.encode_prompt) as enc:
+            first = self.request("/v1/messages/count_tokens", self.BODY)
+            second = self.request("/v1/messages/count_tokens", self.BODY)
+            self.assertEqual(enc.call_count, 1)
+            self.assertEqual(first[:2], second[:2])
+            other = self.request("/v1/messages/count_tokens", {**self.BODY, "system": "longer"})
+            self.assertEqual(enc.call_count, 2)
+            self.assertGreater(other[1]["input_tokens"], first[1]["input_tokens"])
+            # the shared Chat settings change what is rendered: a new count
+            self.svc.shared["reasoning_effort"] = "low"
+            self.addCleanup(self.svc.shared.pop, "reasoning_effort", None)
+            self.request("/v1/messages/count_tokens", self.BODY)
+            self.assertEqual(enc.call_count, 3)
+            self.request("/v1/responses/input_tokens", {"input": "count me"})
+            self.request("/v1/responses/input_tokens", {"input": "count me"})
+            self.assertEqual(enc.call_count, 4)
+
+    def test_the_memo_is_bounded_and_errors_are_not_kept(self):
+        with mock.patch.object(server_mod, "COUNT_CACHE_MAX", 3):
+            for i in range(6):
+                self.request("/v1/messages/count_tokens", {**self.BODY, "system": str(i)})
+        self.assertEqual(len(self.svc.count_cache), 3)
+        bad = {**self.BODY, "stop_sequences": 5}
+        self.assertEqual(self.request("/v1/messages/count_tokens", bad)[0], 400)
+        self.assertEqual(self.request("/v1/messages/count_tokens", bad)[0], 400)
+
+    def test_count_includes_the_format_instruction(self):
+        fmt = {"output_config": {"format": {"type": "json_schema", "schema": Formats.SCHEMA}}}
+        plain = self.request("/v1/messages/count_tokens", self.BODY)[1]["input_tokens"]
+        shaped = self.request("/v1/messages/count_tokens", {**self.BODY, **fmt})[1]["input_tokens"]
+        self.assertGreater(shaped, plain)
 
 
 if __name__ == "__main__":
