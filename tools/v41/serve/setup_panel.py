@@ -145,7 +145,18 @@ def catalog(m=None) -> dict:
     gpus = list_gpus()
     return {"ram_gb": ram, "models": rows, "refused": [c for c in custom if not c["ok"]], "custom_folder": os.path.join(m, CUSTOM),
             "mode": s.get("mode") if s.get("mode") in MODES else "fast", "gpus": gpus, "multi_gpu": bool(s.get("multi_gpu")),
-            "helper_gpu": helper_gpu(gpus), "bias_override": "DS41_ROUTE_BIAS" in os.environ}
+            "helper_gpu": helper_gpu(gpus), "bias_override": "DS41_ROUTE_BIAS" in os.environ, "health": pc_health()}
+
+
+def pc_health():
+    """what windows_tips.py found at this start (local/windows-health.json): [{"text", "how"}], [] = all fine, None =
+    not checked (DS41_NO_TIPS, another launcher)"""
+    try:
+        with open(os.path.join(HERE, "local", "windows-health.json"), encoding="utf-8") as f:
+            items = json.load(f).get("items")
+        return [x for x in items if isinstance(x, dict) and x.get("text")] if isinstance(items, list) else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def list_gpus() -> list:

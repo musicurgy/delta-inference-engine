@@ -29,11 +29,31 @@ CPUs from before 2013.)
    - the engine: the prebuilt one for your CPU from the
      [Releases page](https://github.com/musicurgy/delta-inference-engine/releases) (under 1 GB, no compiler needed) - or it builds
      it, if you have Visual Studio Build Tools, the CUDA Toolkit and Git,
+   - where the model goes: it lists your drives with their free space and type (NVMe is best; USB and hard disks are
+     slow), checks Windows' page file, measures your download speed and says how long the download takes; press
+     Enter for the recommended folder, or type another (it is saved as `DS41_MODELS` in `ds41-paths.bat`),
    - the model: it asks which one you want and marks the one that suits your RAM, then downloads it from Hugging Face
-     (233-395 GB, checked against the published SHA-256; it checks the free space first; resumable - just start it
-     again if it stops).
-3. Then the server starts and the chat page opens in your browser. Apps use `http://127.0.0.1:8080/v1` (OpenAI) or
-   `/v1/messages` (Anthropic), any API key.  (Another port: `DS41_PORT` in `ds41-paths.bat`.)
+     (233-395 GB, checked against the published SHA-256; it checks the free space first).  You can leave it alone:
+     the PC stays awake while it downloads, a download that stops moving is started again by itself, one line shows
+     the progress and the time left, and a Windows notification says when it is done.  (Laptop lid or power button:
+     it still sleeps.  If it stops for good, start again: it goes on where it was.)
+3. Then the server starts and the chat page opens in your browser at once: it shows the start's steps and how long
+   the last start took, and a question typed meanwhile is answered when the model is ready.  Apps use
+   `http://127.0.0.1:8080/v1` (OpenAI) or `/v1/messages` (Anthropic), any API key.  (Another port: `DS41_PORT` in
+   `ds41-paths.bat`.)
+
+**Every day in the chat page:**
+- **Pause / Resume** (top right): Pause frees the model's RAM and the graphics card for games or other programs;
+  Resume, or simply the next message or app request, loads it again (about a minute).
+- **Chats** (the list button beside the message box): turn on "Save chats in this browser" to keep a chat list with
+  search, pins, rename, delete and export / import (JSON).  Off by default: then each chat lives in its tab only.
+  "New temporary chat" makes one that is never saved.
+- **Modes** above the message box: Quick (no thinking), Think (the default), Code and Write; under them, how long
+  answers in that mode took to start on this PC.
+- **Answer-ready notifications** (Setup > Settings, off by default): a Windows notification when an answer finishes
+  while the tab is in the background (on `http://127.0.0.1` only; browsers refuse it on a LAN address).
+- **Connect an app** (Setup > Connect your tools): the exact settings for Claude Code, OpenCode, Cline / Aider /
+  Open WebUI and others, with Copy buttons and a Test button.
 
 Every later start: double-click `Start DeepSeek.bat` again - it finds everything in place and starts the server
 (ready in about a minute). To run another quant (see "Other quants" below), double-click **`Choose Model.bat`**.
@@ -213,7 +233,8 @@ compact your conversation early.
 - Nothing from your prompts or answers is written to disk unless you turn it on: conversations live in memory and
   are gone when the server stops. Opt-in only: the plain-text watch log (`STRATA_TEXT_LOG=<a file path>`), the
   request monitor page (`"api_monitor": true` in `tools/v41/serve/ds41-windows.json`; memory only) and, in the
-  built-in chat page, "Keep chats in this browser" (Settings; off = the chat lives in the tab only).
+  built-in chat page, "Save chats in this browser" (the Chats list or Sampling; kept in the browser's own storage on
+  this PC, never on the server; off = the chat lives in the tab only).
 
 ## Quality
 
