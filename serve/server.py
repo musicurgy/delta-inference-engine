@@ -2562,7 +2562,8 @@ class Vision:
             if cancel is not None and cancel.is_set():
                 raise ClientGone()
             detail = details[i] if details and i < len(details) else None
-            out.append(self.encode(src, keep=[p for p, _ in out], detail=detail))
+            kw = {"detail": detail} if detail else {}       # an encode() of its own without detail keeps working
+            out.append(self.encode(src, keep=[p for p, _ in out], **kw))
         return out
 
     def encode(self, source: str | bytes, keep=(), detail=None) -> tuple[Path, int]:
