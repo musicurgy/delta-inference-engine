@@ -81,6 +81,7 @@ from serve import embeddings as embeddings_api  # noqa: E402  (0.94: /v1/embeddi
 from serve import response_store as store_api  # noqa: E402  (0.94: stored Responses, from Project Maya)
 from serve.response_store import ResponseStore, StoreBusy  # noqa: E402
 from serve.response_jobs import BackgroundJobs, JobError  # noqa: E402
+from serve import loop_guard  # noqa: E402  (0.94: a note when an agent repeats one tool call)
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -3339,6 +3340,10 @@ class Service:
         self.response_jobs = BackgroundJobs(self.responses, self.response_limits)
         self.responses_store_default = False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
+        # 0.94 (serve/loop_guard.py): the same tool call this many times in a row gets a note before the next turn
+        # (the config's "loop_guard"; 0: off)
+        self.loop_guard_repeats = loop_guard.REPEATS
+        self.note_role = None                             # the loop guard note's role (_loop_note_role)
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -4173,6 +4178,7 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
+        messages = self._loop_guard(messages)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
@@ -4321,6 +4327,31 @@ class Service:
                   f"(common start {n})", flush=True)
             return {}
         return {"tokens": n}
+
+    def _loop_guard(self, messages):
+        """0.94 (serve/loop_guard.py, BACKLOG #69): a request that answers the results of a tool call the model has made
+        loop_guard_repeats times in a row, with the same arguments, gets one short note after those results, right
+        before the model's turn - for this prompt only (the client's conversation is not changed).  Any other request
+        is returned as it came, so it renders exactly as before."""
+        hit = loop_guard.repeated(messages, self.loop_guard_repeats)
+        if hit is None:
+            return messages
+        names, times = hit
+        print(f"[strata] loop guard: {names} repeated {times} times", flush=True)
+        return messages + [{"role": self._loop_note_role(), "content": loop_guard.note(names, times)}]
+
+    def _loop_note_role(self) -> str:
+        """"system" when the template takes a system message in the middle of a conversation (DeepSeek V4.1's does),
+        else "user" (Qwen's template refuses a late system message; the server makes a client's late ones user
+        messages too)."""
+        if self.note_role is None:
+            try:
+                self.template.render([{"role": "system", "content": "a"}, {"role": "user", "content": "b"},
+                                      {"role": "system", "content": "c"}], tools=None)
+                self.note_role = "system"
+            except Exception:  # noqa: BLE001 - any refusal: the role every template takes
+                self.note_role = "user"
+        return self.note_role
 
     def drop_embeddings(self) -> None:
         """Delete the combined image file prepare() wrote when no run() took it over (a run deletes its own as it
@@ -8107,6 +8138,10 @@ def main() -> int:
     if not isinstance(hc, bool):
         raise SystemExit(f"[strata] config \"claude_code_helpers\" must be true or false, not {hc!r}")
     svc.helper_calls = hc
+    try:                                                # 0.94: serve/loop_guard.py (on unless turned off)
+        svc.loop_guard_repeats = loop_guard.setting(cfg.get("loop_guard"))
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}") from None
     rsd = cfg.get("responses_store_default", False)     # 0.94: store a response that does not say (OpenAI's default)
     if not isinstance(rsd, bool):
         raise SystemExit(f"[strata] config \"responses_store_default\" must be true or false, not {rsd!r}")

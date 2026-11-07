@@ -877,6 +877,7 @@ print(r.choices[0].message.content)
   does. A request without deferred tools is rendered exactly as before. `"tool_search": "off"` in
   `strata-<model>.json` lists every tool again. Whether the model calls a tool it found this way as reliably as one
   in the list is not measured yet.
+- **Loop guard (0.94, on by default).** When an agent makes the same tool call (same name and arguments) 4 times in a row, the server adds one short note before the model's next turn telling it to try something else or stop, and logs `loop guard: <tool> repeated N times`; `"loop_guard": {"repeats": N}` or `false` in `strata-<model>.json` (other requests are rendered exactly as before).
 - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out (on `/v1/messages` a `ping` event at least every
