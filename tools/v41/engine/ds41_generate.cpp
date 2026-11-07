@@ -2794,10 +2794,19 @@ int main(int argc, char ** argv) {
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
                     int acc = 0, tn = -1;
                     const bool q_on = sp_sampled && !is_lk;   // DSpark's sampled drafts: accept against their q rows
+                    // 0.94 exactness fix: with STRATA_LOOKUP_AGREE a lookup pass is taken only when the copy's first token is
+                    // DSpark's own first draft - a SAMPLED draw from q.  Accepting that row with p(d) on lookup passes and
+                    // min(1, p/q) on DSpark passes picked the rule by the draw itself, so the mix was not exact (the copied
+                    // token came out ~q*p instead of p; TV up to ~0.1 when the drafter is unsure; Maya refuses the pair for
+                    // this reason).  Row 0 of such a pass is now accepted against q like any DSpark row; the copied rows
+                    // after it are deterministic given the context, so p(d) stays exact for them.
+                    // (only with the agree gate: without it the pass does not depend on the draw, and p(d) is exact)
+                    const bool q_row0 = sp_sampled && is_lk && lk_agree && dr[0] == sp_ids[0];
                     for (; acc < k; ++acc) {
                         sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
-                        if (q_on ? !spec_accept_q(dist, dr[acc], sp_cdf.data() + (size_t) acc * (size_t) dsp->vocab(), dsp->vocab(), rng, tn)
-                                 : !spec_accept(dist, dr[acc], rng, tn)) break;
+                        const bool qa = q_on || (q_row0 && acc == 0);
+                        if (qa ? !spec_accept_q(dist, dr[acc], sp_cdf.data() + (size_t) acc * (size_t) dsp->vocab(), dsp->vocab(), rng, tn)
+                               : !spec_accept(dist, dr[acc], rng, tn)) break;
                     }
                     if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
                     // STRATA_DSPARK_TRACE=<file> (opt-in, data collection only - nothing else reads it, no output change; it
