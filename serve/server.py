@@ -2397,6 +2397,8 @@ class Vision:
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once."""
 
+    local_files = True      # main(): False when the server listens beyond this PC (see load)
+
     @staticmethod
     def work_dir() -> Path:
         """#480: the directory for the encoder's files.  The engine reads the embeddings file named in a `GENI` line
@@ -2525,6 +2527,11 @@ class Vision:
         if source.startswith(("http://", "https://")):
             return Vision.download(source)
         path = source[7:] if source.startswith("file://") else source
+        # 0.94: a server that listens beyond this PC (the phone page, a LAN) reads no file by a client's path - anyone
+        # with the key could otherwise have any picture on this PC read and described ("image_local_files": true allows)
+        if not Vision.local_files:
+            raise ValueError("this server listens beyond this PC, so it reads no picture by file path: send the "
+                             "picture itself (a data: URL), or set \"image_local_files\": true in the config")
         # refused before anything looks at the path: file://host/share/x.png is \\host\share\x.png ("file://C:/x.png",
         # a drive, is a client's spelling of file:///C:/x.png)
         host = re.split(r"[/\\]", path, maxsplit=1)[0] if source.startswith("file://") else ""
@@ -2533,6 +2540,10 @@ class Vision:
                              "file://host/...) are not read")
         if path and os.path.isfile(path):
             try:
+                # 0.94: capped as an image URL is - the whole file was read, so a path to the model's GGUF (hundreds
+                # of GB) filled the RAM beside the engine's pinned arena
+                if os.path.getsize(path) > IMAGE_URL_MAX:
+                    raise ValueError(f"the image file {path} is over {IMAGE_URL_MAX >> 20} MiB: not a picture to read")
                 return Path(path).read_bytes()
             except OSError as e:
                 raise ValueError(f"the image could not be read from {path} ({e})") from None
@@ -8200,6 +8211,7 @@ def main() -> int:
               f"a network you trust - set \"allow_no_key\": true in the config (or STRATA_ALLOW_NO_KEY=1).",
               file=sys.stderr, flush=True)
         return 2
+    Vision.local_files = this_pc_only(a.host) or cfg.get("image_local_files") is True
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
