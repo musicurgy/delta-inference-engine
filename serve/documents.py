@@ -46,6 +46,15 @@ from collections import OrderedDict
 MAX_BYTES = 64 << 20            # the largest document read (bytes); larger ones become a note
 MAX_CHARS = 2_000_000           # the most text one document puts into the prompt (~500K tokens); the rest is cut
 CHILD_TIMEOUT_S = 120.0         # a PDF / Office file that takes longer is given up (a note says so)
+# 0.94 (decompression bombs): MAX_BYTES bounds only the packed file.  An Office file (a zip) whose parts unpack to more
+# than MAX_UNZIPPED, or that has a part over RATIO_FROM unpacking to more than MAX_RATIO times its packed size, is
+# refused before the reader starts; the reader may not commit more than CHILD_MEMORY; and its answer is read up to
+# 12 bytes a character of MAX_CHARS (ensure_ascii's escapes, a surrogate pair at worst) plus OUTPUT_SLACK
+MAX_UNZIPPED = 256 << 20
+MAX_RATIO = 200
+RATIO_FROM = 4 << 20
+CHILD_MEMORY = 2 << 30
+OUTPUT_SLACK = 64 << 10
 READ_TOK_S = 650.0              # first-read speed for the estimate (README: 600-740 tok/s on long prompts, RTX 3090)
 
 KIND_NAMES = {"pdf": "PDF", "docx": "Word", "xlsx": "Excel", "pptx": "PowerPoint", "html": "HTML", "csv": "CSV",
@@ -305,29 +314,148 @@ def _child_main(kind: str) -> int:
         out = READERS[kind](data)
     except ImportError as e:
         out = {"error": f"the {PACKAGES[kind]} package is not installed ({e}); run the first-start step again"}
+    except MemoryError:
+        out = {"error": f"reading it needed more than {CHILD_MEMORY >> 20} MB of memory"}
     except Exception as e:   # noqa: BLE001 - any failure of a parser on a broken file is the answer
         out = {"error": f"{type(e).__name__}: {e}"[:400]}
+    text = out.get("text")
+    if isinstance(text, str) and len(text) > MAX_CHARS:     # only what the prompt can take goes back (and its length)
+        out["text"], out["chars"] = text[:MAX_CHARS], len(text)
     sys.stdout.buffer.write(json.dumps(out, ensure_ascii=True).encode("ascii"))
     return 0
 
 
+def zip_bomb(data: bytes) -> str:
+    """Why an Office file (a zip) is not read - its parts unpack to too much - or "".  The sizes are the zip's own, and
+    Python's zipfile (which python-docx, openpyxl and python-pptx read with) never unpacks a part past its stated size."""
+    try:
+        infos = zipfile.ZipFile(io.BytesIO(data)).infolist()
+    except (zipfile.BadZipFile, ValueError, OSError):
+        return ""                                            # the reader says what is wrong with it
+    total = 0
+    for info in infos:
+        total += info.file_size
+        if info.file_size > RATIO_FROM and info.file_size > MAX_RATIO * max(info.compress_size, 1):
+            return (f"its part {info.filename[:80]!r} unpacks to {info.file_size / 1048576:.0f} MB, "
+                    f"{info.file_size // max(info.compress_size, 1):,} times its packed size (a decompression bomb?)")
+    if total > MAX_UNZIPPED:
+        return f"it unpacks to {total / 1048576:.0f} MB; Office files up to {MAX_UNZIPPED >> 20} MB unpacked are read"
+    return ""
+
+
+def _limit_memory(limit: int) -> bool:
+    """The reader process (this one) may not commit more than `limit` bytes: a Windows job object with a process memory
+    limit, RLIMIT_AS elsewhere.  A larger allocation fails (MemoryError) instead of taking the RAM the model needs.
+    Best effort: False when it could not be set."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class Basic(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                            ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                            ("SchedulingClass", wintypes.DWORD)]
+
+            class Extended(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_ulonglong * 6),
+                            ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateJobObjectW.restype = wintypes.HANDLE
+            k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+            k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+            k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            job = k32.CreateJobObjectW(None, None)          # left open: the limit lasts as long as this process
+            if not job:
+                return False
+            info = Extended()
+            info.BasicLimitInformation.LimitFlags = 0x100    # JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            info.ProcessMemoryLimit = limit
+            return bool(k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))   # extended
+                        and k32.AssignProcessToJobObject(job, k32.GetCurrentProcess()))
+        import resource
+        hard = resource.getrlimit(resource.RLIMIT_AS)[1]
+        resource.setrlimit(resource.RLIMIT_AS, (limit if hard == resource.RLIM_INFINITY else min(limit, hard), hard))
+        return True
+    except (OSError, ValueError, AttributeError, ImportError):
+        return False
+
+
 def _run_child(kind: str, data: bytes, timeout: float = CHILD_TIMEOUT_S) -> dict:
-    """Read a PDF / Office file in a separate Python with a time limit (a hostile file must not hang the server)."""
+    """Read a PDF / Office file in a separate Python with a time limit (a hostile file must not hang the server), a
+    memory limit (the child sets it on itself) and a limit on how much of its answer is read."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+    cap = 12 * MAX_CHARS + OUTPUT_SLACK
     try:
-        r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), kind], input=data,   # noqa: S603
-                           capture_output=True, timeout=timeout, creationflags=flags, env=env)
-    except subprocess.TimeoutExpired:
-        return {"error": f"reading it took longer than {timeout:.0f} s"}
+        p = subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), kind],   # noqa: S603
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             creationflags=flags, env=env)
     except OSError as e:
         return {"error": f"the reader could not start ({e})"}
+    late = threading.Event()
+
+    def stop(timed_out=False):
+        if timed_out:
+            late.set()
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+    def feed():
+        try:
+            p.stdin.write(data)
+        except (OSError, ValueError):                       # the child ended (or was stopped) before reading it all
+            pass
+        finally:
+            try:
+                p.stdin.close()
+            except OSError:
+                pass
+
+    err = [b""]
+
+    def drain():                                            # stderr: only its end is kept
+        for chunk in iter(lambda: p.stderr.read(65536), b""):
+            err[0] = (err[0] + chunk)[-65536:]
+
+    timer = threading.Timer(timeout, stop, (True,))
+    timer.daemon = True
+    threads = [threading.Thread(target=feed, daemon=True), threading.Thread(target=drain, daemon=True)]
+    timer.start()
+    for t in threads:
+        t.start()
     try:
-        out = json.loads(r.stdout.decode("ascii") or "{}")
+        raw = p.stdout.read(cap + 1)
+        over = len(raw) > cap
+        if over:
+            stop()
+        p.wait()
+    finally:
+        timer.cancel()
+        for t in threads:
+            t.join(timeout=5)
+        for f in (p.stdout, p.stderr):
+            try:
+                f.close()
+            except OSError:
+                pass
+    if late.is_set():
+        return {"error": f"reading it took longer than {timeout:.0f} s"}
+    if over:
+        return {"error": f"the reader's answer was over {cap:,} bytes"}
+    try:
+        out = json.loads(raw.decode("ascii") or "{}")
     except ValueError:
         out = {}
     if not isinstance(out, dict) or ("text" not in out and "error" not in out):
-        tail = r.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [f"exit code {r.returncode}"]
+        tail = err[0].decode("utf-8", "replace").strip().splitlines()[-1:] or [f"exit code {p.returncode}"]
         return {"error": f"the reader stopped ({tail[0][:300]})"}
     return out
 
@@ -374,11 +502,16 @@ def _extract(data: bytes, name: str, kind: str) -> Doc:
         return Doc(name, kind, error=f"{what} is not supported; save it as .docx / .xlsx / .pptx or PDF")
     if kind == "binary":
         return Doc(name, kind, error="it is not a PDF, Word, Excel, PowerPoint, HTML or text file")
+    full = 0                                                # the text's length before the reader cut it
     if kind in BINARY_KINDS:
+        bomb = zip_bomb(data) if kind != "pdf" else ""
+        if bomb:
+            return Doc(name, kind, error=bomb)
         out = _run_child(kind, data)
         if out.get("error"):
             return Doc(name, kind, error=out["error"])
         doc = Doc(name, kind, out.get("text") or "", out.get("pages"), out.get("note") or "")
+        full = out.get("chars") if isinstance(out.get("chars"), int) else 0
     else:
         text = decode_text(data)
         if kind == "html":
@@ -388,8 +521,8 @@ def _extract(data: bytes, name: str, kind: str) -> Doc:
         doc = Doc(name, kind, text.replace("\r\n", "\n"))
     if not doc.text.strip() and not doc.note:
         doc.note = "no text was found in it"
-    if len(doc.text) > MAX_CHARS:
-        cut = len(doc.text)
+    if max(len(doc.text), full) > MAX_CHARS:
+        cut = max(len(doc.text), full)
         doc.text = doc.text[:MAX_CHARS]
         doc.note = (doc.note + "; " if doc.note else "") + \
             f"cut at {MAX_CHARS:,} of {cut:,} characters (the rest was not read)"
@@ -494,4 +627,5 @@ def estimate_seconds(tokens: int, rate: float | None = None) -> float:
 if __name__ == "__main__":
     if len(sys.argv) != 2 or sys.argv[1] not in READERS:
         sys.exit("usage: documents.py pdf|docx|xlsx|pptx < file")
+    _limit_memory(CHILD_MEMORY)
     sys.exit(_child_main(sys.argv[1]))
