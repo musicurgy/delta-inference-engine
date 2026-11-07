@@ -694,7 +694,8 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | --- | --- |
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
-| OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
+| OpenAI Responses (stream and non-stream, tools, stored and background responses, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses`, `GET` / `DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` |
+| Embeddings and rerank with small models (off by default, [below](#embeddings-and-rerank-v1embeddings-v1rerank-off-by-default-094)) | `POST /v1/embeddings`, `POST /v1/rerank` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` (`HEAD /api/hello` answers 200: Claude Code's warm-up probe) |
 | Count a request's prompt tokens (the model does not run) | `POST /v1/messages/count_tokens` (Anthropic), `POST /v1/responses/input_tokens` (OpenAI Responses) |
 | llama.cpp's text tools: text to tokens and back, a chat request to its prompt text | `POST /tokenize`, `POST /detokenize`, `POST /apply-template` |
@@ -848,6 +849,34 @@ print(r.choices[0].message.content)
   with no `"thinking"`, effort or budget thinks as the model's template does. `"anthropic_thinking": "on_request"` in
   `strata-<model>.json` renders such a request without thinking - Anthropic's own rule, and what Claude Code's short
   helper calls (a session title in a few dozen tokens) need; its real turns ask for thinking when it is on there.
+- **Claude Code's helper calls (0.94, on by default).** Besides the conversation, Claude Code sends small requests of
+  its own. The server recognises five of them by narrow, fixed signatures and logs `helper call: <kind>` for each:
+  the quota probe at start (answered at once, without the model), the session title and new-topic check, the Bash
+  command-prefix check before a Bash call and the file-path extraction after it (these four run without thinking:
+  they used to think for hundreds of tokens before writing a few words), and the prompt suggestion after each reply.
+  A suggestion keeps its thinking setting (changing it would make the whole conversation be read again), thinks at
+  most 256 tokens, and gives way to the main conversation: a main request that arrives goes first, and a running
+  suggestion is stopped (at its first token if it is still reading its prompt). Any other request is served as
+  before. `"claude_code_helpers": false` in `strata-<model>.json` turns all of this off.
+- **A helper lane for those calls (opt-in, 0.94).** A `"helper_lane"` block names a small chat model's server (any
+  OpenAI-compatible one, e.g. `llama-server` with Qwen3-1.7B and `--jinja`), set up like the embeddings server
+  [below](#embeddings-and-rerank-v1embeddings-v1rerank-off-by-default-094) (`cmd`, `args`, `model`, `gpu`,
+  `idle_s`). The session title, the new-topic check and the file-path extraction then go to it, without thinking,
+  and never wait for or interrupt the main conversation. The Bash command-prefix check stays with the main model
+  unless you add it to `"classes"`: Claude Code uses that answer to decide whether a command needs your permission.
+  If the lane fails, the main model answers. Measured with Qwen3-1.7B Q8_0 on the CPU (Core i5-13600K, 4 threads):
+  the first call takes 17 s including the start, a later file-path answer 0.2 s.
+- **Tool search: deferred tools stay out of the prompt (0.94).** Claude Code marks its MCP tools
+  `"defer_loading": true` and finds them with a search when it needs one. The server now leaves those tools out of the
+  tool list at the top of the prompt (with many MCP servers that is 10-50K tokens less on every new session) and
+  expands a `tool_reference` that a search returns into the tool's full definition, inside that tool result: the
+  model reads it where it was found, so everything before it stays the same and the conversation cache keeps it. A
+  request may also declare Anthropic's own search tools, `tool_search_tool_regex_20251119` (a Python regular
+  expression, case-insensitive) or `tool_search_tool_bm25_20251119` (plain words); the server runs them inside the
+  answer and returns `server_tool_use` and `tool_search_tool_result` blocks with up to 5 tools, as Anthropic's API
+  does. A request without deferred tools is rendered exactly as before. `"tool_search": "off"` in
+  `strata-<model>.json` lists every tool again. Whether the model calls a tool it found this way as reliably as one
+  in the list is not measured yet.
 - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out (on `/v1/messages` a `ping` event at least every
@@ -855,9 +884,11 @@ print(r.choices[0].message.content)
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
   connection or pressing stop in your app really stops the model, so the next request starts at once.
 - **Tools the provider runs (Anthropic server tools).** `web_search_*`, `web_fetch_*`, `code_execution_*` and
-  `tool_search_tool_*` tools on `/v1/messages` are run by Anthropic's servers, not by the client. This server cannot run
-  them yet, so they are left out of the prompt (one line in the server window per kind) instead of being offered to the
-  model as tools nobody can run. Client tools (your own, and Anthropic's `bash`, `text_editor`, `memory`, ...) stay.
+  `tool_search_tool_*` tools on `/v1/messages` are run by Anthropic's servers, not by the client. This server runs tool
+  search itself, and web search and fetch once `"web_tools"` configures them (both below); the others (code execution,
+  and web search or fetch while they are off) are left out of the prompt (one line in the server window per kind)
+  instead of being offered to the model as tools nobody can run. Client tools (your own, and Anthropic's `bash`,
+  `text_editor`, `memory`, ...) stay.
 - **One tool call per turn.** `"parallel_tool_calls": false` (chat completions, Responses) or Anthropic's
   `tool_choice.disable_parallel_tool_use: true` ends the answer at its first complete tool call.
 - **`strict` tools.** A tool marked `"strict": true` has its call's arguments checked against its schema (with the
@@ -1307,15 +1338,22 @@ without penalties, so more of its guesses are now rejected. Requests without pen
 speaks Chat Completions). It runs on the same path as `/v1/chat/completions`, so the thinking levels, the thinking
 budget, the conversation cache and the same API key, Host and Origin checks apply.
 
-It is **stateless**: nothing is stored, so the client sends the whole conversation in `input` every time (Codex does,
-with `store: false`). `previous_response_id`, `conversation`, `background` and the retrieve/delete/cancel endpoints
-are refused with an error that says so.
+Codex sends the whole conversation in `input` every time (with `store: false`), and nothing is kept. Since 0.94 a
+request with `"store": true` is kept in memory (up to 128 responses or 64 MB, for an hour; only the API key that
+made it can read it), so the OpenAI SDKs' `previous_response_id`, `GET` / `DELETE /v1/responses/{id}` and
+`GET /v1/responses/{id}/input_items` work. `"background": true` (with `"store": true`) answers at once with a queued
+response; it runs after the requests that wait for their answer, is read with `GET /v1/responses/{id}` (add
+`?stream=true`, and `&starting_after=N`, to replay its events) and stopped with `POST /v1/responses/{id}/cancel`. A
+request without `store` is not kept; `"responses_store_default": true` in `strata-<model>.json` keeps it, as
+OpenAI's API does. `conversation` is still refused. The limits are environment variables `STRATA_RESPONSES_*`
+(`CACHE_ENTRIES`, `CACHE_BYTES`, `CACHE_TTL_S`, `JOB_ENTRIES`, `JOB_TIMEOUT_S`, ...; serve/response_store.py). The
+store and the background jobs come from Project Maya (MIT).
 
 | Request | What Strata does |
 | --- | --- |
 | `input` as a string, or as items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)` |
 | `instructions` | The system message (with leading `developer` messages; later ones become user messages, as on the chat path) |
-| `tools` | `function` tools, `namespace` tools (the model sees `namespace.name`; calls come back with `namespace` and `name`), `custom` tools (one free-form `input` string). Hosted tools (`web_search`, `file_search`, ...) are left out: the model cannot run them. `"strict": true` function tools are checked (above) |
+| `tools` | `function` tools, `namespace` tools (the model sees `namespace.name`; calls come back with `namespace` and `name`), `custom` tools (one free-form `input` string). Hosted tools (`file_search`, ...) are left out: the model cannot run them; `web_search` runs here once `"web_tools"` configures a search. `"strict": true` function tools are checked (above) |
 | `tool_choice` | `"none"` hides the tools; `"auto"` lets the model choose; `"required"` and `{"type": "function", "name": ...}` (also `allowed_tools` with `mode: "required"`) make it call a tool, as on the chat path |
 | `parallel_tool_calls` | `false`: the answer ends at its first complete call |
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh` (and `max` where the model has it: DeepSeek V4.1); without it the config's `reasoning_effort` (0.1.44.1; 0.1.44 ignored it here), else the model's default (high) |
@@ -1462,6 +1500,64 @@ run is a slightly different model: the rescaled angles, and `yarn`'s magnitude c
 position, not only past the trained end. That is why the setup turns scaling on only for a context past
 262,144. Pictures read the same scaled table (their (t, h, w) positions feed it). That should work, but it is
 unmeasured: all the runs above are text.
+
+---
+
+## Web search and web fetch (off by default, 0.94)
+
+Claude Code's WebSearch, Anthropic's `web_search_*` / `web_fetch_*` tools and Codex's `web_search` need the server to
+run the search. Strata does that once you name a search service in `strata-<model>.json`:
+
+```json
+"web_tools": {
+  "search": "searxng",
+  "searxng_url": "http://127.0.0.1:8888",
+  "fetch": true
+}
+```
+
+- `"search"`: `"searxng"` (your own [SearXNG](https://docs.searxng.org/) with JSON output on; no key, and the most
+  private), `"brave"` with `"brave_api_key"`, `"tavily"` with `"tavily_api_key"`, or `"mcp"` with `"mcp_tool"` (a
+  search tool of one of your MCP servers, `server__tool`).
+- `"fetch": true` lets the model read a web page as text, but only a page whose address is already in the conversation
+  (you wrote it, or a search found it), only on a public address (never this PC or your network, also after a
+  redirect), at most `fetch_max_chars` (20,000) characters.
+- `max_uses` (5 per answer unless the request sets its own), `max_results` (5), `snippet_chars` (500), `timeout_s` (15).
+
+**Privacy.** A search sends the model's query - written from your conversation - to the service you chose, and a
+fetch downloads the page from its site. Nothing leaves the PC until you add this block. Page text can contain
+instructions aimed at the model: treat answers built on web pages as you would the pages themselves.
+
+Each search adds its results to the prompt (about 1-3K tokens), which the model then reads before going on.
+
+---
+
+## Embeddings and rerank (`/v1/embeddings`, `/v1/rerank`; off by default, 0.94)
+
+Codebase indexing (Roo Code, Kilo Code, Continue) and document chat (Open WebUI, LibreChat, AnythingLLM) need an
+embedding model, and some a reranker. Strata can serve both from small models next to the big one: name a server
+for each in `strata-<model>.json`, for example llama.cpp's `llama-server` with Qwen3-Embedding-0.6B and
+Qwen3-Reranker-0.6B (Apache-2.0, ~640 MB each as Q8_0 GGUF):
+
+```json
+"embeddings": {"cmd": "C:/llama.cpp/llama-server.exe", "model": "qwen3-embedding-0.6b",
+               "args": ["-m", "D:/models/Qwen3-Embedding-0.6B-Q8_0.gguf", "--embedding", "--pooling", "last",
+                        "-c", "8192", "-ngl", "99", "--port", "{port}"]},
+"rerank": {"cmd": "C:/llama.cpp/llama-server.exe", "model": "qwen3-reranker-0.6b",
+           "args": ["-m", "D:/models/qwen3-reranker-0.6b-q8_0.gguf", "--reranking",
+                    "-c", "8192", "-ngl", "99", "--port", "{port}"]}
+```
+
+- Each starts with its first request and stops after `idle_s` (600 s) without one.
+- `"gpu"`: `"auto"` (default) uses a second NVIDIA card if the PC has one the main model does not use, else the CPU
+  at below-normal priority; a number picks a card; `"cpu"` forces the CPU. The main model's card is never used unless
+  you name it, and these requests do not wait in the chat queue.
+- `/v1/embeddings` takes OpenAI's body (`input` as a string, a list, or token ids; `dimensions` shortens a Qwen3
+  vector and normalizes it again; `encoding_format: "base64"`). `/v1/rerank` (and `/rerank`) takes the Jina / Cohere
+  body (`query`, `documents`, `top_n`, `return_documents`) and returns `results` sorted by `relevance_score`.
+
+Measured (Core i5-13600K with 4 threads / RTX 3060, the two Q8_0 models above): the first request, model start included, answers
+in 1.1-1.6 s on the CPU or the 3060; a warm one-sentence embedding takes 0.01-0.02 s.
 
 ---
 

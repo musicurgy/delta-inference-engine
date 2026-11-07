@@ -29,6 +29,7 @@ import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from serve import documents
+from serve import server_tools as server_tools_api
 
 LOGGER = logging.getLogger(__name__)
 
@@ -209,6 +210,8 @@ def _parts_of(content):
 # carries nothing this server can read - the same reason responses.py's _reasoning_text gives for another server's
 # encrypted_content.
 ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
+# 0.94: the server tools' blocks (serve/server_tools.py): read when this server runs that kind, else left out as before
+SERVER_TOOL_BLOCKS = ("server_tool_use", "tool_search_tool_result", "web_search_tool_result", "web_fetch_tool_result")
 
 
 def _check_parts(content, path: str, kinds):
@@ -534,21 +537,17 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
 # C3: Anthropic server tools - tools the API provider runs itself (web search, web fetch, code execution, tool search).
 # They come with a "type" such as "web_search_20250305" and no input schema; offered to the model they were an empty
 # tool the client cannot run (Claude Code's WebSearch then failed), so they are left out with one line in the log.
-# SERVER_TOOLS is the hook for the ones this server can run: a type prefix (e.g. "web_search_") -> its runner.  Empty
-# for now; a type listed there is kept.
+# The ones this server can run are serve/server_tools.py's registered kinds (tool search; web search and fetch when
+# "web_tools" configures them): one registry, server_tools.KINDS.  A type with no kind, or a kind that is off, is left out.
 ANTHROPIC_SERVER_TOOLS = ("web_search_", "web_fetch_", "code_execution_", "tool_search_tool_")
-SERVER_TOOLS: dict = {}
 _SERVER_TOOLS_NOTED: set = set()
 
 
 def server_tool_runner(kind):
-    """The runner registered in SERVER_TOOLS for a server tool type (by its prefix), or None."""
+    """The registered, enabled server_tools kind for a server tool type, or None."""
     if not isinstance(kind, str):
         return None
-    for prefix, runner in SERVER_TOOLS.items():
-        if kind == prefix or kind.startswith(prefix):
-            return runner
-    return None
+    return server_tools_api.kind_of({"type": kind})
 
 
 def is_anthropic_server_tool(tool) -> bool:
@@ -666,10 +665,33 @@ def pin_billing_stamp(system: str) -> str:
     return "".join(s)
 
 
+def _tool_reference_text(content, ctx) -> str | None:
+    """0.94: a tool_result whose content holds `tool_reference` blocks (Claude Code's own ToolSearch, or any client's
+    custom tool search) -> its text plus the referenced tools' definitions, which Anthropic's API expands the same way.
+    None when it holds none (the result is read as before)."""
+    if not isinstance(content, list) or not server_tools_api.TOOL_SEARCH or \
+            not any(t.get(server_tools_api.DEFERRED) for t in ctx.tools):    # only for a request that defers tools
+        return None
+    refs = [b.get("tool_name") for b in content if isinstance(b, dict) and b.get("type") == "tool_reference"]
+    if not refs:
+        return None
+    text = _text_of([b for b in content if isinstance(b, dict) and b.get("type") != "tool_reference"])
+    defs = server_tools_api.tool_definition_text([r for r in refs if isinstance(r, str)], ctx)
+    return (text + "\n" + defs) if text else defs
+
+
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
     renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
+    return anthropic_request(req, think_unasked)[:3]
+
+
+def anthropic_request(req: dict, think_unasked: bool = True):
+    """anthropic_to_messages plus the request's server-tool Context (serve/server_tools.py): its deferred tools and the
+    server tools it declared."""
+    # P2's C3 drop: a server tool this server cannot run (no registered, enabled kind) is left out
+    tools, ctx = server_tools_api.anthropic_tools(drop_server_tools(_tool_list(req.get("tools"), None), "/v1/messages"))
     messages = []
     system = req.get("system")
     if system:
@@ -685,8 +707,32 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             messages.append({"role": "user", "content": _parts_of(content)})
             continue
         text, reasoning, calls, parts = [], [], [], []
+        # 0.94: a server tool's call and result inside an assistant turn (the server ran it mid-answer): the turn up to
+        # them becomes an assistant message with the call, then a tool message with the text the model read, as
+        # run_with_mcp rendered it - the rest of the turn follows as its own assistant message
+        pending, ran = [], []
+        results = {b.get("tool_use_id"): b for b in content or [] if isinstance(b, dict)
+                   and b.get("type") in SERVER_TOOL_BLOCKS[1:]} if m.get("role") == "assistant" else {}
+
+        def flush_server():
+            messages.append({"role": "assistant", "content": "".join(text).strip(),
+                             **({"reasoning_content": "".join(reasoning).strip()} if reasoning_given(
+                                 "".join(reasoning)) else {}),
+                             "tool_calls": calls + pending})
+            messages.extend({"role": "tool", "content": r} for r in ran)
+            del text[:], reasoning[:], calls[:], parts[:], pending[:], ran[:]
         for j, block in enumerate(content or []):
             kind = block.get("type")
+            if ran and kind not in SERVER_TOOL_BLOCKS:
+                flush_server()
+            if kind == "server_tool_use":
+                result = results.get(block.get("id"))
+                replay = server_tools_api.replay_text(result, ctx) if result is not None else None
+                if replay is not None:
+                    pending.append({"function": {"name": block.get("name"),
+                                                 "arguments": tool_arguments(block.get("input"))}})
+                    ran.append(replay)
+                continue
             if kind == "text":
                 text.append(block.get("text", ""))
                 parts.append(block)
@@ -697,10 +743,17 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
             elif kind == "tool_result":
+                expanded = _tool_reference_text(block.get("content"), ctx)
+                if expanded is not None:
+                    messages.append({"role": "tool", "content": expanded})
+                    continue
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.
                 messages.append({"role": "tool", "content": _parts_of(_check_parts(
                     block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS))})
+        if ran:
+            flush_server()
+            continue
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
@@ -709,8 +762,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             if calls:
                 out["tool_calls"] = calls
             messages.append(out)
-    tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
-             for t in drop_server_tools(_tool_list(req.get("tools"), None), "/v1/messages")] or None
+    tools = tools or None
     kwargs = {}
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
     # "output_config": {"effort": "low" | "medium" | "high"}
@@ -730,7 +782,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
-    return _env_to_user(_late_system_to_user(messages)), tools, kwargs
+    return _env_to_user(_late_system_to_user(messages)), tools, kwargs, ctx
 
 
 # ------------------------------------------------------------------------------------------------ output parser

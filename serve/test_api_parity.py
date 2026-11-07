@@ -101,13 +101,14 @@ class ServerTools(Http):
         with mock.patch("builtins.print") as out:
             _, tools, _ = anthropic_to_messages({"messages": [{"role": "user", "content": "hi"}], "tools": self.TOOLS})
             anthropic_to_messages({"messages": [{"role": "user", "content": "hi"}], "tools": self.TOOLS})
-        # client tools (a schema of their own, or Anthropic's client tool types such as bash) stay
-        self.assertEqual([t["name"] for t in tools], ["read", "bash"])
+        # client tools (a schema of their own, or Anthropic's client tool types such as bash) stay, and so does the
+        # tool search this server runs (serve/toolsearch.py; web search and fetch are off until "web_tools")
+        self.assertEqual([t["name"] for t in tools], ["read", "bash", "tool_search_tool_regex"])
         lines = [c.args[0] for c in out.call_args_list if "server tools" in c.args[0]]
         self.assertEqual(len(lines), 1)                     # said once per type, not per request
-        for kind in ("web_search_20250305", "web_fetch_20250910", "code_execution_20250825",
-                     "tool_search_tool_regex_20251119"):
+        for kind in ("web_search_20250305", "web_fetch_20250910", "code_execution_20250825"):
             self.assertIn(kind, lines[0])
+        self.assertNotIn("tool_search_tool_regex", lines[0])
 
     def test_only_server_tools_render_as_no_tools(self):
         msgs = [{"role": "user", "content": "hi"}]
@@ -117,10 +118,16 @@ class ServerTools(Http):
         self.assertEqual(self.svc.encode_prompt(*with_server), self.svc.encode_prompt(*plain))
 
     def test_a_registered_server_tool_is_kept(self):
-        with mock.patch.dict(frontend.SERVER_TOOLS, {"web_search_": object()}):
-            _, tools, _ = anthropic_to_messages({"messages": [{"role": "user", "content": "hi"}],
-                                                 "tools": self.TOOLS[:2]})
+        # one registry (serve/server_tools.py): a configured web search is kept and run, an unconfigured fetch dropped
+        from serve import websearch
+        websearch.configure({"search": "searxng", "searxng_url": "http://127.0.0.1:9"})
+        self.addCleanup(websearch.configure, None)
+        _, tools, _ = anthropic_to_messages({"messages": [{"role": "user", "content": "hi"}], "tools": self.TOOLS[:2]})
         self.assertEqual([t["name"] for t in tools], ["web_search"])
+        self.assertEqual(tools[0]["parameters"]["required"], ["query"])     # offered with its query schema
+        websearch.configure(None)
+        _, tools, _ = anthropic_to_messages({"messages": [{"role": "user", "content": "hi"}], "tools": self.TOOLS[:2]})
+        self.assertIsNone(tools)
 
     def test_messages_request_with_server_tools_answers(self):
         code, b, _ = self.request("/v1/messages", {"model": "m", "max_tokens": 50, "tools": self.TOOLS,
@@ -476,7 +483,7 @@ class Endpoints(Http):
         code, b, _ = self.request("/v1/responses/input_tokens", {"input": "x", "previous_response_id": "resp_1"})
         self.assertEqual(code, 400)
         self.assertEqual(b["error"]["param"], "previous_response_id")
-        # other /v1/responses/... paths still say nothing is stored
+        # an unknown previous_response_id (0.94: none is stored here) and an unknown response to cancel
         self.assertEqual(self.request("/v1/responses/resp_1/cancel", {})[0], 404)
 
     def test_tokenize_detokenize(self):

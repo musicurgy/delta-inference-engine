@@ -22,6 +22,8 @@ pypdfium2==5.15.0
 python-docx==1.2.0
 openpyxl==3.1.5
 python-pptx==1.0.2
+# strict tools and JSON formats are checked against their schema (serve/structured.py; MIT, with its dependencies)
+jsonschema==4.26.0
 
 # their dependencies
 markupsafe==3.0.3
@@ -34,3 +36,9 @@ lxml==6.1.3
 et-xmlfile==2.0.0
 XlsxWriter==3.3.1
 typing-extensions==4.16.0
+# jsonschema's (MIT); rpds-py's newest release needs Python 3.11
+attrs==26.1.0
+jsonschema-specifications==2025.9.1
+referencing==0.37.0
+rpds-py==2026.9.1; python_version >= "3.11"
+rpds-py==0.30.0; python_version < "3.11"
