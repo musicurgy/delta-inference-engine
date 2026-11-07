@@ -27,7 +27,8 @@ import json
 import time
 import uuid
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, reasoning_given
+from serve import frontend as _frontend
+from serve.frontend import Event, _late_system_to_user, _parts_of, reasoning_given
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -510,7 +511,8 @@ def template_kwargs(req: dict, shared: dict) -> dict:
     if effort is None:
         effort = shared.get("reasoning_effort")      # the Chat settings shared with apps, as on the chat path
     try:
-        return effort_kwargs(effort)
+        # read at call time: a model adapter (serve_ds41.py) replaces frontend.effort_kwargs with its own levels
+        return _frontend.effort_kwargs(effort)
     except ValueError as e:
         raise ResponsesError(str(e), "reasoning.effort") from None
 
