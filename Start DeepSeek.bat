@@ -88,7 +88,10 @@ rem 0.94 (round 358): a card of 22 GB or more keeps all 128 of the drafter's exp
 rem +8 percent drafts accepted, about +3 percent writing speed, prompts no slower.  Smaller cards keep the 64 most-used.
 if defined VRAM_MIB if %VRAMN% GEQ 22000 set STRATA_DSPARK_KEEP=
 set STRATA_DSPARK_DEPTH=5
-set STRATA_DSPARK_CONF=0.6
+rem 0.94 (rounds 360, 363): drafts stop when the PRODUCT of the drafter's confidences falls below 0.25, not at the first
+rem draft under 0.6.  At temperature 1 (what apps send) +3 to +11 percent writing speed in all 3 rotations; greedy flat.
+set STRATA_DSPARK_CONF=
+set STRATA_DSPARK_CUM=0.25
 rem sampled drafts (exact): at temperature > 0 the drafter samples its drafts from its own sharpened distribution
 rem and the check accepts each with min(1, p/q) - the answers are distributed exactly as before, ~4-6% faster at the
 rem default sampling (rounds 271-273); greedy (temperature 0) requests are unchanged
