@@ -1484,6 +1484,35 @@ Each search adds its results to the prompt (about 1-3K tokens), which the model 
 
 ---
 
+## Embeddings and rerank (`/v1/embeddings`, `/v1/rerank`; off by default, 0.94)
+
+Codebase indexing (Roo Code, Kilo Code, Continue) and document chat (Open WebUI, LibreChat, AnythingLLM) need an
+embedding model, and some a reranker. Strata can serve both from small models next to the big one: name a server
+for each in `strata-<model>.json`, for example llama.cpp's `llama-server` with Qwen3-Embedding-0.6B and
+Qwen3-Reranker-0.6B (Apache-2.0, ~640 MB each as Q8_0 GGUF):
+
+```json
+"embeddings": {"cmd": "C:/llama.cpp/llama-server.exe", "model": "qwen3-embedding-0.6b",
+               "args": ["-m", "D:/models/Qwen3-Embedding-0.6B-Q8_0.gguf", "--embedding", "--pooling", "last",
+                        "-c", "8192", "-ngl", "99", "--port", "{port}"]},
+"rerank": {"cmd": "C:/llama.cpp/llama-server.exe", "model": "qwen3-reranker-0.6b",
+           "args": ["-m", "D:/models/qwen3-reranker-0.6b-q8_0.gguf", "--reranking",
+                    "-c", "8192", "-ngl", "99", "--port", "{port}"]}
+```
+
+- Each starts with its first request and stops after `idle_s` (600 s) without one.
+- `"gpu"`: `"auto"` (default) uses a second NVIDIA card if the PC has one the main model does not use, else the CPU
+  at below-normal priority; a number picks a card; `"cpu"` forces the CPU. The main model's card is never used unless
+  you name it, and these requests do not wait in the chat queue.
+- `/v1/embeddings` takes OpenAI's body (`input` as a string, a list, or token ids; `dimensions` shortens a Qwen3
+  vector and normalizes it again; `encoding_format: "base64"`). `/v1/rerank` (and `/rerank`) takes the Jina / Cohere
+  body (`query`, `documents`, `top_n`, `return_documents`) and returns `results` sorted by `relevance_score`.
+
+Measured (Core i5-13600K with 4 threads / RTX 3060, the two Q8_0 models above): the first request, model start included, answers
+in 1.1-1.6 s on the CPU or the 3060; a warm one-sentence embedding takes 0.01-0.02 s.
+
+---
+
 ## Manage Strata from your AI assistant (MCP server)
 
 `tools/strata_mcp.py` is an MCP server for Claude Code, Claude Desktop, Cursor, VS Code, Codex and other assistants.

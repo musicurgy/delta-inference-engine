@@ -74,6 +74,7 @@ from serve.helpers import MainFirst  # noqa: E402
 from serve import server_tools as server_tools_api  # noqa: E402
 from serve import toolsearch  # noqa: E402,F401  (registers the tool search server tools)
 from serve import websearch  # noqa: E402  (registers web search / fetch; off until "web_tools" configures them)
+from serve import embeddings as embeddings_api  # noqa: E402  (0.94: /v1/embeddings, /v1/rerank sidecars)
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -3264,6 +3265,7 @@ class Service:
         self.helper_calls = True
         self.main_first = MainFirst()
         self.server_tool_rounds = 8                      # 0.94: server tool rounds (tool search, web) in one answer
+        self.sidecars: dict = {}                         # 0.94: "embeddings" / "rerank" (serve/embeddings.py), lazy
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -5775,7 +5777,7 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
-            if path.startswith("/v1/") and self._foreign_page():
+            if (path.startswith("/v1/") or path == "/rerank") and self._foreign_page():
                 return
             if path in ("/v1/audio/transcriptions", "/v1/audio/speech"):   # local: the voice sidecar
                 self._audio(path)
@@ -5884,6 +5886,8 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 elif path == "/v1/images/generations":
                     self._images(req)
+                elif path in ("/v1/embeddings", "/v1/rerank", "/rerank"):   # 0.94: the lazy sidecars
+                    self._sidecar("embeddings" if path == "/v1/embeddings" else "rerank", req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
@@ -6480,6 +6484,32 @@ def make_handler(svc: Service):
                                           "reasoning.encrypted_content" in include, validator is not None)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req
+
+        def _sidecar(self, kind, req):
+            """0.94 (serve/embeddings.py): POST /v1/embeddings (OpenAI) and /v1/rerank (Jina / Cohere) through a small
+            model's server, started on first use; the main model's queue is not involved."""
+            side = svc.sidecars.get(kind)
+            if side is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "message":
+                                           f"no {kind} model is configured (add an \"{kind}\" block to the config; "
+                                           "see docs/DETAILS.md)"}})
+                return
+            if kind == "embeddings":
+                body = embeddings_api.embeddings_request(req)
+            else:
+                body = embeddings_api.rerank_request(req)
+            try:
+                status, out = side.post("/v1/embeddings" if kind == "embeddings" else "/v1/rerank",
+                                        {"model": side.model, **body})
+            except RuntimeError as e:
+                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                return
+            if status != 200:
+                self._json(status if 400 <= status < 600 else 502, out if isinstance(out, dict) and "error" in out
+                           else {"error": {"type": "server_error", "message": f"the {kind} server answered {status}"}})
+                return
+            self._json(200, embeddings_api.embeddings_response(req, out, side.model) if kind == "embeddings" else
+                       embeddings_api.rerank_response(req, out, side.model, body["documents"]))
 
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
@@ -7453,6 +7483,15 @@ def main() -> int:
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
+    for kind in ("embeddings", "rerank"):              # 0.94: serve/embeddings.py (off unless configured)
+        if cfg.get(kind):
+            try:
+                svc.sidecars[kind] = embeddings_api.Sidecar(kind, cfg[kind], gpu_list(cfg) or [0])
+            except (ValueError, TypeError) as e:
+                raise SystemExit(f"[strata] config {kind}: {e}")
+            side = svc.sidecars[kind]
+            print(f"[strata] /v1/{kind}: {side.model} on {side.where()}, started with the first request", flush=True)
+    embeddings_api.start_idle_stop(svc.sidecars)
     try:                                                # 0.94: serve/websearch.py (off unless configured)
         websearch.configure(cfg.get("web_tools"), public_url=public_url, mcp_hub=hub)
     except ValueError as e:
@@ -7522,6 +7561,7 @@ def main() -> int:
         # local: the voice sidecar's children too - without this a SIGTERM left the ASR/TTS server running
         # (and holding ~1.4 GiB of VRAM) after the server that started it was gone
         closers += [v.stop for v in svc.voice_servers.values()]
+        closers += [s.stop for s in svc.sidecars.values()]          # 0.94: the embeddings / rerank servers
         for close in filter(None, closers):
             try:
                 close()
