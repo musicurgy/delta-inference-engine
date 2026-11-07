@@ -130,6 +130,8 @@ class CpuPlacement(unittest.TestCase):
     def test_efficiency_cores(self):
         self.assertEqual(S.efficiency_cores(self.HYBRID), list(range(12, 20)))
         self.assertEqual(S.efficiency_cores([(0, i, 0) for i in range(16)]), [])     # one kind of core: none
+        self.assertEqual(S.e_cores("e4", self.HYBRID), [16, 17, 18, 19])               # the last four: the pool's last
+        self.assertEqual(S.e_cores("e", self.HYBRID), list(range(12, 20)))
 
     def test_cpu_lists(self):
         self.assertEqual(S.parse_cpus("12-15, 18,3"), [3, 12, 13, 14, 15, 18])

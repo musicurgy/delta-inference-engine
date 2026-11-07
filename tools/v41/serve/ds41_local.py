@@ -450,7 +450,8 @@ def voice_section(m, engine_gpu=None, helper_on=False):
     out = {"lazy_idle_s": VOICE_IDLE_S}
     for kind, port, folder in (("asr", 5110, VOICE_ASR), ("tts", 5210, VOICE_TTS)):
         args = ["-I", script, "--kind", kind, "--port", "{port}", "--model", os.path.join(d, folder).replace("\\", "/"),
-                "--threads", str(VOICE_THREADS[kind]), "--device", device if kind == "tts" else "cpu", "--cpus", "e"]
+                "--threads", str(VOICE_THREADS[kind]), "--device", device if kind == "tts" else "cpu",
+                "--cpus", f"e{VOICE_THREADS[kind]}"]
         if kind == "asr" and os.path.exists(os.path.join(d, VOICE_VAD)):
             args += ["--vad", os.path.join(d, VOICE_VAD).replace("\\", "/")]
         out[kind] = {"cmd": py, "args": args, "port": port, "start_timeout_s": 180, "lazy_reserve_mib": 0,

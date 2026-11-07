@@ -98,9 +98,10 @@ def efficiency_cores(sets=None) -> list[int]:
 
 
 def pin(cpus: str, threads: int, priority: str = "normal") -> str:
-    """Apply --cpus (e = the efficiency cores; a list like 12-15,18; empty = leave it) and --priority (below: the
-    model's own threads win when both want a core, but then speech is starved while the model writes).  Returns what
-    was done, for the start line."""
+    """Apply --cpus (e = the efficiency cores; eN = the last N of them; a list like 12-15,18; empty = leave it) and
+    --priority (below: the model's own threads win when both want a core, but then speech is starved while the model
+    writes).  The engine's expert pool takes the performance cores first and then the efficiency cores in order, so
+    with a pool smaller than the core count the LAST efficiency cores are the free ones.  Returns what was done."""
     done = []
     if os.name == "nt":
         import ctypes
@@ -110,18 +111,25 @@ def pin(cpus: str, threads: int, priority: str = "normal") -> str:
         k.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
         if priority == "below" and k.SetPriorityClass(k.GetCurrentProcess(), 0x4000):   # BELOW_NORMAL_PRIORITY_CLASS
             done.append("below-normal priority")
-        cores = efficiency_cores() if cpus == "e" else parse_cpus(cpus)
+        cores = e_cores(cpus) if cpus.startswith("e") else parse_cpus(cpus)
         if cores:
             mask = sum(1 << c for c in cores if c < 64)
             if mask and k.SetProcessAffinityMask(k.GetCurrentProcess(), mask):
                 done.append(f"CPUs {compact(cores)}")
-        elif cpus == "e":
+        elif cpus.startswith("e"):
             done.append("no efficiency cores on this CPU (any core)")
-    elif cpus and cpus != "e" and hasattr(os, "sched_setaffinity"):
+    elif cpus and not cpus.startswith("e") and hasattr(os, "sched_setaffinity"):
         os.sched_setaffinity(0, parse_cpus(cpus))
         done.append(f"CPUs {cpus}")
     done.append(f"{threads} threads")
     return ", ".join(done)
+
+
+def e_cores(spec: str, sets=None) -> list[int]:
+    """'e' -> every efficiency core, 'e4' -> the last four of them ([] without efficiency cores)."""
+    cores = efficiency_cores(sets)
+    n = spec[1:]
+    return cores[-int(n):] if n.isdigit() and int(n) > 0 else cores
 
 
 def parse_cpus(spec: str) -> list[int]:
@@ -517,7 +525,7 @@ def main(argv=None) -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--model", required=True, help="the model's folder")
     ap.add_argument("--threads", type=int, default=4)
-    ap.add_argument("--cpus", default="e", help="e (efficiency cores), a list like 12-19, or '' (any)")
+    ap.add_argument("--cpus", default="e", help="e (the efficiency cores), eN (the last N of them), a list like 12-19, or '' (any)")
     ap.add_argument("--priority", default="normal", choices=("normal", "below"))
     ap.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
     ap.add_argument("--vad", default="", help="asr: silero_vad.onnx, to cut long recordings at pauses")

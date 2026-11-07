@@ -199,7 +199,8 @@ class LauncherVoiceSection(unittest.TestCase):
         self.assertTrue(asr["args"][1].endswith("serve/speech.py"))
         for c in (asr, tts):
             a = c["args"]
-            self.assertEqual((a[a.index("--device") + 1], a[a.index("--cpus") + 1]), ("cpu", "e"))
+            self.assertEqual(a[a.index("--device") + 1], "cpu")
+            self.assertEqual(a[a.index("--cpus") + 1], "e" + a[a.index("--threads") + 1])   # the last N E-cores
             self.assertNotIn("env", c)
         self.assertIn("--vad", asr["args"])
         self.assertNotIn("--vad", tts["args"])
