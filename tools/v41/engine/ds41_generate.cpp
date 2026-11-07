@@ -2800,6 +2800,42 @@ int main(int argc, char ** argv) {
                                  : !spec_accept(dist, dr[acc], rng, tn)) break;
                     }
                     if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
+                    // STRATA_DSPARK_TRACE=<file> (opt-in, data collection only - nothing else reads it, no output change; it
+                    // costs a few ms a pass): one JSON line per verify pass with every draft DSpark made (also the ones the
+                    // confidence cut left out): its id, the confidence head's sigmoid, and - for sampled drafts - q(draft),
+                    // q's top-2 and entropy; for the verified rows the trunk's p(draft) and top-1.  Offline (drafter_misses.py)
+                    // the emitted stream gives the truth for the rows that were never verified.
+                    static FILE * dtrace = [] { const char * e = std::getenv("STRATA_DSPARK_TRACE"); return e && *e ? std::fopen(e, "a") : nullptr; }();
+                    if (dtrace) {
+                        const int64_t V = dsp->vocab();
+                        std::fprintf(dtrace, "{\"rq\":%d,\"P\":%d,\"t\":%d,\"temp\":%.3f,\"lk\":%d,\"k\":%d,\"acc\":%d,\"tn\":%d,\"d\":[",
+                                     n_req, P, t, temp, is_lk ? 1 : 0, k, acc, tn);
+                        std::vector<std::pair<int, double>> md;
+                        for (int i = 0; i < sp_depth_serve; ++i) {
+                            std::fprintf(dtrace, "%s{\"id\":%d,\"c\":%.4f", i ? "," : "", sp_ids[i], 1.0f / (1.0f + std::exp(-sp_conf[i])));
+                            if (sp_sampled) {
+                                const float * cd = sp_cdf.data() + (size_t) i * (size_t) V;
+                                int b1 = -1, b2 = -1; double q1 = -1, q2 = -1, H = 0, prev = 0;
+                                for (int64_t x = 0; x < V; ++x) {
+                                    const double q = (double) cd[x] - prev; prev = cd[x];
+                                    if (q > 1e-12) H -= q * std::log(q);
+                                    if (q > q1) { q2 = q1; b2 = b1; q1 = q; b1 = (int) x; } else if (q > q2) { q2 = q; b2 = (int) x; }
+                                }
+                                const int s = sp_ids[i];
+                                const double qs = (double) cd[s] - (s > 0 ? (double) cd[s - 1] : 0.0);
+                                std::fprintf(dtrace, ",\"q\":%.4f,\"q1\":[%d,%.4f],\"q2\":[%d,%.4f],\"H\":%.3f", qs, b1, q1, b2, q2, H);
+                            }
+                            if (i < k && !is_lk) {
+                                sample_dist(vlog.data() + (size_t) (r0 + i) * nv, nv, temp, tk, top_p, min_p, md);
+                                double pd = 0; int m1 = md.empty() ? -1 : md[0].first; double p1 = md.empty() ? 0 : md[0].second;
+                                for (auto & e : md) { if (e.first == dr[i]) pd = e.second; if (e.second > p1) { p1 = e.second; m1 = e.first; } }
+                                std::fprintf(dtrace, ",\"p\":%.4f,\"m1\":[%d,%.4f]", pd, m1, p1);
+                            }
+                            std::fprintf(dtrace, "}");
+                        }
+                        std::fprintf(dtrace, "]}\n");
+                        std::fflush(dtrace);
+                    }
                     ++rq_pass; rq_acc += acc;
                     if (tier.tracing()) {   // STRATA_ROUTE_TRACE: 'P' {m, k, acc, refeed, 0} - the server's passes (timing is in 'V')
                         const float pm[5] = { (float) vt.size(), (float) k, (float) acc, refeed ? 1.0f : 0.0f, 0.0f };
