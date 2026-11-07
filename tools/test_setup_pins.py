@@ -342,10 +342,15 @@ class Requirements(unittest.TestCase):
         lines = setup.requirement_lines()
         legacy = sorted(setup.PY_PACKAGES) + ["nvidia-cublas==13.0.2.14"]
         deps = {"markupsafe", "certifi", "charset-normalizer", "idna", "urllib3", "colorama"}
-        self.assertEqual(self.pip(legacy, lines, installed=deps)[0], [])
+        # packages added to requirements.txt after the legacy list (gguf, documents, jsonschema...) are installed;
+        # nothing the legacy install already has is touched
+        def name(x): return x.split(";")[0].split("==")[0].strip().lower()
+        have = {name(x) for x in legacy} | deps
+        added = sorted(x for x in lines if name(x) not in have)
+        self.assertEqual(sorted(self.pip(legacy, lines, installed=deps)[0]), added)
         missing = [p for p in legacy if p != "psutil"]                         # an older list without psutil
         ran, _ = self.pip(missing, lines, installed=deps)
-        self.assertEqual(ran, ["psutil==7.2.2"])
+        self.assertEqual(sorted(ran), sorted(added + ["psutil==7.2.2"]))
 
     def test_a_changed_pin_is_installed(self):
         lines = setup.requirement_lines()
