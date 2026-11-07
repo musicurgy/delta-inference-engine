@@ -2620,8 +2620,22 @@ int main(int argc, char ** argv) {
                     else std::printf("ERR cancelled prefill cleanup: %s\n", dense.last_error().c_str());
                 } else std::printf("ERR prefill failed: %s\n", ferr.c_str());
                 std::fflush(stdout);
-                hist.clear();
-                snap_len = -1;
+                // 0.94: a CANCELLED read (Esc in an agent, a client watchdog, an aborted helper request) kept nothing, so the
+                // next request re-read the whole conversation from token 0 (70-90 s at 50K, minutes at 200K).  When this
+                // read started at or past the latest snapshot, every row below it and the snapshot itself are untouched (the
+                // feed writes rows >= reused): restore it now, so the live state, parking and the conversation cache all
+                // see the snapshot's state, and keep the history up to it.  Otherwise (an error, or a read that began
+                // below the snapshot) nothing is kept, as before.
+                if (prefill_cancelled && snap_len > 0 && reused >= snap_len && hist.size() >= (size_t) snap_len && dense.restore()) {
+                    hist.resize((size_t) snap_len);
+#if defined(DS41_HAVE_DSPARK)
+                    dsp_next = -1;   // the drafter's ring re-seeds from the next prompt's tail
+#endif
+                    std::fprintf(stderr, "serve: cancelled read - the conversation is kept at its %d-token snapshot\n", snap_len);
+                } else {
+                    hist.clear();
+                    snap_len = -1;
+                }
                 continue;
             }
             hist = ids;
