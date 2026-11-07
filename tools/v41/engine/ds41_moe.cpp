@@ -6288,10 +6288,28 @@ int64_t Ds41MoeTier::regrow_cache(std::string& err) {
     std::string ge;
     if (!c.grow(c.full_bytes(), ge)) { err = "regrow_cache: grow: " + ge; im_->shrunk.clear(); return -1; }
     std::vector<std::array<int64_t, 3>> fjobs;   // slot, layer, expert (not in the arena: read from the file)
-    int64_t added = 0;
-    for (const auto& j : im_->shrunk) {
+    int64_t added = 0, others = 0;
+    for (auto& j : im_->shrunk) {
         if (j[0] >= c.slots()) break;   // a short grow (VRAM taken meanwhile): the rest stay out
-        if (c.admit_at(j[1], j[2], j[0]) < 0) continue;   // re-admitted elsewhere meanwhile - leave the slot empty
+        if (c.admit_at(j[1], j[2], j[0]) < 0) {
+            // re-admitted elsewhere meanwhile (STRATA_KEEP_LAZY: the turn wrote on a shrunk cache).  lru_victim only takes
+            // occupied slots, so an empty one stays empty for good: round 348 lost a quarter of the cache this way, 512
+            // slots refilled down to 249 in 12 requests.  The layer's latest used expert of this size that the card lacks
+            // takes the slot; that is usually the victim the re-admission pushed out.
+            if (im_->vlast.empty()) continue;
+            const int ci = im_->g.cls(j[1], j[2]);
+            const int64_t NX = im_->g.n_experts;
+            int32_t best = -1;
+            int64_t bu = -1;
+            for (int64_t e = 0; e < NX; ++e) {
+                if (c.slot_of(j[1], e) >= 0 || im_->g.cls(j[1], e) != ci) continue;
+                const int64_t u = im_->vlast[(size_t) (j[1] * NX + e)];
+                if (u > bu) { bu = u; best = (int32_t) e; }
+            }
+            if (best < 0 || c.admit_at(j[1], best, j[0]) < 0) continue;
+            j[2] = best;
+            ++others;
+        }
         const int64_t BL = im_->bl[(size_t) im_->g.cls(j[1], j[2])];
         if (const uint8_t* p = im_->gpu->arena.ptr(j[1], j[2])) {
             if (!c.fill_slot_queued(j[0], p, err, BL)) { im_->shrunk.clear(); return -1; }
@@ -6348,8 +6366,8 @@ int64_t Ds41MoeTier::regrow_cache(std::string& err) {
         std::fprintf(stderr, "[keep-chk] %lld refilled slots checked, %lld bad\n", (long long) n, (long long) bad);
     }
     im_->admitted += added;
-    std::fprintf(stderr, "serve: cache regrown: %lld experts back (%zu from the file) in %.0f ms\n", (long long) added,
-                 fjobs.size(), now_ms() - t0);
+    std::fprintf(stderr, "serve: cache regrown: %lld experts back (%zu from the file) in %.0f ms, %lld in re-admitted experts' slots\n",
+                 (long long) added, fjobs.size(), now_ms() - t0, (long long) others);
     im_->shrunk.clear();
     return added;
 #else
