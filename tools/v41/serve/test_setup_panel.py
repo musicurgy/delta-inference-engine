@@ -73,6 +73,15 @@ check("custom models are listed", "custom/mine.gguf" in ids)
 check("a custom one-file model needs the default", "default" in ids["custom/mine.gguf"]["blocked"], ids["custom/mine.gguf"])
 check("a custom split model does not", ids["custom/split-00001-of-00003.gguf"]["blocked"] == "")
 check("the second card is found", cat["helper_gpu"] and cat["helper_gpu"]["index"] == 1, cat["helper_gpu"])
+# a card older than RTX 20 is never the second card (no code for it in the CUDA 13 builds); unknown cc still counts
+pascal = [{"index": 0, "name": "RTX 3090", "mib": 24576, "cc": 8.6}, {"index": 1, "name": "Tesla P40", "mib": 24576, "cc": 6.1},
+          {"index": 2, "name": "RTX 2080 Ti", "mib": 11264, "cc": 7.5}]
+check("a Pascal card is passed over", (SP.helper_gpu(pascal, 0) or {}).get("index") == 2, SP.helper_gpu(pascal, 0))
+check("only a Pascal card: none", SP.helper_gpu(pascal[:2], 0) is None)
+twins = [{"index": 0, "name": "RTX 3090", "mib": 24576, "lanes": 16}, {"index": 1, "name": "RTX 3060", "mib": 12288, "lanes": 1},
+         {"index": 2, "name": "RTX 3060", "mib": 12288, "lanes": 4}]
+check("two equal cards: the wider link", (SP.helper_gpu(twins, 0) or {}).get("index") == 2, SP.helper_gpu(twins, 0))
+check("no cc read: the card counts", (SP.helper_gpu([pascal[0], {"index": 1, "name": "x", "mib": 12288}], 0) or {}).get("index") == 1)
 check("UD-IQ2_XXS is shown as recommended here", any(m["recommended"] and "UD-IQ2_XXS" in m["name"] for m in cat["models"]))
 
 # apply: refused changes write nothing

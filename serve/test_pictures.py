@@ -230,6 +230,13 @@ class Placement(unittest.TestCase):
         self.assertIs(L.share_card(plan, {"gpu": False}), plan)
         self.assertIs(L.share_card(plan, None), plan)
         self.assertIsNone(L.share_card(None, {"cuda_device": 1}))
+        # read-aloud on the helper's card takes its room too (with or without the encoder there)
+        tts = {"tts": {"env": {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "1"}}}
+        both = L.share_card(plan, {"gpu": True, "cuda_device": 1}, tts)
+        self.assertEqual((both["gib"], both["args"][1]), (6.0, "6"))
+        self.assertEqual(L.share_card(plan, None, tts)["gib"], 8.0)
+        self.assertIs(L.share_card(plan, None, {"tts": {"env": {"CUDA_VISIBLE_DEVICES": "2"}}}), plan)
+        self.assertIs(L.share_card(plan, None, {"tts": {}}), plan)
 
     def test_encoder_env_names_the_card(self):
         env = server.vision_env({"vision": {"cuda_device": 1}}, {"CUDA_VISIBLE_DEVICES": "0"})
