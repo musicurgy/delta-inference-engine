@@ -55,16 +55,16 @@ if exist ".venv\Scripts\python.exe" (
 )
 echo Setting up the Python environment ^(.venv: ~0.3 GB of packages, a minute or two^) ...
 set "PYEXE="
-for %%v in (3.11 3.12 3.10) do if not defined PYEXE (
+for %%v in (3.14 3.13 3.12 3.11 3.10) do if not defined PYEXE (
   py -%%v -c "import sys" >nul 2>&1 && set "PYEXE=py -%%v"
 )
 if not defined PYEXE (
-  python -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] <= (3, 12) else 1)" >nul 2>&1 && set "PYEXE=python"
+  python -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] <= (3, 14) else 1)" >nul 2>&1 && set "PYEXE=python"
 )
 if defined PYEXE goto havepy
 rem no Python: Windows' own package manager (winget, part of Windows 11 and of recent Windows 10) installs python.org's
 rem Python 3.11 for this Windows user only - no administrator rights, nothing else on the PC changes
-echo Python 3.10, 3.11 or 3.12 is needed and none was found.
+echo Python 3.10 up to 3.14 is needed and none was found.
 where winget >nul 2>&1
 if errorlevel 1 (
   echo ^(Windows' package manager winget, which could install it, is not on this PC - Windows LTSC editions have none.^)
