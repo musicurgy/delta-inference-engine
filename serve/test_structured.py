@@ -209,5 +209,36 @@ class Structured(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
 
 
+class PatternTimeLimit(unittest.TestCase):
+    """0.94 (ReDoS): a client's schema `pattern` / `patternProperties` on the model's answer cannot freeze the server:
+    jsonschema's matches run with a time limit, and one that runs out of time is no match."""
+
+    def setUp(self):
+        if structured.jsonschema_modules() is None:
+            self.skipTest("jsonschema is not installed")
+        p = mock.patch("builtins.print")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def errors(self, schema, value):
+        import time
+        t0 = time.monotonic()
+        out = list(structured.schema_validator(schema).iter_errors(value))
+        self.assertLess(time.monotonic() - t0, 5.0)
+        return out
+
+    def test_pattern(self):
+        slow = r"^(.*)(.*)(.*)(.*)(.*)\1\2\3\4\5$"                # n^5 tries: hours in re, cut short here
+        schema = {"type": "object", "properties": {"a": {"type": "string", "pattern": slow}}}
+        self.assertEqual(self.errors(schema, {"a": "aaaa"}), [])
+        self.assertEqual(len(self.errors(schema, {"a": "Reads the weather for a city by its name, " * 3})), 1)
+
+    def test_pattern_properties(self):
+        schema = {"type": "object", "patternProperties": {"^(a|a)+$": {"type": "integer"}},
+                  "additionalProperties": False}
+        self.assertEqual(self.errors(schema, {"aa": 1}), [])
+        self.assertTrue(self.errors(schema, {"a" * 40 + "!": 1}))
+
+
 if __name__ == "__main__":
     unittest.main()

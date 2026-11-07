@@ -8,7 +8,15 @@ json_schema is checked against its schema when the package is installed - withou
 JSON object, and the server says so once.
 """
 import json
+import re
 import threading
+
+try:
+    import regex as _regex             # requirements.txt: matches with a time limit
+except ImportError:                    # pragma: no cover
+    _regex = None
+
+PATTERN_S = 0.25                       # 0.94 (ReDoS): one schema `pattern` match; a slower one counts as no match
 
 
 class StructuredOutputError(RuntimeError):
@@ -32,6 +40,43 @@ _jsonschema = None                     # (validators, SchemaError, Registry, NoS
 _jsonschema_lock = threading.Lock()
 
 
+class _TimedRe:
+    """`re` as jsonschema's keyword modules see it (0.94, ReDoS): `pattern`, `patternProperties` and
+    `additionalProperties` call re.search(pattern, text), with a client's pattern on the model's answer.  Python's re
+    holds the GIL for the whole match, so a pattern like ^(a|a)+$ on a long answer froze every request; this searches
+    with the regex module and a time limit, and a match that runs out of time is no match (the answer fails the
+    schema, as it would if it did not match).  Everything else is the real re."""
+
+    def __getattr__(self, name):
+        return getattr(re, name)
+
+    @staticmethod
+    def search(pattern, string, flags=0):
+        if _regex is None or not isinstance(string, str):
+            return re.search(pattern, string, flags)
+        try:
+            return _regex.search(pattern, string, flags | _regex.V0, timeout=PATTERN_S, concurrent=True)
+        except TimeoutError:
+            print(f"[strata] JSON schema: the pattern {str(pattern)[:80]!r} took over {PATTERN_S} s on "
+                  f"{len(string):,} characters; counted as no match", flush=True)
+            return None
+
+
+def _time_limited_patterns() -> bool:
+    """Point jsonschema's keyword modules at _TimedRe (they import re as a module).  False when one is not there."""
+    import importlib
+    done = True
+    for name in ("jsonschema._keywords", "jsonschema._legacy_keywords", "jsonschema._utils"):
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            done = False
+            continue
+        if getattr(module, "re", None) is re:
+            module.re = _TimedRe()
+    return done
+
+
 def jsonschema_modules():
     """jsonschema, imported on first use; None when it is not installed (said once, in the server window)."""
     global _jsonschema
@@ -43,6 +88,7 @@ def jsonschema_modules():
                 from referencing import Registry
                 from referencing.exceptions import NoSuchResource
                 _jsonschema = (validators, SchemaError, Registry, NoSuchResource)
+                _time_limited_patterns()
             except ImportError:
                 _jsonschema = False
                 print('[strata] response_format json_schema: the Python package jsonschema is not installed, so '
