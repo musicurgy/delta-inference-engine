@@ -1,0 +1,4 @@
+# Voice (Enable Voice.bat; setup-ds41-models.bat installs this only when voice is turned on): sherpa-onnx (Apache-2.0)
+# runs the speech models on the CPU (serve/speech.py).  ~28 MB; numpy comes from requirements.txt.
+sherpa-onnx==2.0.1
+sherpa-onnx-core==2.0.1

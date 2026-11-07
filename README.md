@@ -237,6 +237,21 @@ compact your conversation early.
     them back on. To choose where pictures are read, put one word in `vision-choice.txt`: `on` (the default), `cpu`,
     `gpu:1` (a card by its `nvidia-smi` number), `main` (the model's own card: fastest, but ~1.5 GB of its VRAM) or
     `off`.
+- **Documents**: attach or drop a PDF, Word, Excel or PowerPoint file (or text, Markdown, CSV, HTML) in the chat page.
+  Its text goes into the message, and the page shows how many tokens it is and how long the first read takes
+  (~650 tokens/s; follow-ups reuse it) before you send. Through the API: Anthropic `document` blocks, OpenAI `file`
+  parts and Responses `input_file` parts (the file itself, base64; URLs and file ids are not fetched). Scanned PDFs
+  have no text to read; old `.doc` / `.xls` / `.ppt` files need saving as the new formats first.
+- **Voice** is off by default. Double-click **`Enable Voice.bat`** once, then start DeepSeek again: it downloads the
+  speech models (1.1 GB, checked) and sherpa-onnx (28 MB). Then the chat page has a **microphone** (hold to talk, or
+  click to start and again to stop; the text lands in the message box), a **speaker** under every answer, and a
+  **Talk** button for a hands-free conversation (a short pause sends; talking over the answer interrupts it). Any
+  OpenAI app can use `/v1/audio/transcriptions` and `/v1/audio/speech`. The speech models start with their first use
+  (a few seconds) and stop after 10 idle minutes. They run on the CPU's efficiency cores: a 5 s clip is written out in
+  ~0.7 s and an answer is spoken about twice as fast as it plays - while the model is not writing. While it writes,
+  they share the CPU with it and are much slower. `Enable Voice.bat gpu` (from a command window) puts read-aloud on a
+  second NVIDIA card instead (~2 GB more to download). The microphone works on `http://127.0.0.1` / `localhost`;
+  from another device the page needs HTTPS. To turn voice off again, put `off` in `voice-choice.txt`.
 
 ## Privacy
 
@@ -462,6 +477,12 @@ hand:
 - nazeshinjite: the ds4 Q2 GGUF.
 - ISTA-DASLab: the GSQ-RCO quants.
 - DeepSeek: the model, and the MTP heads the drafter is built from.
+- Voice (optional): [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0); NVIDIA's
+  [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (CC-BY-4.0), in sherpa-onnx's int8
+  conversion; [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) by hexgrad (Apache-2.0);
+  [Silero VAD](https://github.com/snakers4/silero-vad) (MIT).
+- Documents: [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) / PDFium (Apache-2.0 / BSD-3),
+  python-docx, openpyxl and python-pptx (MIT).
 - [Project Maya](https://github.com/mw00/project-maya) and [antirez/ds4](https://github.com/antirez/ds4): server fixes
   ported in 0.93 (the end of thinking by its token, TCP_NODELAY; a blank replayed reasoning read as absent); the
   EXL3 CPU / CUDA kernels started from Project Maya's port of exllamav3's (MIT).

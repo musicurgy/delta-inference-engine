@@ -24,12 +24,16 @@ rem before the space check counts them
 if /i "%~1"=="pictures" (
   if "%~2"=="" (>"%~dp0vision-choice.txt" echo on) else (>"%~dp0vision-choice.txt" echo %~2)
 )
+rem "setup-ds41-models.bat voice cpu|gpu": dictation and read-aloud on (step 6)
+if /i "%~1"=="voice" (
+  if /i "%~2"=="gpu" (>"%~dp0voice-choice.txt" echo gpu) else (>"%~dp0voice-choice.txt" echo cpu)
+)
 rem stop before a download fills the drive (the downloader only warns): what is still to do vs the free space
 "%PY%" tools\v41\setup_space.py "%M%" || exit /b 1
 set "DS=deepseek-ai/DeepSeek-V4.1-Flash-1017"
 set "Q2=DeepSeek-V4.1-Flash-1017-Q2.gguf"
 
-rem 1. Is the main model needed?  It is downloaded LAST (step 5), so a problem in the small steps shows before hours of
+rem 1. Is the main model needed?  It is downloaded LAST (step 7), so a problem in the small steps shows before hours of
 rem    download.  An install from before 2026-10-27 has ds4-q2-slim.gguf + DeepSeek's Engram shards in engram\ instead
 rem    of the GGUF: it keeps working as it is.  A model Choose Model.bat picked and that is there (an Unsloth GGUF
 rem    carries its own Engram) stands for the default.
@@ -106,15 +110,15 @@ for /f "usebackq tokens=1,2" %%a in (`""%PY%" tools\v41\serve\ds41_local.py --vi
   set "VPLAN=%%a"
   set "VTORCH=%%b"
 )
-if /i "%VPLAN%"=="off" goto mainmodel
+if /i "%VPLAN%"=="off" goto voice
 set "VG=DeepSeek-V4.1-Flash-1017-Vision.gguf"
 if exist "%M%\%VG%.ok" goto vision_torch
 "%PY%" tools\v41\serve\hf_get.py nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %VG% --local-dir "%M%" || exit /b 1
 "%PY%" tools\v41\hf_verify.py --repo nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF --dir "%M%" %VG% || exit /b 1
 :vision_torch
 rem PyTorch: any build does on the CPU; a card needs the CUDA one (a CPU build there is replaced)
-if /i "%VTORCH%"=="cuda" goto mainmodel
-if /i "%VTORCH%"=="cpu" if /i not "%VPLAN%"=="cuda" goto mainmodel
+if /i "%VTORCH%"=="cuda" goto voice
+if /i "%VTORCH%"=="cpu" if /i not "%VPLAN%"=="cuda" goto voice
 set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
 if /i "%VPLAN%"=="cuda" set "TORCH_INDEX=https://download.pytorch.org/whl/cu130"
 if /i "%VPLAN%"=="cuda" echo Pictures on the second card need PyTorch's CUDA build: a 2.0 GB download, ~2.9 GB in .venv.
@@ -123,8 +127,45 @@ rem not --force-reinstall: that would also replace its dependencies (jinja2 is p
 "%PY%" -m pip uninstall -y -q torch >nul 2>&1
 "%PY%" -m pip install -q --disable-pip-version-check torch==2.14.1 --index-url %TORCH_INDEX% || exit /b 1
 
+:voice
+rem 6. Voice (off unless voice-choice.txt or DS41_VOICE says cpu or gpu; "Enable Voice.bat" sets it): dictation and
+rem    read-aloud.  sherpa-onnx in .venv runs the speech models: its CPU build (28 MB), or for "gpu" its CUDA build with
+rem    NVIDIA's CUDA 12 libraries (~1.8 GB).  The models go into the model folder's speech\ (1.1 GB, checked):
+rem    NVIDIA Parakeet TDT 0.6B v3 int8 (speech to text, 25 languages, 671 MB, CC-BY-4.0), Kokoro-82M v1.0 (text to
+rem    speech, 401 MB, Apache-2.0) and Silero VAD (1.8 MB, MIT), from sherpa-onnx's author's Hugging Face repositories.
+set "VOC=off"
+if exist "%~dp0voice-choice.txt" set /p VOC=<"%~dp0voice-choice.txt"
+if defined DS41_VOICE set "VOC=%DS41_VOICE%"
+set "VOCDEV="
+if /i "%VOC%"=="cpu" set "VOCDEV=cpu"
+if /i "%VOC:~0,3%"=="gpu" set "VOCDEV=gpu"
+if not defined VOCDEV goto mainmodel
+set "SP=%M%\speech"
+if not exist "%SP%" mkdir "%SP%" || exit /b 1
+"%PY%" -c "import importlib.util as u, os, sys; s = u.find_spec('sherpa_onnx'); sys.exit(0 if s and ('%VOCDEV%' == 'cpu' or os.path.exists(os.path.join(list(s.submodule_search_locations)[0], 'lib', 'onnxruntime_providers_cuda.dll'))) else 1)" >nul 2>&1 && goto voice_models
+echo Installing the speech runtime ^(sherpa-onnx, %VOCDEV%^) ...
+set "VREQ=requirements-voice.txt"
+if "%VOCDEV%"=="gpu" set "VREQ=requirements-voice-gpu.txt"
+rem (the CUDA build carries its own runtime: the CPU build's sherpa-onnx-core is taken out first)
+if "%VOCDEV%"=="gpu" "%PY%" -m pip uninstall -y -q sherpa-onnx-core >nul 2>&1
+"%PY%" -m pip install -q --disable-pip-version-check -r %VREQ% || exit /b 1
+:voice_models
+set "ASR=csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+set "TTS=csukuangfj/kokoro-multi-lang-v1_0"
+if exist "%SP%\parakeet-tdt-0.6b-v3-int8\encoder.int8.onnx.ok" goto voice_tts
+"%PY%" tools\v41\serve\hf_get.py %ASR% encoder.int8.onnx decoder.int8.onnx joiner.int8.onnx tokens.txt --revision ed5d745623472f97cfc2e6c2916ee248798fc5a8 --local-dir "%SP%\parakeet-tdt-0.6b-v3-int8" || exit /b 1
+"%PY%" tools\v41\hf_verify.py --repo %ASR% --revision ed5d745623472f97cfc2e6c2916ee248798fc5a8 --dir "%SP%\parakeet-tdt-0.6b-v3-int8" joiner.int8.onnx decoder.int8.onnx encoder.int8.onnx || exit /b 1
+:voice_tts
+if exist "%SP%\kokoro-multi-lang-v1_0\model.onnx.ok" goto voice_vad
+"%PY%" tools\v41\serve\hf_get.py %TTS% --revision f7b96bb6bef5c5da4d3aa4f4e0498fbbf62dc78b --local-dir "%SP%\kokoro-multi-lang-v1_0" || exit /b 1
+"%PY%" tools\v41\hf_verify.py --repo %TTS% --revision f7b96bb6bef5c5da4d3aa4f4e0498fbbf62dc78b --dir "%SP%\kokoro-multi-lang-v1_0" voices.bin lexicon-us-en.txt lexicon-zh.txt model.onnx || exit /b 1
+:voice_vad
+if exist "%SP%\silero_vad.onnx.ok" goto mainmodel
+"%PY%" tools\v41\serve\hf_get.py csukuangfj/vad silero_vad.onnx --revision fba88cd2e921609e7675c3aaf51e0b9b295da4bc --local-dir "%SP%" || exit /b 1
+"%PY%" tools\v41\hf_verify.py --repo csukuangfj/vad --revision fba88cd2e921609e7675c3aaf51e0b9b295da4bc --dir "%SP%" silero_vad.onnx || exit /b 1
+
 :mainmodel
-rem 6. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 GB, checked).  It also carries the
+rem 7. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 GB, checked).  It also carries the
 rem    Engram tables - DeepSeek's own bytes - and the engine reads them straight from it.
 if defined SKIPMAIN goto done
 set "BIGDL=1"

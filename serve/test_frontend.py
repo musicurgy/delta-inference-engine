@@ -86,9 +86,9 @@ class UnreadContentParts(unittest.TestCase):
         tok = ByteTokenizer()
         self.service = Service(MockEngine(tok, "ok"), tok, self.template)
 
-    def test_chat_file_and_audio_parts_are_left_out(self):
-        parts = ({"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}},
-                 {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}})
+    def test_chat_audio_parts_are_left_out(self):
+        # (a file part is read as its text since 0.94: serve/test_documents.py)
+        parts = ({"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}},)
         plain = [{"role": "user", "content": "summarize"}, {"role": "user", "content": "this one"}]
         for part in parts:
             with self.subTest(kind=part["type"]):
@@ -101,9 +101,9 @@ class UnreadContentParts(unittest.TestCase):
                 self.assertEqual(got, want)
 
     def test_messages_blocks_real_clients_send_are_left_out(self):
-        # tool_reference (Claude Code's tool search), documents, search results, server tool blocks, signed thinking
-        extra = [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "AA"}},
-                 {"type": "search_result", "source": "s", "title": "t", "content": [{"type": "text", "text": "x"}]},
+        # tool_reference (Claude Code's tool search), search results, server tool blocks, signed thinking (documents
+        # are read as their text since 0.94: serve/test_documents.py)
+        extra = [{"type": "search_result", "source": "s", "title": "t", "content": [{"type": "text", "text": "x"}]},
                  {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}},
                  {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []},
                  {"type": "container_upload", "file_id": "f"}]

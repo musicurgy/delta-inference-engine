@@ -198,7 +198,16 @@ if defined NEEDVIS if exist "%M%\DeepSeek-V4.1-Flash-1017-Vision.gguf.ok" if /i 
 if defined NEEDVIS if /i "%VPLAN%"=="cuda" echo   missing: pictures on the second card ^(the vision encoder, 0.97 GB, unless it is there, and PyTorch's CUDA build, 2.0 GB; without it pictures are read on the CPU^)
 if defined NEEDVIS if /i not "%VPLAN%"=="cuda" echo   missing: pictures ^(the vision encoder, 0.97 GB, and PyTorch, 124 MB^)
 if defined NEEDVIS echo            ^(Disable Pictures.bat turns pictures off: then this is not asked again^)
-if not defined NEED if not defined NEEDDRAFT if not defined NEEDVIS exit /b 0
+rem voice: off unless voice-choice.txt / DS41_VOICE says cpu or gpu (Enable Voice.bat): the speech models and sherpa-onnx
+set "VOC=off"
+if exist "%ROOT%\voice-choice.txt" set /p VOC=<"%ROOT%\voice-choice.txt"
+if defined DS41_VOICE set "VOC=%DS41_VOICE%"
+set "NEEDVOC="
+if /i "%VOC%"=="cpu" set "NEEDVOC=1"
+if /i "%VOC:~0,3%"=="gpu" set "NEEDVOC=1"
+if defined NEEDVOC if exist "%M%\speech\parakeet-tdt-0.6b-v3-int8\encoder.int8.onnx.ok" if exist "%M%\speech\kokoro-multi-lang-v1_0\model.onnx.ok" ".venv\Scripts\python.exe" -c "import sherpa_onnx" >nul 2>&1 && set "NEEDVOC="
+if defined NEEDVOC echo   missing: voice ^(the speech models, 1.1 GB, and sherpa-onnx, 28 MB^)
+if not defined NEED if not defined NEEDDRAFT if not defined NEEDVIS if not defined NEEDVOC exit /b 0
 rem what the README asks for, said before any download (the launcher's own notes come only once all is there)
 if defined VRAM_MIB if %VRAMN% LSS 11800 echo   Note: this card has %VRAM_MIB% MiB of VRAM. Under 12 GB is untested: the model may not fit on it.
 set "RAM_GB="
@@ -246,7 +255,7 @@ if errorlevel 1 (
 )
 exit /b 0
 :declined
-rem only the drafter / pictures missing: start without them; they are offered again at the next start
+rem only the drafter / pictures / voice missing: start without them; they are offered again at the next start
 if defined NEED exit /b 1
 echo Starting without what is missing ^(text only / slower^). It is offered again at the next start.
 exit /b 0

@@ -1488,6 +1488,47 @@ The config snippets for every client, the tool arguments and the safety rules ar
 
 ---
 
+## Documents and voice
+
+**Documents.** `serve/documents.py` turns a PDF (pypdfium2), Word / Excel / PowerPoint file (python-docx, openpyxl,
+python-pptx), HTML, CSV or text file into text and puts it into the prompt between
+`<document name="..." type="PDF" pages="12">` and `</document>`; PDF pages start with `--- Page N ---`, sheets and
+slides with a `##` heading, tables become Markdown tables. PDF and Office files are read in a separate Python with a
+120 s limit; up to 64 MB per file, and at most 2,000,000 characters go into the prompt (a note says when it was cut).
+The result is cached by the file's SHA-256, so a client that re-sends the same PDF every turn gets the same prompt
+and keeps the conversation cache.
+
+- Anthropic: `{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": ...}}`,
+  `"source": {"type": "text", ...}` or `{"type": "content", ...}`, with an optional `title` and `context`; also inside
+  a `tool_result` (Claude Code's Read of a PDF).
+- OpenAI chat: `{"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,..."}}`.
+- Responses: `{"type": "input_file", "filename": "a.pdf", "file_data": ...}`.
+- `POST /v1/extract` `{"name": "a.pdf", "data": "<base64 or a data: URL>"}` returns the prompt text, `tokens` and
+  `read_seconds` (what the chat page shows before sending).
+
+URLs (`"type": "url"`, `file_url`) are never fetched and file ids (`file_id`) are not kept: such a part becomes a
+one-line note in the prompt (on `/v1/responses`, a 400). A page without a text layer (a scan) is not read; the
+document says how many such pages it has.
+
+**Voice** (off by default; `Enable Voice.bat`, or `setup-ds41-models.bat voice cpu|gpu`, writes `voice-choice.txt`).
+The server starts `serve/speech.py` (sherpa-onnx) the first time it is needed and stops it after 10 idle minutes:
+
+| | Model | Size | Where it runs |
+|---|---|---|---|
+| Speech to text, `POST /v1/audio/transcriptions` | NVIDIA Parakeet TDT 0.6B v3, int8 (25 European languages, punctuation) + Silero VAD for long recordings | 671 MB + 1.8 MB | CPU, the last 4 efficiency cores |
+| Text to speech, `POST /v1/audio/speech` | Kokoro-82M v1.0 (54 voices: English, Spanish, French, Italian, Portuguese, Hindi, Japanese, Chinese) | 401 MB | CPU, the last 6 efficiency cores; with `gpu`, a second NVIDIA card |
+
+Both take OpenAI's request shapes: transcriptions as `multipart/form-data` (`file`, `language`, `response_format`
+`json` / `text` / `verbose_json` / `srt` / `vtt`) or as JSON `{"file": "<base64 WAV>"}`; speech as
+`{"input": "...", "voice": "af_heart", "speed": 1.0, "response_format": "wav"}` (OpenAI's voice names such as `alloy`
+or `nova` map to Kokoro voices). WAV is read and written directly; MP3, M4A, Opus and the like need `ffmpeg` on the
+PATH (without it, speech comes back as WAV).
+
+Measured on an i5-13600K (11-07): with the model idle, a 5 s clip is transcribed in 0.66 s and 5.1 s of speech is
+made in 2.6 s (1.7 s with 8 threads; 0.47 s on an RTX 3060). While the model writes, its expert threads use every
+core including the efficiency cores and speech on the CPU was 3-30x slower; the engine's expert pool fills the
+performance cores first, so a pool smaller than the core count leaves the last efficiency cores to speech.
+
 ## Images (vision)
 
 The model has a vision encoder: [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)

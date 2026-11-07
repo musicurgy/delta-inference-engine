@@ -28,7 +28,7 @@ import time
 import uuid
 
 from serve import frontend as _frontend
-from serve.frontend import Event, _late_system_to_user, _parts_of, reasoning_given
+from serve.frontend import Event, _late_system_to_user, _parts_of, document_text, reasoning_given
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -75,6 +75,11 @@ def _content(content, param):
             parts.append({"type": "text", "text": part.get("text") or ""})
         elif kind == "refusal":
             parts.append({"type": "text", "text": part.get("refusal") or ""})
+        elif kind in ("input_file", "file"):                       # a document: its text (serve/documents.py)
+            if not (part.get("file_data") or (part.get("file") or {}).get("file_data")):
+                raise ResponsesError("only files given as file_data (a data: URL or base64) are supported; this "
+                                     "server keeps no files and fetches no URLs", f"{param}[{j}]", "unsupported_parameter")
+            parts.append({"type": "text", "text": document_text(part, j > 0, j < len(content) - 1)})
         elif kind in ("input_image", "image_url"):
             if not part.get("image_url"):
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
@@ -82,7 +87,7 @@ def _content(content, param):
             parts.append({"type": "input_image", "image_url": part["image_url"],
                           **({"detail": part["detail"]} if part.get("detail") else {})})
         else:
-            raise ResponsesError(f"content parts of type {kind!r} are not supported (text and images are)",
+            raise ResponsesError(f"content parts of type {kind!r} are not supported (text, images and files are)",
                                  f"{param}[{j}].type", "unsupported_parameter")
     return _parts_of(parts)
 

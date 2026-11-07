@@ -77,5 +77,151 @@ class VoiceServerTest(unittest.TestCase):
         self.assertTrue(v.alive())
         self.assertLess(time.time() - v.last_used, 5.0)
 
+class VoiceServerOptions(unittest.TestCase):
+    def test_env_and_log_reach_the_child(self):
+        from unittest import mock
+        v = VoiceServer("tts", {"cmd": "py", "args": ["speech.py", "--port", "{port}"], "port": 1,
+                                "env": {"CUDA_VISIBLE_DEVICES": 1}, "show_log": True, "start_timeout_s": 0.01})
+        with mock.patch("subprocess.Popen") as popen:
+            popen.return_value.poll.return_value = None
+            with self.assertRaises(RuntimeError):            # nothing answers /health on port 1
+                v.ensure()
+        args, kw = popen.call_args
+        self.assertEqual(args[0], ["py", "speech.py", "--port", "1"])
+        self.assertEqual(kw["env"]["CUDA_VISIBLE_DEVICES"], "1")
+        self.assertIn("PATH", {k.upper() for k in kw["env"]})      # the rest of the environment is kept
+        self.assertIsNone(kw["stderr"])                                # the child's lines in the server window
+        quiet = VoiceServer("asr", {"cmd": "x"})
+        self.assertEqual((quiet.env, quiet.show_log), ({}, False))
+
+
+class StrataProxy(unittest.TestCase):
+    """The chat page's microphone: JSON to /v1/audio/transcriptions through Strata to the speech child; /health says
+    which voice servers there are."""
+
+    def setUp(self):
+        import sys
+        from pathlib import Path
+        from serve.frontend import ChatTemplate
+        from serve.server import ByteTokenizer, MockEngine, Service, serve
+        root = Path(__file__).resolve().parents[1]
+        self.stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
+        threading.Thread(target=self.stub.serve_forever, daemon=True).start()
+        self.addCleanup(self.stub.server_close)
+        self.addCleanup(self.stub.shutdown)
+        tok = ByteTokenizer()
+        self.svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate(root / "serve/chat_template.jinja"))
+        asr = VoiceServer("asr", {"cmd": sys.executable, "port": self.stub.server_address[1]})
+        asr.ensure = lambda: asr.base_url                             # the stub is already up
+        self.svc.voice_servers = {"asr": asr}
+        self.httpd = serve(self.svc, port=0)
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def call(self, method, path, body=None, headers=None):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=30)
+        try:
+            c.request(method, path, body=body, headers=headers or {})
+            r = c.getresponse()
+            return r.status, json.loads(r.read())
+        finally:
+            c.close()
+
+    def test_health_names_the_voice_servers(self):
+        self.assertEqual(self.call("GET", "/health")[1]["voice"], {"asr": True, "tts": False})
+
+    def test_json_from_the_own_page_is_forwarded(self):
+        port = self.httpd.server_address[1]
+        body = json.dumps({"file": "data:audio/wav;base64,UklGRg=="}).encode()
+        status, out = self.call("POST", "/v1/audio/transcriptions", body,
+                                {"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"})
+        self.assertEqual((status, out["text"]), (200, "hello world"))
+        self.assertEqual(_StubHandler.seen[:2], ("/v1/audio/transcriptions", "application/json"))
+
+    def test_no_tts_configured(self):
+        status, out = self.call("POST", "/v1/audio/speech", b"{}", {"Content-Type": "application/json"})
+        self.assertEqual(status, 404)
+        self.assertIn("no tts server", out["error"]["message"])
+
+
+class LauncherVoiceSection(unittest.TestCase):
+    """tools/v41/serve/ds41_local.py: voice-choice.txt / DS41_VOICE -> the server's "voice" section."""
+
+    def setUp(self):
+        import importlib
+        import os
+        import sys
+        import tempfile
+        from pathlib import Path
+        here = str(Path(__file__).resolve().parents[1] / "tools" / "v41" / "serve")
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        self.L = importlib.import_module("ds41_local")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.m = self.tmp.name
+        self.os = os
+
+    def put(self, *parts):
+        p = self.os.path.join(self.m, "speech", *parts)
+        self.os.makedirs(self.os.path.dirname(p), exist_ok=True)
+        open(p, "wb").close()
+
+    def section(self, mode, sherpa=True, gpus=(), cuda=False, engine_gpu=0):
+        from unittest import mock
+        import io
+        import contextlib
+        out = io.StringIO()
+        real = self.L.importlib.util.find_spec
+        def find_spec(name):
+            return (object() if sherpa else None) if name == "sherpa_onnx" else real(name)
+        with mock.patch.dict(self.os.environ, {"DS41_VOICE": mode}), \
+                mock.patch.object(self.L.importlib.util, "find_spec", side_effect=find_spec), \
+                mock.patch.object(self.L, "sherpa_cuda", return_value=cuda), \
+                mock.patch("setup_panel.list_gpus", return_value=list(gpus)), contextlib.redirect_stdout(out):
+            return self.L.voice_section(self.m, engine_gpu), out.getvalue()
+
+    def test_off_by_default_and_not_set_up(self):
+        self.assertEqual(self.section("off")[0], None)
+        cfg, said = self.section("cpu")
+        self.assertIsNone(cfg)
+        self.assertIn("Enable Voice.bat", said)
+
+    def test_cpu(self):
+        self.put(self.L.VOICE_ASR, "encoder.int8.onnx")
+        self.put(self.L.VOICE_TTS, "model.onnx")
+        self.put(self.L.VOICE_VAD)
+        cfg, _ = self.section("cpu")
+        self.assertEqual(cfg["lazy_idle_s"], self.L.VOICE_IDLE_S)
+        asr, tts = cfg["asr"], cfg["tts"]
+        self.assertEqual((asr["port"], tts["port"]), (5110, 5210))
+        self.assertTrue(asr["args"][1].endswith("serve/speech.py"))
+        for c in (asr, tts):
+            a = c["args"]
+            self.assertEqual(a[a.index("--device") + 1], "cpu")
+            self.assertEqual(a[a.index("--cpus") + 1], "e" + a[a.index("--threads") + 1])   # the last N E-cores
+            self.assertNotIn("env", c)
+        self.assertIn("--vad", asr["args"])
+        self.assertNotIn("--vad", tts["args"])
+        self.assertIsNone(self.section("cpu", sherpa=False)[0])        # the runtime is missing
+
+    def test_gpu(self):
+        self.put(self.L.VOICE_ASR, "encoder.int8.onnx")
+        self.put(self.L.VOICE_TTS, "model.onnx")
+        two = [{"index": 0, "name": "RTX 3090", "mib": 24576}, {"index": 1, "name": "RTX 3060", "mib": 12288}]
+        cfg, _ = self.section("gpu", gpus=two, cuda=True)
+        self.assertEqual(cfg["tts"]["env"], {"CUDA_VISIBLE_DEVICES": "1"})      # read-aloud on the second card
+        self.assertIn("cuda", cfg["tts"]["args"])
+        self.assertIn("cpu", cfg["asr"]["args"])                               # dictation stays on the CPU
+        self.assertNotIn("env", cfg["asr"])
+        cfg, said = self.section("gpu", gpus=two[:1], cuda=True)      # one card: the CPU
+        self.assertNotIn("env", cfg["tts"])
+        self.assertIn("there is none", said)
+        cfg, said = self.section("gpu:1", gpus=two, cuda=False)       # the CPU build of sherpa-onnx
+        self.assertIn("CUDA build", said)
+        self.assertIn("cpu", cfg["tts"]["args"])
+
+
 if __name__ == "__main__":
     unittest.main()
