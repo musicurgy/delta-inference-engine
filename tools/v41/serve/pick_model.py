@@ -29,7 +29,9 @@ UNSLOTH = "unsloth/DeepSeek-V4.1-Flash-1017-GGUF"
 # the same sizes and new content - pinned until the new files are measured
 UNSLOTH_REV = "60ad3651"
 # rounds 323 / 325: the re-made UD-IQ1_S is closer to DeepSeek than the pinned one (89.1 / 91.5% vs 87.5 / 90.2% at bias 0.28), same size
-UNSLOTH_REV_OF = {"UD-IQ1_S": "8a6ec9cf"}
+# 0.94: the re-made UD-Q2_K_XL too (round 309: a tie with the pinned one - general 95.08 vs 95.25%, code + maths 96.80 vs
+# 96.60%, KL lower) - new downloads get Unsloth's latest; an existing install is not re-downloaded
+UNSLOTH_REV_OF = {"UD-IQ1_S": "8a6ec9cf", "UD-Q2_K_XL": "8a6ec9cf"}
 GB = 1e9
 # Writing tok/s through the server at 192 / 128 / 96 / 64 GB of RAM (the 96 / 64 GB columns: 2026-10-28/29, a PC with
 # that much RAM simulated by locking the rest away, so neither Windows' file cache nor the pagefile could use it; "-" =
