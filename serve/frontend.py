@@ -392,14 +392,32 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
     return out, _mark_deep(tools, tags), True
 
 
-_THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
+def _marks_re(marks) -> re.Pattern:
+    """A pattern for any of `marks`.  0.94: when every mark is one character (they all are: private use code points,
+    consecutive), a character class of their RANGES - the same matches as the alternation, which with literal_tags()'
+    ~1,240 control-token marks (DeepSeek V4.1) took ~1 us a character: ~50 ms on a 50K-character prompt, every turn
+    once a message held a literal.  (A class that lists the characters one by one is as slow: above U+FFFF the regex
+    engine checks them in turn.)"""
+    if not marks or any(len(k) != 1 for k in marks):
+        return re.compile("|".join(map(re.escape, marks)))
+    points, runs = sorted(map(ord, marks)), []
+    for c in points:
+        if runs and c == runs[-1][1] + 1:
+            runs[-1][1] = c
+        else:
+            runs.append([c, c])
+    return re.compile("[" + "".join(re.escape(chr(a)) + ("-" + re.escape(chr(b)) if b > a else "")
+                                    for a, b in runs) + "]")
+
+
+_THINK_MARK_RE = _marks_re(THINK_MARKS)
 
 
 def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> tuple[str, list[tuple[int, int]]]:
     """The rendered prompt with THINK_TAGS' marks turned back into the tags' text, and the (start, end) spans of those
     tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
     marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
-    mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
+    mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else _marks_re(marks)
     out, spans, pos, n = [], [], 0, 0
     for m in mark_re.finditer(prompt):
         out.append(prompt[pos:m.start()])

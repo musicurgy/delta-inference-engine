@@ -16,8 +16,11 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
+from array import array
+from bisect import bisect_right
 
 import regex
 
@@ -139,6 +142,10 @@ class Tokenizer:
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
+        # the longest literal each pattern can match: how far past a match's end the scan that found it looked
+        self._lit_max = {id(self._always_re): max(map(len, always), default=0),
+                         id(self._special_re): max(map(len, self.special_tokens), default=0)}
+        self._memo: tuple = ()           # the prefix memo (see encode): (pat, text, ids, ends, counts, spans), newest first
         # Initialize once, rather than allocating a default dict and looking it up
         # through __dict__.setdefault on each encoded segment or decoded token.
         self._piece_ids: dict[str, list[int]] = {}
@@ -324,6 +331,18 @@ class Tokenizer:
             out.extend(self._encode_plain(text[pos:]))
         return out
 
+    # The prefix memo (0.94, brainstorm_1107 idea 1 / BACKLOG #41): an agent resends its whole conversation every turn,
+    # and the pre-tokenizer's regexes ran over all of it each time - ~1.4 ms per 1K tokens on a 5800X, 140 ms a turn at
+    # 100K tokens, before the engine saw the request.  The last PREFIX_MEMO long texts keep their ids and the places
+    # where a literal (special token) match ended; a text that starts the same takes the ids up to the last such place
+    # whose matching lies wholly inside the shared characters and tokenizes only the rest.  Exact: the ids are a
+    # concatenation over the literal matches (each stretch between two matches is BPE'd on its own, _encode_matching),
+    # and the matches up to a place are decided by the characters before it plus the longest literal's length.
+    # 0 turns it off; STRATA_TOKENIZE_CHECK=1 encodes every reused text whole too and says so on a difference.
+    PREFIX_MEMO = 4
+    PREFIX_MEMO_MIN = 4096      # characters: shorter texts are encoded whole and not remembered
+    CHECK = os.environ.get("STRATA_TOKENIZE_CHECK", "").strip().lower() in ("1", "true", "on", "yes")
+
     def encode(self, text: str, parse_special: bool = False, plain=()) -> list[int]:
         """Tokenize `text`.
 
@@ -332,7 +351,78 @@ class Tokenizer:
         `plain`: (start, end) spans of `text` that are ordinary text even where they spell a literal - a
         `</think>` quoted in a message (#537) - and are tokenized with the text around them.
         """
-        return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
+        pat = self._special_re if parse_special else self._always_re
+        if (pat is None or not self.PREFIX_MEMO or len(text) < self.PREFIX_MEMO_MIN
+                or not isinstance(plain, (list, tuple))           # other iterables: consumed as they come
+                or type(self)._encode_matching is not Tokenizer._encode_matching):   # a subclass's own matching
+            return self._encode_matching(text, pat, plain)
+        return self._encode_memo(text, pat, tuple(sorted(plain)))
+
+    def _encode_memo(self, text: str, pat, spans: tuple) -> list[int]:
+        """encode() with the prefix memo: `pat` set, `spans` the plain spans sorted (as _encode_matching sorts them).
+        A remembered match end p is a place to go on from when the characters up to p + the longest literal are the
+        same in both texts, and so are the plain spans that start before p (they alone decide which matches before p
+        were skipped); the scan from p then takes every span again, which leaves it where the whole scan would be."""
+        lit = self._lit_max[id(pat)]
+        best, keep, pos, n = None, -1, 0, 0
+        for entry in self._memo:
+            if entry[0] is not pat:
+                continue
+            old, old_spans = entry[1], entry[5]
+            if old == text and old_spans == spans:              # the same text again (a count, a retry)
+                self._remember(entry, entry)
+                return entry[2].tolist()
+            limit = common_prefix(old, text) - lit
+            c = 0
+            while c < len(spans) and c < len(old_spans) and spans[c] == old_spans[c]:
+                c += 1
+            for sp in (spans, old_spans):                       # p must not pass the first span that differs
+                if c < len(sp):
+                    limit = min(limit, sp[c][0])
+            k = bisect_right(entry[3], limit) - 1               # the last match end safely inside
+            if k >= 0 and entry[4][k] > n:
+                best, keep, pos, n = entry, k, entry[3][k], entry[4][k]
+        if best is None:
+            out, ends, counts = [], array("q"), array("q")
+        else:
+            out, ends, counts = best[2][:n].tolist(), best[3][:keep + 1], best[4][:keep + 1]
+        upcoming_spans = iter(spans)                            # _encode_matching from `pos`, recording match ends
+        upcoming, plain_end = next(upcoming_spans, None), 0
+        for m in pat.finditer(text, pos):
+            start = m.start()
+            while upcoming is not None and upcoming[0] <= start:
+                plain_end = max(plain_end, upcoming[1])
+                upcoming = next(upcoming_spans, None)
+            if start < plain_end:
+                continue
+            if start > pos:
+                out.extend(self._encode_plain(text[pos:start]))
+            out.append(self.special_tokens[m.group(0)])
+            pos = m.end()
+            ends.append(pos)
+            counts.append(len(out))
+        if pos < len(text):
+            out.extend(self._encode_plain(text[pos:]))
+        if best is not None and self.CHECK:
+            whole = self._encode_matching(text, pat, spans)
+            if whole != out:
+                at = next((i for i, (a, b) in enumerate(zip(whole, out)) if a != b), min(len(whole), len(out)))
+                print(f"[strata] tokenize check: the prefix memo gave different ids at token {at} "
+                      f"({len(out)} vs {len(whole)} tokens) - using the whole encode", file=sys.stderr, flush=True)
+                self._remember(best, None)                        # forget the entry it grew from
+                return whole
+        self._remember(best, (pat, text, array("i", out), ends, counts, spans))
+        return out
+
+    def _remember(self, replaced, entry) -> None:
+        """Put `entry` first in the memo, in place of `replaced` (the entry it grew from) or of the oldest one; None
+        only drops `replaced`.  The memo is a tuple replaced whole, so a thread reading it never sees it change (two
+        writers at once can lose an entry, which costs only a whole encode)."""
+        rest = [e for e in self._memo if e is not replaced]
+        if entry is None:
+            self._memo = tuple(rest)
+        else:
+            self._memo = tuple([entry] + rest[:max(0, self.PREFIX_MEMO - 1)])
 
     def token_bytes(self, i: int) -> bytes:
         """The raw bytes of one token (a multi-byte character can be split across tokens)."""
@@ -352,6 +442,27 @@ class Tokenizer:
 
     def decode(self, ids: list[int], errors: str = "replace") -> str:
         return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
+
+
+def common_prefix(a: str, b: str) -> int:
+    """The length of the longest common prefix of `a` and `b`: compares of 32K-character blocks, then a binary search
+    inside the first block that differs (every compare is C code; a loop over characters would cost more than the
+    tokenizing it saves)."""
+    n = min(len(a), len(b))
+    lo, step = 0, 1 << 15
+    while lo < n:
+        hi = min(n, lo + step)
+        if a[lo:hi] == b[lo:hi]:
+            lo = hi
+            continue
+        while hi - lo > 1:                  # a[:lo] == b[:lo] and a[lo:hi] != b[lo:hi]
+            mid = (lo + hi) // 2
+            if a[lo:mid] == b[lo:mid]:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+    return lo
 
 
 # ------------------------------------------------------------------ the pack's tokenizer/ directory
