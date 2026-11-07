@@ -1,4 +1,6 @@
 @echo off
+rem no usage reports to Hugging Face (downloads only)
+set HF_HUB_DISABLE_TELEMETRY=1
 rem Choose the model "Start DeepSeek.bat" loads: the default ds4 Q2, one of ISTA-DASLab's GSQ-RCO quants (IQ2_XS,
 rem IQ2_XXS, IQ1_M: built here from their files) or one of Unsloth's (UD-IQ1_S ... UD-Q8_K_XL: downloaded as they are).
 rem It lists what is there and what you can add, with sizes, speed and agreement.  The choice is saved in

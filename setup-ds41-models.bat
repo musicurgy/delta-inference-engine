@@ -1,4 +1,6 @@
 @echo off
+rem no usage reports to Hugging Face (downloads only)
+set HF_HUB_DISABLE_TELEMETRY=1
 rem Download and prepare the model files into DS41_MODELS (ds41-paths.bat).  "Start DeepSeek.bat" runs this for you when
 rem files are missing.  Safe to re-run: finished steps are skipped, the Hugging Face downloads resume, and every large
 rem file is checked against the SHA-256 its repository publishes before it is used.  Downloads ~375 GB; needs ~385 GB

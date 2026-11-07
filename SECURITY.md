@@ -21,7 +21,11 @@ this PC only. The details and every setting are in [docs/DETAILS.md](docs/DETAIL
 "Host names", "Web pages without an API key", "Tools from MCP servers").
 
 - **Where it listens.** `127.0.0.1` by default. `--host 0.0.0.0` (or `"host"` in `tools/v41/serve/ds41-windows.json`) opens it to
-  your network, and the server then warns when no API key is set.
+  your network.  From 0.94 the server refuses to start that way without an API key; on a network you trust,
+  "allow_no_key": true in the config (or STRATA_ALLOW_NO_KEY=1) lets it run with a warning.
+- **Image URLs.** A picture given as an http(s) URL is fetched by the server, so from 0.94 a URL whose host resolves
+  to this PC or a private / link-local network address is refused (redirects are checked too);
+  STRATA_IMAGE_FETCH_PRIVATE=1 allows it.  Hugging Face telemetry is off in every launcher and download script.
 - **API key.** `"api_key"` in the run config (or `STRATA_API_KEY`) is required on `/v1/*` and on every endpoint
   that shows the model's state, requests or answers (`/status`, `/metrics`, `/settings`, `/mcp`, `/props`, `/slots`,
   `/api/requests`, `/config`) and on every `POST`. It is compared in constant time. Set one before you open the

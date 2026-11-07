@@ -2268,6 +2268,45 @@ class StrataEngine:
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
 
 
+def public_url(url: str, resolve=socket.getaddrinfo) -> None:
+    """0.94 (SSRF): an image URL a client sends is fetched by this server, so it must not point into this PC or its
+    network - a client could otherwise reach a router page, another local service or a cloud metadata address
+    (169.254.169.254) through us.  Every address the host name resolves to must be a global one; a ValueError (a 400
+    that says why) otherwise.  STRATA_IMAGE_FETCH_PRIVATE=1 lifts it (pictures served from your own network)."""
+    if os.environ.get("STRATA_IMAGE_FETCH_PRIVATE", "").strip() == "1":
+        return
+    import ipaddress
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        raise ValueError("the image URL could not be read: not a valid URL") from None
+    if parts.scheme not in ("http", "https") or not host:
+        raise ValueError("the image URL must be http(s) with a host name")
+    try:
+        infos = resolve(host, port or (443 if parts.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError) as e:
+        raise ValueError(f"the image URL could not be read: {e}") from None
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+        if not ip.is_global:
+            raise ValueError(f"the image URL points into this PC or its network ({host} is {ip}): not fetched "
+                             "(STRATA_IMAGE_FETCH_PRIVATE=1 allows it)")
+
+
+class _PublicRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect is a new URL: checked like the first one, so a public page cannot bounce the fetch inward."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_PUBLIC_OPENER = urllib.request.build_opener(_PublicRedirects)
+
+
 def network_path(path: str) -> bool:
     r"""A path to another computer: \\host\share or //host/share (either slash), \\?\UNC\host\..., \\.\UNC\host\...
     or the NT form \??\UNC\host\...  Windows connects to that host at the first look at the path (os.path.isfile is
@@ -2452,8 +2491,9 @@ class Vision:
         """An image URL's bytes, at most IMAGE_URL_MAX of them: the whole response was read, so a huge or endless one
         filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection."""
         too_big = f"the image URL's file is over {IMAGE_URL_MAX >> 20} MiB"
+        public_url(url)   # 0.94: never on a client's behalf into this PC or its network (and not after a redirect)
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
+            with _PUBLIC_OPENER.open(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
                 size = r.headers.get("Content-Length") or ""
                 if size.isdigit() and int(size) > IMAGE_URL_MAX:
                     raise ValueError(too_big)
@@ -6596,6 +6636,27 @@ def host_allowed(host, names, any_host=False) -> bool:
                            or _name_in(name, names))
 
 
+def this_pc_only(host) -> bool:
+    """True when `host` is reachable from this PC alone: localhost or a loopback address (127.0.0.0/8, ::1)."""
+    h = (host or "").strip().strip("[]").lower()
+    if h in ("localhost", ""):
+        return h == "localhost"
+    try:
+        import ipaddress
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False   # a name other than localhost may resolve anywhere
+
+
+def open_without_key(host, api_key, cfg, env) -> bool:
+    """0.94: True = refuse to start.  Listening beyond this PC (0.0.0.0, a LAN address, a host name) with no API key
+    let anyone on the network use the model and read its requests; it used to be only a warning.  "allow_no_key": true
+    in the config, or STRATA_ALLOW_NO_KEY=1, keeps the old behaviour on a network the user trusts."""
+    if api_key or this_pc_only(host):
+        return False
+    return not (cfg.get("allow_no_key") is True or str(env.get("STRATA_ALLOW_NO_KEY", "")).strip() == "1")
+
+
 def key_list(value) -> list[str]:
     """#1344: the keys a server accepts.  --api-key / STRATA_API_KEY / "api_key" take llama.cpp's form, several keys
     separated by commas ("k1,k2"; spaces around each are dropped), or a list in the config ("api_key": ["k1", "k2"],
@@ -7166,6 +7227,12 @@ def main() -> int:
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    if open_without_key(a.host, svc.api_key, cfg, os.environ):
+        print(f"[strata] refusing to listen on {a.host} without an API key: anyone on your network could use the model "
+              f"and read its requests.  Set \"api_key\" in the config (or STRATA_API_KEY), listen on 127.0.0.1, or - on "
+              f"a network you trust - set \"allow_no_key\": true in the config (or STRATA_ALLOW_NO_KEY=1).",
+              file=sys.stderr, flush=True)
+        return 2
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
