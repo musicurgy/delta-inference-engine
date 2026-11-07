@@ -59,8 +59,8 @@ def main():
             vis = f.readline().strip().lower()
     except OSError:
         vis = ""
-    vis = os.environ.get("DS41_VISION", "").strip().lower() or vis or "off"
-    if vis in ("cpu", "gpu") and not os.path.exists(os.path.join(m, "DeepSeek-V4.1-Flash-1017-Vision.gguf.ok")):
+    vis = os.environ.get("DS41_VISION", "").strip().lower() or vis or "on"     # on by default since 0.94
+    if vis not in ("off", "0", "no", "none", "false", "disable", "disabled") and not os.path.exists(os.path.join(m, "DeepSeek-V4.1-Flash-1017-Vision.gguf.ok")):
         steps.append(("pictures (0.97 GB)", VISION, VISION))
     if not old and not os.path.exists(os.path.join(m, Q2_NAME + ".ok")):
         n = max(0.0, Q2 - size(os.path.join(m, Q2_NAME)) - partial(m))
