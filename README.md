@@ -20,8 +20,8 @@ CPUs from before 2013.)
 **Beware of fakes.** Get Delta only from [github.com/musicurgy/delta-inference-engine](https://github.com/musicurgy/delta-inference-engine).
 It downloads models only from the Hugging Face repositories written into its own scripts (the model ones are named in
 this README and in `Choose Model.bat`), and its engine only from this repository's Releases page.  It is free and never
-asks for payment, a login or an account.  A "Qwen 4" download, or a DeepSeek download that wants payment or a login,
-is not from this project.
+asks for payment, a login or an account.  A download that wants payment or a login, or a model this README does not
+name, is not from this project.
 
 1. Get this folder (**Code > Download ZIP**, or
    `git clone -c core.longpaths=true https://github.com/musicurgy/delta-inference-engine C:\AI\Delta`) somewhere with
@@ -302,9 +302,10 @@ Every model is in the tables under "Other quants".
   89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with the refresh).  The test moves
   by about 0.2 points between identical runs.
 - On agentic, tool-calling text (53 transcripts with tools, tool calls and tool results, 46K tokens) the bias costs the
-  same as on prose: on ds4 Q2 exact routing agrees with DeepSeek's own model on 96.05% of next tokens, bias 0.28 on
-  95.10%; inside the tool-call JSON itself the cost is 0.4 points, in the prose between calls 2.9.  There is no
-  collapse at this setting (reports of collapse come from a bias of 1.0, which this launcher does not use).
+  same as on prose: on the default model (UD-IQ2_XXS) exact routing agrees with DeepSeek's own model on 96.48% of next
+  tokens, bias 0.28 on 95.93% (one run each, about 0.15 points between identical runs).  The tool-call syntax itself
+  costs nothing; the cost is in the argument values and the prose around the calls.  There is no collapse at this
+  setting (reports of collapse come from a bias of 1.0, which this launcher does not use).
 - `--kv-fp4` (the compressed KV cache, on by default) is exact: the logits are bit-identical with and without it.
 - For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`, or
   per request with `"strata_tune": {"route_bias": 0, "route_bias_file": 0}` - about 25% slower.
