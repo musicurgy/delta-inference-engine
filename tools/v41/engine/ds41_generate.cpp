@@ -2066,9 +2066,9 @@ int main(int argc, char ** argv) {
             bool bias_changed = false;
             // 0.94 phase-aware route bias (opt-in, STRATA_ANSWER_ROUTE_BIAS=<f>, STRATA_ANSWER_ROUTE_BIAS_FILE=<f>, default the
             // same): the request's bias while the model thinks, this one from </think> on (the answer and its tool calls).
-            // The bias flips the trunk's top-1 on ~6% of tokens and each flip ends a draft pass (rounds 247/248: 2.08 vs
-            // 2.25 tokens/pass), so the answer gains exactness and acceptance; the thinking is unchanged.  A prompt that
-            // already ends its thinking (thinking off) starts in the answer phase.
+            // A lower answer bias buys quality where the user reads it and costs answer speed (cheaper verify passes are
+            // all the bias buys; separate-server runs show it does not change drafter acceptance).  The thinking is
+            // unchanged.  A prompt that already ends its thinking (thinking off) starts in the answer phase.
             static const float ans_rb = std::getenv("STRATA_ANSWER_ROUTE_BIAS") ? std::max(0.0f, (float) std::atof(std::getenv("STRATA_ANSWER_ROUTE_BIAS"))) : -1.0f;
             static const float ans_rbf = std::getenv("STRATA_ANSWER_ROUTE_BIAS_FILE") ? std::max(0.0f, (float) std::atof(std::getenv("STRATA_ANSWER_ROUTE_BIAS_FILE"))) : ans_rb;
             static const int think_beg_id = std::getenv("STRATA_THINK_BEGIN_ID") ? std::atoi(std::getenv("STRATA_THINK_BEGIN_ID")) : 128821;
