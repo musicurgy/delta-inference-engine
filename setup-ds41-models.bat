@@ -24,6 +24,9 @@ rem before the space check counts them
 if /i "%~1"=="pictures" (
   if "%~2"=="" (>"%~dp0vision-choice.txt" echo on) else (>"%~dp0vision-choice.txt" echo %~2)
 )
+rem "setup-ds41-models.bat drafter-imx": an install that has 0.93's drafter downloads the drafter's shards again (7.9 GB)
+rem to make 0.94's slightly better one (step 4); without it that is done only when the full-size drafter is still here
+if /i "%~1"=="drafter-imx" set "DS41_DRAFTER_IMX=1"
 rem "setup-ds41-models.bat voice cpu|gpu": dictation and read-aloud on (step 6)
 if /i "%~1"=="voice" (
   if /i "%~2"=="gpu" (>"%~dp0voice-choice.txt" echo gpu) else (>"%~dp0voice-choice.txt" echo cpu)
@@ -72,8 +75,10 @@ rem    VRAM first-start sets DS41_NO_DRAFTER).
 rem    0.94: the experts are shrunk with the drafter's own importance matrix (drafter-imatrix.bin, beside the engine's
 rem    v41_sidecar_requant.exe, or tools\v41\serve\ in a source checkout) into a NEW file, V41-1017-MTP-iq2xxs-imx.gguf
 rem    (+0.6% drafts accepted, +1.2% on prose thinking, same size).  An install from 0.93 has only the old uniform file,
-rem    V41-1017-MTP-iq2xxs.gguf: the new one is made once (the shards are downloaded again: the full-size drafter was
-rem    deleted after 0.93's requant), and the launcher uses whichever is there, the new one first.
+rem    V41-1017-MTP-iq2xxs.gguf, and usually no full-size drafter (0.93 deleted it after its requant): it keeps the old
+rem    one - 7.9 GB of download is a poor trade for ~0.3% speed - unless the full-size drafter is still here (then the new
+rem    one is made from it, no download) or "setup-ds41-models.bat drafter-imx" / DS41_DRAFTER_IMX=1 asks for it.  The
+rem    launcher uses whichever is there, the new one first.
 if defined DS41_NO_DRAFTER goto main
 if exist "%M%\V41-1017-MTP-iq2xxs-imx.gguf" goto drafter_done
 rem the engine build this CPU runs (cpu_level.py: this PC's own build, else the portable or an older-CPU one)
@@ -89,7 +94,10 @@ if defined IMX if exist "%REQ%" "%REQ%" --imatrix probe 2>&1 | findstr /c:"unkno
 rem no importance matrix (an engine from before 0.94, no source copy) and the uniform drafter is there: keep it as it is
 if not defined IMX if exist "%M%\V41-1017-MTP-iq2xxs.gguf" goto main
 if exist "%M%\V41-1017-MTP.gguf" goto requant
-if exist "%M%\V41-1017-MTP-iq2xxs.gguf" echo Making the 0.94 drafter once: the drafter's 7.9 GB of official shards are downloaded again ^(the old drafter keeps working until it is done^).
+rem 0.93's drafter is there, the full-size one is not: no download unless asked (drafter-imx / DS41_DRAFTER_IMX=1)
+if exist "%M%\V41-1017-MTP-iq2xxs.gguf" if not "%DS41_DRAFTER_IMX%"=="1" echo Drafter: 0.93's.  A slightly better one ^(+0.6%% drafts accepted^) is optional: setup-ds41-models.bat drafter-imx ^(downloads 7.9 GB once^).
+if exist "%M%\V41-1017-MTP-iq2xxs.gguf" if not "%DS41_DRAFTER_IMX%"=="1" goto main
+if exist "%M%\V41-1017-MTP-iq2xxs.gguf" echo Making the 0.94 drafter: the drafter's 7.9 GB of official shards are downloaded again ^(the old drafter keeps working until it is done^).
 "%PY%" tools\v41\serve\hf_get.py %DS% model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors --local-dir "%D%" || exit /b 1
 "%PY%" tools\v41\hf_verify.py --repo %DS% --dir "%D%" model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors || exit /b 1
 set "V41_SRC=%D%"

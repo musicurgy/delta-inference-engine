@@ -7,7 +7,7 @@ progress counts as far as it got) is compared with the drive's free space.  Exit
 not - so the setup stops before a download fills the drive (the Hugging Face downloader only warns).
 DS41_SKIP_SPACE_CHECK=1 skips the check.
 
-    setup_space.py --drafter-plan MODEL_FOLDER   prints what the drafter step will do: none / make / upgrade
+    setup_space.py --drafter-plan MODEL_FOLDER   prints what the drafter step will do: none / make / upgrade / opt-in
                                                  (first-start.bat asks; setup-ds41-models.bat follows the same rules)"""
 import glob
 import os
@@ -64,14 +64,20 @@ def imatrix_usable():
 
 
 def drafter_plan(m):
-    """none (not used here, or 0.94's is there, or 0.93's is there and this engine cannot make the new one) / make (no
-    drafter yet) / upgrade (0.93's is there: 0.94's is made once, the shards downloaded again)"""
+    """none (not used here, 0.94's is there, or 0.93's is there and this engine cannot make the new one) / make (no
+    drafter yet) / upgrade (0.93's is there and 0.94's is made now: from the full-size drafter still on disk, or - asked
+    for with setup-ds41-models.bat drafter-imx / DS41_DRAFTER_IMX=1 - after downloading its 7.9 GB of shards again) /
+    opt-in (0.93's is there and kept: the 7.9 GB download for ~0.3% speed is the user's call)"""
     if os.environ.get("DS41_NO_DRAFTER") == "1" or os.path.exists(os.path.join(m, IMX_NAME)):
         return "none"
     has_uniform = os.path.exists(os.path.join(m, UNIFORM_NAME))
+    if not has_uniform:
+        return "make"
     if not imatrix_usable():
-        return "none" if has_uniform else "make"
-    return "upgrade" if has_uniform else "make"
+        return "none"
+    if os.path.exists(os.path.join(m, SOURCE_NAME)) or os.environ.get("DS41_DRAFTER_IMX") == "1":
+        return "upgrade"
+    return "opt-in"
 
 
 def main():
@@ -94,7 +100,7 @@ def main():
     if pick and os.path.exists(pick if os.path.isabs(pick) else os.path.join(m, pick)):
         old = True
     # the drafter first (setup-ds41-models.bat builds it before the main model's download); none under 14 GB of VRAM
-    if drafter_plan(m) != "none":
+    if drafter_plan(m) in ("make", "upgrade"):   # "opt-in": nothing is done unless asked
         if os.path.exists(os.path.join(m, SOURCE_NAME)):
             steps.append(("drafter", DRAFTER, DRAFTER - SIDECAR))
         else:

@@ -180,13 +180,14 @@ set "DS41_NO_DRAFTER="
 if defined VRAM_MIB if %VRAMN% LSS 14000 set "DS41_NO_DRAFTER=1"
 set "NEEDDRAFT="
 rem setup_space.py --drafter-plan (setup-ds41-models.bat's own rules): make = none yet; upgrade = 0.93's uniform drafter
-rem is there and this engine can make 0.94's (drafter-imatrix.bin), once; none = nothing to do
+rem is there and 0.94's is made now (from the full-size drafter still here, or asked for: DS41_DRAFTER_IMX=1); opt-in /
+rem none = nothing to do here (the launcher says how to get 0.94's drafter)
 set "DPLAN=none"
 if not defined DS41_NO_DRAFTER for /f "usebackq" %%p in (`".venv\Scripts\python.exe" tools\v41\setup_space.py --drafter-plan "%M%"`) do set "DPLAN=%%p"
 if /i "%DPLAN%"=="make" set "NEEDDRAFT=1"
 if /i "%DPLAN%"=="make" echo   missing: the speculative-decoding drafter ^(downloads 7.9 GB, keeps 4.2 GB^)
 if /i "%DPLAN%"=="upgrade" set "NEEDDRAFT=1"
-if /i "%DPLAN%"=="upgrade" echo   update: the 0.94 drafter, a little faster ^(downloads 7.9 GB once, keeps 4.2 GB; the old one works until then^)
+if /i "%DPLAN%"=="upgrade" echo   update: the 0.94 drafter, a little faster ^(keeps 4.2 GB; the old one works until then^)
 rem pictures (on since 0.94) unless vision-choice.txt / DS41_VISION says off: the vision GGUF (0.97 GB) and PyTorch -
 rem its CPU build (124 MB), or its CUDA build (2.0 GB) when pictures go to a card (the second card with multi-GPU on).
 rem ds41_local.py --vision-setup: "<plan: off / cpu / cuda> <the PyTorch there is: none / cpu / cuda>"

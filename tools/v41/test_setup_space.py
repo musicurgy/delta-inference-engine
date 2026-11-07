@@ -1,6 +1,7 @@
 """tools/v41/test_setup_space.py - the drafter plan setup_space.py gives first-start.bat (and its space check), which must
-follow setup-ds41-models.bat's rules: 0.94's imatrix drafter first, 0.93's uniform one kept when this engine cannot
-make the new one, never a loop of downloads.
+follow setup-ds41-models.bat's rules: 0.94's imatrix drafter first; from 0.93's, the new one is made only for free
+(the full-size drafter still on disk) or when asked (drafter-imx / DS41_DRAFTER_IMX=1), else "opt-in"; 0.93's kept when
+this engine cannot make the new one, never a loop of downloads.
 
     python -m unittest tools/v41/test_setup_space.py
 """
@@ -18,7 +19,7 @@ class DrafterPlan(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.TemporaryDirectory()
         self.m = self.d.name
-        self.env = mock.patch.dict(os.environ, {"DS41_NO_DRAFTER": ""})
+        self.env = mock.patch.dict(os.environ, {"DS41_NO_DRAFTER": "", "DS41_DRAFTER_IMX": ""})
         self.env.start()
 
     def tearDown(self):
@@ -42,13 +43,26 @@ class DrafterPlan(unittest.TestCase):
         self.touch(S.UNIFORM_NAME)
         self.assertEqual(self.plan(True), "none")
 
-    def test_093_install_upgrades_once(self):
+    def test_093_install_without_source_is_opt_in(self):
         self.touch(S.UNIFORM_NAME)
-        self.assertEqual(self.plan(True), "upgrade")
+        self.assertEqual(self.plan(True), "opt-in")     # no 7.9 GB download unasked
+
+    def test_093_install_with_source_upgrades_free(self):
+        self.touch(S.UNIFORM_NAME)
+        self.touch(S.SOURCE_NAME)
+        self.assertEqual(self.plan(True), "upgrade")    # made from the full-size drafter on disk, no download
+
+    def test_093_install_asked_for_it_upgrades(self):
+        self.touch(S.UNIFORM_NAME)
+        with mock.patch.dict(os.environ, {"DS41_DRAFTER_IMX": "1"}):
+            self.assertEqual(self.plan(True), "upgrade")
 
     def test_093_install_old_engine_keeps_uniform(self):
         self.touch(S.UNIFORM_NAME)
+        self.touch(S.SOURCE_NAME)
         self.assertEqual(self.plan(False), "none")      # no download loop when the engine cannot use the matrix
+        with mock.patch.dict(os.environ, {"DS41_DRAFTER_IMX": "1"}):
+            self.assertEqual(self.plan(False), "none")
 
     def test_no_drafter_under_14_gb(self):
         with mock.patch.dict(os.environ, {"DS41_NO_DRAFTER": "1"}):
