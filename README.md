@@ -23,7 +23,7 @@ CPUs from before 2013.)
    ~320 GB free on a fast NVMe drive for the default model (its speed matters - see below).
 2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
    asks before anything big:
-   - Python and its packages (no Python 3.10-3.12 on the PC: it offers to install python.org's Python 3.11 with
+   - Python and its packages (no Python 3.10-3.14 on the PC: it offers to install python.org's Python 3.11 with
      Windows' own winget, for your Windows user only),
    - the engine: the prebuilt one for your CPU from the
      [Releases page](https://github.com/musicurgy/delta-inference-engine/releases) (under 1 GB, no compiler needed) - or it builds
@@ -310,7 +310,7 @@ bias are bit-identical to the default file's (GSQ-RCO only changes the routed ex
   tok/s) and writes 6-9% faster.  With 128 GB of RAM, more experts come from the SSD, so it matters more.  Use a PCIe
   4.0 or 5.0 NVMe with room to spare (a nearly full SSD slows down) - not a SATA SSD, a hard disk or a USB drive.
   The model files take 233-395 GB: about 320 GB free for the default, UD-IQ2_XXS (a GSQ build adds its 125-159 GB).
-- Python 3.10, 3.11 or 3.12 (3.11 recommended) - `Start DeepSeek.bat` offers to install it.
+- Python 3.10 to 3.14 (3.11 recommended) - `Start DeepSeek.bat` offers to install it.
 - To build (not needed with the prebuilt engine from the Releases page):
   - Visual Studio 2019 or 2022 (Build Tools are enough) with "Desktop development with C++";
   - the CUDA Toolkit 13.0;
