@@ -454,16 +454,11 @@ def text_format(req: dict):
 
 
 def check_request(req: dict) -> None:
-    """What this stateless server cannot do, refused before anything runs."""
-    if req.get("previous_response_id"):
-        raise ResponsesError("this server keeps no responses (stateless): send the whole conversation in input "
-                             "instead of previous_response_id", "previous_response_id", "unsupported_parameter")
+    """What this server cannot do, refused before anything runs.  0.94: previous_response_id and background are
+    handled before this (server.py _responses_state, serve/response_store.py)."""
     if req.get("conversation"):
         raise ResponsesError("this server keeps no conversations (stateless): send the whole conversation in input",
                              "conversation", "unsupported_parameter")
-    if req.get("background"):
-        raise ResponsesError("background responses are not supported: use stream or wait for the answer",
-                             "background", "unsupported_parameter")
     if req.get("prompt"):
         raise ResponsesError("stored prompt templates are not supported: send instructions and input",
                              "prompt", "unsupported_parameter")

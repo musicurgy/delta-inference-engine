@@ -226,15 +226,14 @@ class Http(unittest.TestCase):
             time.sleep(0.02)
         time.sleep(0.2)                               # decoding by now
         t0 = time.monotonic()
-        self.engine.delay = 0.0
-        s, b = self.post(MAIN)
+        s, b = self.post(dict(MAIN, max_tokens=5))      # 5 tokens: ~0.25 s once it has the turn
         t.join(30)
         self.assertEqual(s, 200, b)
-        self.assertLess(time.monotonic() - t0, 3.0)   # did not wait for the whole suggestion
+        self.assertLess(time.monotonic() - t0, 3.0)   # did not wait for the whole suggestion (~4 s)
         s2, b2 = out["s"]
         self.assertEqual(s2, 200, b2)
         self.assertLess(b2["usage"]["output_tokens"], 80)   # stopped part-way
-        self.assertEqual(b["usage"]["output_tokens"], len(self.engine.script))   # the main reply is whole
+        self.assertEqual(b["usage"]["output_tokens"], 5)
 
 
 if __name__ == "__main__":

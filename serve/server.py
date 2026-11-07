@@ -75,6 +75,9 @@ from serve import server_tools as server_tools_api  # noqa: E402
 from serve import toolsearch  # noqa: E402,F401  (registers the tool search server tools)
 from serve import websearch  # noqa: E402  (registers web search / fetch; off until "web_tools" configures them)
 from serve import embeddings as embeddings_api  # noqa: E402  (0.94: /v1/embeddings, /v1/rerank sidecars)
+from serve import response_store as store_api  # noqa: E402  (0.94: stored Responses, from Project Maya)
+from serve.response_store import ResponseStore, StoreBusy  # noqa: E402
+from serve.response_jobs import BackgroundJobs, JobError  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -3266,6 +3269,12 @@ class Service:
         self.main_first = MainFirst()
         self.server_tool_rounds = 8                      # 0.94: server tool rounds (tool search, web) in one answer
         self.sidecars: dict = {}                         # 0.94: "embeddings" / "rerank" (serve/embeddings.py), lazy
+        # 0.94: stored and background Responses (in memory, bounded; STRATA_RESPONSES_* limits).  Kept only when a
+        # request sends "store": true, unless the config's "responses_store_default": true follows OpenAI's default
+        self.response_limits = store_api.limits_from_env()
+        self.responses = ResponseStore.from_limits(self.response_limits)
+        self.response_jobs = BackgroundJobs(self.responses, self.response_limits)
+        self.responses_store_default = False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -4385,9 +4394,12 @@ class Service:
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
             self.status["queued"] += 1
-        # 0.94 (serve/helpers.py): a prompt suggestion yields the turn to the main conversation
-        order = self.main_first if self.helper_calls and not par else None
-        place = order.enter(cancel, bool((sampling or {}).get("strata_preemptible"))) if order else None
+        # 0.94 (serve/helpers.py): a prompt suggestion yields the turn to the main conversation, and so does a
+        # background response (which is not stopped for it)
+        order = self.main_first if not par else None
+        low = (sampling or {}).get("strata_background") is True
+        place = order.enter(cancel, bool((sampling or {}).get("strata_preemptible")) or low,
+                            stoppable=not low) if order else None
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
@@ -5664,6 +5676,10 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, SETUP.get())
                 return
+            if path.startswith("/v1/responses/"):            # 0.94: a stored or background response
+                if self._authorized():
+                    self._response_resource()
+                return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():
@@ -5822,9 +5838,8 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
-                if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
-                    self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
-                                                         "whole conversation to POST /v1/responses", code="not_found"))
+                if path.startswith("/v1/responses/"):        # 0.94: cancel a background response
+                    self._response_cancel(path)
                     return
                 if path in ("/v1/load", "/v1/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
@@ -6306,7 +6321,13 @@ def make_handler(svc: Service):
 
         def _responses(self, req):
             """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
-            Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
+            Errors use the Responses format; once the stream has started they arrive as a response.failed event.
+            0.94: `store`, `previous_response_id` and `background` (serve/response_store.py, response_jobs.py)."""
+            owner = self._response_owner()
+            try:
+                req, history = self._responses_state(req, owner)
+            except ResponsesError as e:
+                return self._json(e.status, e.body())
             try:
                 title = (responses_api.thread_title_events(req, svc.model_for(req))
                          if svc.codex_thread_titles else None)
@@ -6314,6 +6335,8 @@ def make_handler(svc: Service):
                 return self._json(e.status, e.body())
             if title is not None:
                 return self._responses_ready(req, title)
+            if req.get("background"):
+                return self._responses_background(req, owner, history)
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
@@ -6327,37 +6350,12 @@ def make_handler(svc: Service):
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
-
-            def check(text, finish):
-                return validated_json(text, validator, finish)
-
-            server_run = getattr(self, "server_run", None)
-
-            def events():
-                yield from asm.start()
-                done = None
-                if server_run:                               # 0.94: the hosted web_search runs here
-                    runner, messages, shown, kw = server_run
-                    source = run_with_mcp(svc, runner, messages, shown, kw, ids, thinking, max_new,
-                                          req.get("max_output_tokens") or 0, req, cancel, runner.names())
-                else:
-                    source = svc.run(ids, thinking, tools, max_new, req, cancel)
-                queries = {}
-                for kind, x in source:
-                    if kind == "ping":
-                        yield None
-                    elif kind == "event":
-                        yield from asm.feed(x)
-                    elif kind == "mcp":
-                        if x["event"] == "call":
-                            queries[x["id"]] = (x.get("arguments") or {}).get("query")
-                        elif x["event"] == "result" and not x.get("skipped"):
-                            yield from asm.web_search_call(queries.get(x["id"]), x.get("text") or "")
-                    elif kind == "done":
-                        done = x
-                if done is not None and done["finish"] != "cancel" and not cancel.is_set():
-                    yield from asm.finish(done, check)
-            items = self._capture(events(), "responses")
+            self._responses_stored(asm, req, history)
+            items = self._responses_events(ids, thinking, tools, max_new, asm, validator, req, cancel,
+                                           getattr(self, "server_run", None))
+            if history is not None:
+                items = self._responses_keep(items, owner, history)
+            items = self._capture(items, "responses")
             if not req.get("stream"):
                 try:
                     result = responses_api.collect(items)
@@ -6403,6 +6401,226 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
+
+        # ---- 0.94: stored and background responses (serve/response_store.py, serve/response_jobs.py; Maya's, MIT)
+        def _response_owner(self):
+            """Stored responses belong to the API key that made them (its hash); without a key, to everyone here."""
+            if not svc.api_key:
+                return "public"
+            auth = self.headers.get("Authorization", "")
+            given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+            return hashlib.sha256(given.encode()).hexdigest()
+
+        def _response_lookup(self, owner, response_id):
+            try:
+                return svc.response_jobs.get(owner, response_id)
+            except KeyError:
+                return svc.responses.get(owner, response_id)
+
+        def _responses_state(self, req, owner):
+            """-> (the request with previous_response_id's conversation put in front of its input, the input items
+            to keep when it is stored - None when it is not)."""
+            store = req.get("store") if isinstance(req.get("store"), bool) else svc.responses_store_default
+            if req.get("background") not in (None, False, True):
+                raise ResponsesError("background must be true or false", "background")
+            if req.get("background") and not store:
+                raise ResponsesError("a background response is kept until it is read: send \"store\": true",
+                                     "background")
+            prev = req.get("previous_response_id")
+            if prev is not None:
+                if not isinstance(prev, str) or not prev:
+                    raise ResponsesError("previous_response_id must be a response id", "previous_response_id")
+                try:
+                    stored = self._response_lookup(owner, prev)
+                except KeyError:
+                    raise ResponsesError(f"no stored response {prev!r}: responses are kept only when sent with "
+                                         "\"store\": true, in memory, for an hour", "previous_response_id",
+                                         "previous_response_not_found") from None
+                except StoreBusy as e:
+                    raise ResponsesError(str(e), "previous_response_id", "server_error", status=503) from None
+                if stored["response"].get("status") not in ("completed", "incomplete"):
+                    raise ResponsesError("the previous response has not finished", "previous_response_id",
+                                         status=409)
+                added = req.get("input", [])
+                if isinstance(added, str):
+                    added = [{"type": "message", "role": "user", "content": added}]
+                if not isinstance(added, list):
+                    raise ResponsesError("input must be a string or an array of input items", "input")
+                req = {**req, "input": stored["input"] + stored["response"]["output"] + added}
+                req.pop("previous_response_id")
+                req["_previous_response_id"] = prev
+            if not store:
+                return req, None
+            try:
+                return req, store_api.input_items(req.get("input") if req.get("input") is not None else [])
+            except ValueError as e:
+                raise ResponsesError(str(e), "input") from None
+
+        def _responses_stored(self, asm, req, history):
+            asm.response["previous_response_id"] = req.get("_previous_response_id")
+            asm.response["store"] = history is not None
+            asm.response["background"] = bool(req.get("background"))
+
+        def _responses_events(self, ids, thinking, tools, max_new, asm, validator, req, cancel, server_run):
+            """The response's events (None for a keep-alive), from the engine's (or, with a server tool, from
+            run_with_mcp's)."""
+            def check(text, finish):
+                return validated_json(text, validator, finish)
+
+            yield from asm.start()
+            done = None
+            if server_run:                               # 0.94: the hosted web_search runs here
+                runner, messages, shown, kw = server_run
+                source = run_with_mcp(svc, runner, messages, shown, kw, ids, thinking, max_new,
+                                      req.get("max_output_tokens") or 0, req, cancel, runner.names())
+            else:
+                source = svc.run(ids, thinking, tools, max_new, req, cancel)
+            queries = {}
+            for kind, x in source:
+                if kind == "ping":
+                    yield None
+                elif kind == "event":
+                    yield from asm.feed(x)
+                elif kind == "mcp":
+                    if x["event"] == "call":
+                        queries[x["id"]] = (x.get("arguments") or {}).get("query")
+                    elif x["event"] == "result" and not x.get("skipped"):
+                        yield from asm.web_search_call(queries.get(x["id"]), x.get("text") or "")
+                elif kind == "done":
+                    done = x
+            if done is not None and done["finish"] != "cancel" and not cancel.is_set():
+                yield from asm.finish(done, check)
+
+        def _responses_keep(self, items, owner, history):
+            """The events as they are; a finished response is stored on its way out."""
+            try:
+                for e in items:
+                    if e is not None and e.get("type") in ("response.completed", "response.incomplete"):
+                        try:
+                            svc.responses.put(owner, e["response"], history)
+                        except ValueError as err:            # too big for the store: answered, not kept
+                            e["response"]["store"] = False
+                            print(f"[strata] /v1/responses: not stored ({err})", flush=True)
+                    yield e
+            finally:
+                items.close()
+
+        def _responses_background(self, req, owner, history):
+            """background: true - queued, answered at once with the queued response; it runs at a priority below
+            requests that wait for their answer (serve/helpers.MainFirst) and is read with GET /v1/responses/{id}."""
+            initial = responses_api.Assembler(req, svc.model_for(req), 0, {}, False).response
+            initial.update(status="queued", background=True, store=True,
+                           previous_response_id=req.get("_previous_response_id"))
+            handler = self
+
+            def work(cancel, rid):
+                job_req = {**req, "strata_background": True, "stream": False}
+                ids, thinking, tools, max_new, asm, validator, job_req = handler._responses_prepare(job_req, cancel)
+                asm.response.update(id=rid, created_at=initial["created_at"])
+                handler._responses_stored(asm, req, history)
+                for e in handler._responses_events(ids, thinking, tools, max_new, asm, validator, job_req, cancel,
+                                                   getattr(handler, "server_run", None)):
+                    if e is not None:
+                        yield e["type"], e
+            try:
+                out = svc.response_jobs.submit(owner, initial, history, work)
+            except JobError as e:
+                return self._json(e.status, responses_error_body(str(e), "server_error", code="server_error"))
+            if req.get("stream"):
+                return self._background_stream(owner, out["id"])
+            return self._json(200, out)
+
+        def _background_stream(self, owner, response_id, after=-1):
+            try:
+                svc.response_jobs.check_cursor(owner, response_id, after)
+            except KeyError:
+                return self._json(409, responses_error_body("this response's events are no longer kept; retrieve it "
+                                                            "without stream", "invalid_request_error"))
+            except JobError as e:
+                return self._json(e.status, responses_error_body(str(e), "invalid_request_error"))
+            with svc.response_jobs.reader(owner, response_id, after) as events:
+                self._sse()
+                try:
+                    for item in events:
+                        if item is None:
+                            self.wfile.write(b": keep-alive\n\n")
+                        else:
+                            name, payload = item
+                            after = payload["sequence_number"]
+                            self.wfile.write(f"event: {name}\n".encode() + b"data: " +
+                                             json.dumps(payload, ensure_ascii=False).encode() + b"\n\n")
+                        self.wfile.flush()
+                except (JobError, KeyError) as exc:
+                    payload = {"type": "error", "code": "event_history_unavailable", "param": None,
+                               "message": str(exc), "sequence_number": after + 1}
+                    try:
+                        self.wfile.write(b"event: error\ndata: " + json.dumps(payload).encode() + b"\n\n")
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+
+        def _response_resource(self, delete=False):
+            """GET /v1/responses/{id} (?stream=true&starting_after=N for a background one), GET .../input_items,
+            DELETE /v1/responses/{id}."""
+            parts = self.path.split("?")[0].rstrip("/")[len("/v1/responses/"):].split("/")
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if len(parts) > 2 or not parts[0] or (len(parts) == 2 and (parts[1] != "input_items" or delete)):
+                return self._json(404, responses_error_body("not found", code="not_found"))
+            owner = self._response_owner()
+            try:
+                if delete:
+                    removed = False
+                    for store in (svc.response_jobs, svc.responses):
+                        try:
+                            store.delete(owner, parts[0])
+                            removed = True
+                        except KeyError:
+                            pass
+                    if not removed:
+                        raise KeyError(parts[0])
+                    return self._json(200, {"id": parts[0], "object": "response.deleted", "deleted": True})
+                stored = self._response_lookup(owner, parts[0])
+                if len(parts) == 1 and query.get("stream") == ["true"]:
+                    if set(query) - {"stream", "starting_after", "include"}:
+                        raise ValueError("retrieve accepts stream=true and starting_after")
+                    after = int(query["starting_after"][0]) if "starting_after" in query else -1
+                    if after < -1:
+                        raise ValueError("starting_after must be 0 or more")
+                    return self._background_stream(owner, parts[0], after)
+                self._json(200, store_api.input_page(stored["input"] or [], query) if len(parts) == 2
+                           else stored["response"])
+            except KeyError:
+                self._json(404, responses_error_body(f"no stored response {parts[0]!r}", code="not_found"))
+            except (JobError, StoreBusy) as e:
+                self._json(getattr(e, "status", 503), responses_error_body(str(e), "server_error"))
+            except ValueError as e:
+                self._json(400, responses_error_body(str(e)))
+
+        def _response_cancel(self, path):
+            parts = path[len("/v1/responses/"):].split("/")
+            if len(parts) != 2 or parts[1] != "cancel":
+                return self._json(404, responses_error_body("not found", code="not_found"))
+            owner = self._response_owner()
+            try:
+                out = svc.response_jobs.cancel(owner, parts[0])
+            except KeyError:
+                try:
+                    out = svc.responses.get(owner, parts[0])["response"]
+                except KeyError:
+                    return self._json(404, responses_error_body(f"no background response {parts[0]!r}",
+                                                                code="not_found"))
+                if not out.get("background"):
+                    return self._json(400, responses_error_body("only a background response can be cancelled"))
+            self._json(200, out)
+
+        def do_DELETE(self):
+            if not self._authorized() or self._foreign_page():
+                return
+            if self.path.split("?")[0].startswith("/v1/responses/"):
+                self._response_resource(delete=True)
+            else:
+                self._json(404, {"error": {"message": "not found"}})
 
         def _responses_failed(self, asm, message, code, send):
             e = asm.failed(message, code)
@@ -7432,6 +7650,10 @@ def main() -> int:
     if not isinstance(hc, bool):
         raise SystemExit(f"[strata] config \"claude_code_helpers\" must be true or false, not {hc!r}")
     svc.helper_calls = hc
+    rsd = cfg.get("responses_store_default", False)     # 0.94: store a response that does not say (OpenAI's default)
+    if not isinstance(rsd, bool):
+        raise SystemExit(f"[strata] config \"responses_store_default\" must be true or false, not {rsd!r}")
+    svc.responses_store_default = rsd
     ts = cfg.get("tool_search", "on")                   # 0.94: serve/toolsearch.py ("off": deferred tools listed as before)
     if ts not in ("on", "off"):
         raise SystemExit(f"[strata] config \"tool_search\" must be \"on\" or \"off\", not {ts!r}")
@@ -7562,6 +7784,7 @@ def main() -> int:
         # (and holding ~1.4 GiB of VRAM) after the server that started it was gone
         closers += [v.stop for v in svc.voice_servers.values()]
         closers += [s.stop for s in svc.sidecars.values()]          # 0.94: the embeddings / rerank servers
+        closers.append(lambda: svc.response_jobs.close(timeout=2))  # 0.94: background responses are cancelled
         for close in filter(None, closers):
             try:
                 close()

@@ -694,7 +694,8 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | --- | --- |
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
-| OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
+| OpenAI Responses (stream and non-stream, tools, stored and background responses, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses`, `GET` / `DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` |
+| Embeddings and rerank with small models (off by default, [below](#embeddings-and-rerank-v1embeddings-v1rerank-off-by-default-094)) | `POST /v1/embeddings`, `POST /v1/rerank` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (busy or idle, with `n_prompt_tokens`; one entry per slot with `--batch`) |
@@ -1307,9 +1308,16 @@ without penalties, so more of its guesses are now rejected. Requests without pen
 speaks Chat Completions). It runs on the same path as `/v1/chat/completions`, so the thinking levels, the thinking
 budget, the conversation cache and the same API key, Host and Origin checks apply.
 
-It is **stateless**: nothing is stored, so the client sends the whole conversation in `input` every time (Codex does,
-with `store: false`). `previous_response_id`, `conversation`, `background` and the retrieve/delete/cancel endpoints
-are refused with an error that says so.
+Codex sends the whole conversation in `input` every time (with `store: false`), and nothing is kept. Since 0.94 a
+request with `"store": true` is kept in memory (up to 128 responses or 64 MB, for an hour; only the API key that
+made it can read it), so the OpenAI SDKs' `previous_response_id`, `GET` / `DELETE /v1/responses/{id}` and
+`GET /v1/responses/{id}/input_items` work. `"background": true` (with `"store": true`) answers at once with a queued
+response; it runs after the requests that wait for their answer, is read with `GET /v1/responses/{id}` (add
+`?stream=true`, and `&starting_after=N`, to replay its events) and stopped with `POST /v1/responses/{id}/cancel`. A
+request without `store` is not kept; `"responses_store_default": true` in `strata-<model>.json` keeps it, as
+OpenAI's API does. `conversation` is still refused. The limits are environment variables `STRATA_RESPONSES_*`
+(`CACHE_ENTRIES`, `CACHE_BYTES`, `CACHE_TTL_S`, `JOB_ENTRIES`, `JOB_TIMEOUT_S`, ...; serve/response_store.py). The
+store and the background jobs come from Project Maya (MIT).
 
 | Request | What Strata does |
 | --- | --- |

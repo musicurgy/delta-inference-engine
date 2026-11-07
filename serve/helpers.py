@@ -134,8 +134,10 @@ class MainFirst:
         self.entries: dict[int, dict] = {}       # id -> {"cancel", "state": queued|reading|decoding, "stop"}
         self.preempted = 0                       # how many were stopped (GET /metrics could show it)
 
-    def enter(self, cancel: threading.Event, preemptible: bool) -> dict:
-        e = {"cancel": cancel, "state": "queued", "stop": False, "pre": preemptible}
+    def enter(self, cancel: threading.Event, preemptible: bool, stoppable: bool = True) -> dict:
+        """`preemptible`: the request waits while a main request waits; `stoppable` (a prompt suggestion): a main
+        request also stops it.  A background response is preemptible but not stoppable."""
+        e = {"cancel": cancel, "state": "queued", "stop": False, "pre": preemptible, "stoppable": stoppable}
         with self.lock:
             if preemptible:
                 self.entries[id(e)] = e
@@ -147,7 +149,7 @@ class MainFirst:
         return e
 
     def _stop(self, e: dict) -> None:
-        if e["stop"]:
+        if e["stop"] or not e["stoppable"]:
             return
         e["stop"] = True
         self.preempted += 1
