@@ -293,6 +293,9 @@ def expand(cfg):
         out["vision"] = vision
         if "--vision" not in a:   # here, not by the server: it would add --vram-reserve-mib, which this engine refuses
             a.append("--vision")
+    voice = voice_section(m, out.get("gpu"), bool(plan))
+    if voice:
+        out["voice"] = voice
     return out
 
 
@@ -371,6 +374,90 @@ def vision_section(m):
     return v
 
 
+# Voice (off by default): dictation and read-aloud, serve/speech.py run by sherpa-onnx, started on first use and stopped
+# after VOICE_IDLE_S idle.  Enable Voice.bat (setup-ds41-models.bat voice cpu|gpu) downloads the models into
+# <models>/speech and writes voice-choice.txt.
+VOICE_ASR = "parakeet-tdt-0.6b-v3-int8"     # csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8 (CC-BY-4.0), 671 MB
+VOICE_TTS = "kokoro-multi-lang-v1_0"        # csukuangfj/kokoro-multi-lang-v1_0 (Apache-2.0), 401 MB
+VOICE_VAD = "silero_vad.onnx"               # Silero VAD (MIT), 0.6 MB: cuts long recordings at pauses
+VOICE_IDLE_S = 600
+# i5-13600K, efficiency cores, the model idle (11-07): dictation 0.66 s for a 5 s clip (4 threads); read-aloud 2.6 s
+# for 5.1 s of speech at 4 threads, 1.7 s at 8.  Any core, 4 threads: 0.29 s and 1.0 s - but those are the expert
+# threads' cores.  While the model writes, its expert pool uses every core, the efficiency cores too: read-aloud then
+# took 16 s for 5.9 s of speech (6 threads), dictation 1-10 s.
+VOICE_THREADS = {"asr": 4, "tts": 6}
+
+
+def voice_choice():
+    v = os.environ.get("DS41_VOICE", "").strip().lower()
+    if not v:
+        try:
+            with open(os.path.join(ROOT, "voice-choice.txt"), encoding="utf-8") as f:
+                v = f.readline().strip().lower()
+        except OSError:
+            v = ""
+    return v or "off"
+
+
+def sherpa_cuda():
+    """True when the installed sherpa-onnx is its CUDA build (it carries onnxruntime's CUDA provider)."""
+    spec = importlib.util.find_spec("sherpa_onnx")
+    if spec is None or not spec.submodule_search_locations:
+        return False
+    lib = os.path.join(list(spec.submodule_search_locations)[0], "lib")
+    return any(os.path.exists(os.path.join(lib, n))
+               for n in ("onnxruntime_providers_cuda.dll", "libonnxruntime_providers_cuda.so"))
+
+
+def voice_section(m, engine_gpu=None, helper_on=False):
+    """The server's "voice" section (dictation + read-aloud), or None (off, or not set up: said in one line).
+    "cpu": the efficiency cores of a hybrid Intel CPU (any core elsewhere); "gpu" / "gpu:N": read-aloud on a second
+    NVIDIA card (dictation stays on the CPU: the int8 Parakeet is faster there - 0.66 s vs 0.87 s for a 5 s clip, 11-07;
+    Kokoro on a 3060 0.47 s vs 2.6 s on the efficiency cores for 5.1 s of speech)."""
+    mode = voice_choice()
+    if mode in ("off", "0", "no", "none", "false"):
+        return None
+    if mode != "cpu" and not re.fullmatch(r"gpu(:\d+)?", mode):
+        print(f"ds41_local: voice {mode!r} (DS41_VOICE / voice-choice.txt): use cpu, gpu or off - voice off")
+        return None
+    d = os.path.join(m, "speech")
+    need = {"asr": os.path.join(d, VOICE_ASR, "encoder.int8.onnx"), "tts": os.path.join(d, VOICE_TTS, "model.onnx")}
+    missing = [os.path.basename(os.path.dirname(p)) for p in need.values() if not os.path.exists(p)]
+    if importlib.util.find_spec("sherpa_onnx") is None:
+        missing.append("sherpa-onnx (the speech runtime)")
+    if missing:
+        print(f"ds41_local: voice is on but not set up - missing {', '.join(missing)}: voice off.  "
+              f"Enable Voice.bat sets it up")
+        return None
+    env, device = {}, "cpu"
+    if mode.startswith("gpu"):
+        gpu = int(mode[4:]) if ":" in mode else None
+        if gpu is None:
+            import setup_panel
+            h = setup_panel.helper_gpu(setup_panel.list_gpus(), engine_gpu)
+            gpu = h["index"] if h else None
+        if gpu is None or gpu == engine_gpu:
+            print("ds41_local: voice on a second card was asked for, but there is none - voice on the CPU")
+        elif not sherpa_cuda():
+            print("ds41_local: voice on a second card needs sherpa-onnx's CUDA build (Enable Voice.bat gpu) - "
+                  "voice on the CPU")
+        else:
+            env, device = {"CUDA_VISIBLE_DEVICES": str(gpu)}, "cuda"
+            if helper_on:
+                print(f"ds41_local: voice shares GPU {gpu} with the multi-GPU helper (about 1.5 GB of it)")
+    py = sys.executable.replace("\\", "/")
+    script = ROOT.replace("\\", "/") + "/serve/speech.py"
+    out = {"lazy_idle_s": VOICE_IDLE_S}
+    for kind, port, folder in (("asr", 5110, VOICE_ASR), ("tts", 5210, VOICE_TTS)):
+        args = ["-I", script, "--kind", kind, "--port", "{port}", "--model", os.path.join(d, folder).replace("\\", "/"),
+                "--threads", str(VOICE_THREADS[kind]), "--device", device if kind == "tts" else "cpu", "--cpus", "e"]
+        if kind == "asr" and os.path.exists(os.path.join(d, VOICE_VAD)):
+            args += ["--vad", os.path.join(d, VOICE_VAD).replace("\\", "/")]
+        out[kind] = {"cmd": py, "args": args, "port": port, "start_timeout_s": 180, "lazy_reserve_mib": 0,
+                     "show_log": True, **({"env": env} if env and kind == "tts" else {})}
+    return out
+
+
 DEFAULT_NAME = "deepseek-v4.1-flash-1017-ds4-q2"   # the shipped config's model_name
 
 
@@ -434,6 +521,11 @@ def main():
               "vs 27 / 20 tok/s at 96 / 64 GB; 89.1 vs 89.9% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
     if cfg.get("vision"):
         print(f"ds41_local: pictures on ({'on the GPU' if cfg['vision']['gpu'] else 'on the CPU'})")
+    if cfg.get("voice"):
+        env = cfg["voice"]["tts"].get("env") or {}
+        print(f"ds41_local: voice on (read-aloud on {'GPU ' + env['CUDA_VISIBLE_DEVICES'] if env else 'the CPU'}, "
+              f"dictation on the CPU; "
+              f"the speech models start with the first use)")
     for p in missing:
         print(f"ds41_local: MISSING {p}  (see README.md, 'Setup')")
     sys.exit(1 if missing else 0)

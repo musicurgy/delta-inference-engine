@@ -1,0 +1,9 @@
+# Voice on a second NVIDIA card ("Enable Voice.bat" gpu): sherpa-onnx's CUDA build (Apache-2.0, ~200 MB download) and
+# NVIDIA's CUDA 12 / cuDNN 9 runtime libraries (NVIDIA's redistributable licence; ~2.3 GB installed).  Read-aloud runs on the
+# card; dictation stays on the CPU (its int8 model is faster there).
+--find-links https://k2-fsa.github.io/sherpa/onnx/cuda.html
+sherpa-onnx==2.0.1+cuda12.cudnn9
+nvidia-cuda-runtime-cu12==12.9.79
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.28.1.4
+nvidia-cufft-cu12==11.4.1.4

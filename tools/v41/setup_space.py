@@ -17,6 +17,7 @@ Q2_NAME = "DeepSeek-V4.1-Flash-1017-Q2.gguf"
 Q2 = 365.7 * GB                                 # the ds4 Q2 GGUF: the model and its Engram tables
 MTP_SHARDS, SIDECAR, DRAFTER = 7.9 * GB, 7.9 * GB, 4.2 * GB
 VISION = 0.97 * GB                             # pictures: DeepSeek-V4.1-Flash-1017-Vision.gguf
+VOICE = 1.08 * GB                              # voice: speech\ (Parakeet TDT 0.6B v3 int8, Kokoro-82M v1.0, Silero VAD)
 
 
 def size(p):
@@ -62,6 +63,16 @@ def main():
     vis = os.environ.get("DS41_VISION", "").strip().lower() or vis or "off"
     if vis in ("cpu", "gpu") and not os.path.exists(os.path.join(m, "DeepSeek-V4.1-Flash-1017-Vision.gguf.ok")):
         steps.append(("pictures (0.97 GB)", VISION, VISION))
+    # voice (off unless voice-choice.txt / DS41_VOICE says cpu or gpu: Enable Voice.bat)
+    try:
+        with open(os.path.join(root, "voice-choice.txt"), encoding="utf-8") as f:
+            voc = f.readline().strip().lower()
+    except OSError:
+        voc = ""
+    voc = os.environ.get("DS41_VOICE", "").strip().lower() or voc or "off"
+    if (voc == "cpu" or voc.startswith("gpu")) and not os.path.exists(
+            os.path.join(m, "speech", "kokoro-multi-lang-v1_0", "model.onnx.ok")):
+        steps.append(("voice (1.1 GB)", VOICE, VOICE))
     if not old and not os.path.exists(os.path.join(m, Q2_NAME + ".ok")):
         n = max(0.0, Q2 - size(os.path.join(m, Q2_NAME)) - partial(m))
         steps.append(("main model (366 GB download)", n, n))

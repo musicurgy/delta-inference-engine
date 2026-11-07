@@ -19,6 +19,7 @@ imports it, not the other way round.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
@@ -42,9 +43,11 @@ class VoiceServer:
         self.health_path = str(cfg.get("health", "/health"))
         self.start_timeout_s = float(cfg.get("start_timeout_s", 120))
         self.reserve_mib = int(cfg.get("lazy_reserve_mib", 1800))   # VRAM the child needs, freed before it starts
+        self.env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}   # e.g. CUDA_VISIBLE_DEVICES
+        self.show_log = bool(cfg.get("show_log", False))   # the child's stderr in the server window (serve/speech.py)
         self.proc = None
         self.stopped = True
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()                      # ensure() calls stop() on a failed start, lock held
         self.last_used = 0.0
         self.on_start = None                               # set by Service.start_lazy_voice (shrinks the cache)
         self._log = log
@@ -73,7 +76,8 @@ class VoiceServer:
             try:
                 self.proc = subprocess.Popen(               # noqa: S603 - the command comes from the config
                     args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=self._log or subprocess.DEVNULL, text=True)
+                    stderr=self._log or (None if self.show_log else subprocess.DEVNULL), text=True,
+                    env={**os.environ, **self.env} if self.env else None)
             except OSError as e:
                 self.proc = None
                 raise RuntimeError(f"the {self.kind} server could not start: {e}") from None
