@@ -69,6 +69,19 @@ class Search(unittest.TestCase):
                 TS.regex_search(bad, self.tools)
             self.assertEqual(str(e.exception), code)
 
+    def test_a_backtracking_pattern_is_refused_in_time(self):
+        # 0.94 (ReDoS): Python's re took hours on (.+)+\x00 against a 40-character description, holding the GIL; the
+        # regex module sees through that one, but not through backreferences (n^5 tries here)
+        import time
+        from unittest import mock
+        slow = [{"name": "t", "description": "Reads the weather for a city by its name, " * 3}]
+        t0 = time.monotonic()
+        with mock.patch("builtins.print"), self.assertRaises(ValueError) as e:
+            TS.regex_search(r"(?s)^(.*)(.*)(.*)(.*)(.*)\1\2\3\4\5$", slow)
+        self.assertEqual(str(e.exception), "invalid_pattern")
+        self.assertLess(time.monotonic() - t0, 5.0)
+        self.assertEqual(TS.regex_search("(weather)+", slow), ["t"])        # an ordinary group still works
+
     def test_bm25(self):
         self.assertEqual(TS.bm25_search("send an email", self.tools)[0], "mcp__mail__send")
         self.assertEqual(TS.bm25_search("database query", self.tools)[0], "mcp__db__query")

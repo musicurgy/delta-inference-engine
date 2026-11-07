@@ -34,6 +34,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from serve import documents
+from serve import netguard
 from serve import server_tools as ST
 
 DEFAULTS = {"max_uses": 5, "max_results": 5, "snippet_chars": 500, "fetch_max_chars": 20000, "timeout_s": 15.0,
@@ -46,6 +48,7 @@ MAX_URL = 2000
 
 CONFIG: dict = {}                       # the "web_tools" block, cleaned (empty: web tools off)
 _CHECK = None                           # server.public_url: raises ValueError for an address this must not fetch
+_PEER = None                            # server.public_peer: the same for the address a connection reached (netguard)
 _HUB = None                             # the MCP hub, for "search": "mcp"
 
 
@@ -55,10 +58,10 @@ class WebError(Exception):
         self.code = code
 
 
-def configure(block, public_url=None, mcp_hub=None) -> dict:
+def configure(block, public_url=None, mcp_hub=None, public_peer=None) -> dict:
     """Read the config's "web_tools" block (None: off).  ValueError names a bad setting."""
-    global CONFIG, _CHECK, _HUB
-    _CHECK, _HUB = public_url, mcp_hub
+    global CONFIG, _CHECK, _HUB, _PEER
+    _CHECK, _HUB, _PEER = public_url, mcp_hub, public_peer
     if not block:
         CONFIG = {}
         return CONFIG
@@ -330,10 +333,13 @@ def fetch(url, allowed=None, blocked=None, seen: str = "") -> dict:
             _CHECK(url)
     except ValueError as e:
         raise WebError("url_not_allowed", str(e)) from None
+    # 0.94: each connection (the first and every redirect's) also checks the address it reached, so a name that
+    # answers a public address to _CHECK and 127.0.0.1 to the connection (DNS rebinding) is refused
+    handlers = netguard.handlers(_PEER) if _PEER is not None else []
     try:
         body, ctype, final = _get(url, {"Accept": "text/html,text/plain,application/json;q=0.9,*/*;q=0.5"},
-                                  opener=urllib.request.build_opener(_Redirects))
-    except ValueError as e:                          # a redirect into this PC's network (_CHECK)
+                                  opener=urllib.request.build_opener(_Redirects, *handlers))
+    except ValueError as e:                          # a redirect into this PC's network (_CHECK), or a peer (_PEER)
         raise WebError("url_not_allowed", str(e)) from None
     except urllib.error.HTTPError as e:
         raise WebError("too_many_requests" if e.code == 429 else "url_not_accessible", f"HTTP {e.code}") from None
@@ -351,16 +357,13 @@ def fetch(url, allowed=None, blocked=None, seen: str = "") -> dict:
     elif ctype.startswith("text/") or ctype in ("application/json", "application/xml", "application/x-yaml", ""):
         title, text = "", body.decode(charset, "replace")
     elif ctype == "application/pdf":
-        try:
-            import io
-
-            import pypdf  # optional
-            text = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(io.BytesIO(body)).pages)
-            title = ""
-        except ImportError:
-            raise WebError("unsupported_content_type", "PDF pages need the optional pypdf package") from None
-        except Exception as e:  # noqa: BLE001
-            raise WebError("unsupported_content_type", f"the PDF could not be read: {e}") from None
+        # 0.94: read like any other document - in serve/documents.py's reader process, with its time and memory
+        # limits - never parsed in the server (a hostile PDF could hang or crash it there)
+        name = urllib.parse.urlsplit(final or url).path.rsplit("/", 1)[-1][:100] or "page.pdf"
+        doc = documents.extract(body, name, "application/pdf")
+        if doc.error:
+            raise WebError("unsupported_content_type", f"the PDF could not be read: {doc.error}")
+        title, text = "", doc.text + (f"\n\n[{doc.note}]" if doc.note else "")
     else:
         raise WebError("unsupported_content_type", ctype)
     cap = int(CONFIG["fetch_max_chars"])

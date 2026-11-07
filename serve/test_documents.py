@@ -13,8 +13,10 @@ import http.client
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -212,6 +214,63 @@ class Office(Quiet):
         doc = D.extract(buf.getvalue(), "deck.pptx")
         self.assertEqual((doc.kind, doc.pages), ("pptx", 1))
         self.assertEqual(doc.text, "## Slide 1\n\nRoadmap\n\nShip 0.94\n\nNotes: say it slowly")
+
+
+def office_zip(part: str, size: int) -> bytes:
+    """A zip that sniffs as a Word file, its document.xml `size` bytes of one letter (packs about 1000:1)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", "<Types/>")
+        z.writestr(part, b"a" * size)
+    return buf.getvalue()
+
+
+class Bombs(Quiet):
+    """0.94 (decompression bombs): an Office file that unpacks to too much is refused before the reader starts; the
+    reader has a memory limit, cuts its own text, and its answer is read up to a size."""
+
+    def test_a_high_ratio_part_is_refused_before_the_reader(self):
+        data = office_zip("word/document.xml", 5 << 20)
+        self.assertGreater(len(data), 0)
+        with mock.patch.object(D, "_run_child") as child:
+            doc = D.extract(data, "bomb.docx")
+        child.assert_not_called()
+        self.assertIn("times its packed size", doc.error)
+
+    def test_too_much_unpacked_is_refused(self):
+        with mock.patch.object(D, "MAX_UNZIPPED", 1 << 20), mock.patch.object(D, "_run_child") as child:
+            doc = D.extract(office_zip("word/document.xml", 2 << 20), "big.docx")
+        child.assert_not_called()
+        self.assertIn("unpacks to 2 MB", doc.error)
+
+    def test_a_normal_office_file_passes(self):
+        self.assertEqual(D.zip_bomb(office_zip("word/document.xml", 64 << 10)), "")
+        self.assertEqual(D.zip_bomb(b"PK\x03\x04 not really a zip"), "")      # the reader says what is wrong
+
+    def test_the_reader_cuts_its_text_and_says_how_long_it_was(self):
+        out = io.BytesIO()
+        with mock.patch.dict(D.READERS, {"pdf": lambda _d: {"text": "x" * 50, "pages": 1}}), \
+                mock.patch.object(D, "MAX_CHARS", 10), \
+                mock.patch.object(sys, "stdin", mock.Mock(buffer=io.BytesIO(b"%PDF"))), \
+                mock.patch.object(sys, "stdout", mock.Mock(buffer=out)):
+            D._child_main("pdf")
+        self.assertEqual(json.loads(out.getvalue()), {"text": "x" * 10, "chars": 50, "pages": 1})
+        with mock.patch.object(D, "MAX_CHARS", 10), \
+                mock.patch.object(D, "_run_child", return_value={"text": "x" * 10, "chars": 50, "pages": 1}):
+            self.assertIn("cut at 10 of 50 characters", D.extract(b"%PDF-1.4 cut", "cut.pdf").render())
+
+    @unittest.skipUnless(HAVE["pypdfium2"], "pypdfium2 is not installed")
+    def test_the_answer_is_read_up_to_a_size(self):
+        with mock.patch.object(D, "MAX_CHARS", 1), mock.patch.object(D, "OUTPUT_SLACK", 0):
+            out = D._run_child("pdf", make_pdf(["Hello PDF world"]))
+        self.assertIn("answer was over 12 bytes", out["error"])
+
+    def test_the_reader_has_a_memory_limit(self):
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); from serve import documents as D\n"
+                "print(D._limit_memory(256 << 20))\n"
+                "try:\n    bytearray(768 << 20)\nexcept MemoryError:\n    print('MemoryError')\n")
+        r = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.stdout.split(), ["True", "MemoryError"], r.stderr)
 
 
 class ApiParts(Quiet):

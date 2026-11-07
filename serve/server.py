@@ -70,6 +70,7 @@ from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve.voice import VoiceServer, start_lazy_voice  # noqa: E402  local: the voice sidecar (ASR/TTS)
 from serve import documents  # noqa: E402  PDF / Office / text documents -> prompt text
+from serve import netguard  # noqa: E402  (0.94: picture / web fetches check the address they connected to)
 from serve import images as images_api  # noqa: E402
 from serve import loadstate  # noqa: E402  the loading screen and Pause / Resume (GET /health)
 from serve import helpers as helper_calls  # noqa: E402
@@ -2327,7 +2328,6 @@ def public_url(url: str, resolve=socket.getaddrinfo) -> None:
     that says why) otherwise.  STRATA_IMAGE_FETCH_PRIVATE=1 lifts it (pictures served from your own network)."""
     if os.environ.get("STRATA_IMAGE_FETCH_PRIVATE", "").strip() == "1":
         return
-    import ipaddress
     try:
         parts = urlsplit(url)
         host, port = parts.hostname, parts.port
@@ -2340,12 +2340,33 @@ def public_url(url: str, resolve=socket.getaddrinfo) -> None:
     except (OSError, UnicodeError) as e:
         raise ValueError(f"the image URL could not be read: {e}") from None
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
-        if getattr(ip, "ipv4_mapped", None):
-            ip = ip.ipv4_mapped
-        if not ip.is_global:
+        ip = _inward_ip(info[4][0])
+        if ip is not None:
             raise ValueError(f"the image URL points into this PC or its network ({host} is {ip}): not fetched "
                              "(STRATA_IMAGE_FETCH_PRIVATE=1 allows it)")
+
+
+def _inward_ip(addr: str):
+    """The address (an ip_address) when it is not a global one - this PC, its network, link-local, ... - else None.
+    An IPv4-mapped IPv6 address is judged as the IPv4 address it carries."""
+    import ipaddress
+    ip = ipaddress.ip_address(str(addr).split("%", 1)[0])
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return None if ip.is_global else ip
+
+
+def public_peer(addr: str) -> None:
+    """0.94 (DNS rebinding): the address a picture or web fetch really connected to must be a global one too.
+    public_url checked the name's addresses, but the connection resolves the name again, and a name with a zero TTL
+    can answer a public address to the check and 127.0.0.1 to the connection.  serve/netguard.py calls this with the
+    connected socket's peer before anything is sent (every redirect hop too).  STRATA_IMAGE_FETCH_PRIVATE=1 lifts it."""
+    if os.environ.get("STRATA_IMAGE_FETCH_PRIVATE", "").strip() == "1":
+        return
+    ip = _inward_ip(addr)
+    if ip is not None:
+        raise ValueError(f"the URL's server is in this PC or its network ({ip}): not fetched (its name gave a public "
+                         "address when it was checked, then this one; STRATA_IMAGE_FETCH_PRIVATE=1 allows it)")
 
 
 class _PublicRedirects(urllib.request.HTTPRedirectHandler):
@@ -2356,7 +2377,8 @@ class _PublicRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_PUBLIC_OPENER = urllib.request.build_opener(_PublicRedirects)
+# every connection (the first and each redirect's) checks the address it reached: public_peer
+_PUBLIC_OPENER = urllib.request.build_opener(_PublicRedirects, *netguard.handlers(lambda ip: public_peer(ip)))
 
 
 def network_path(path: str) -> bool:
@@ -6089,6 +6111,9 @@ def make_handler(svc: Service):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                # 0.94 (clickjacking): another site may not frame the page and trick a click on the Setup card
+                self.send_header("Content-Security-Policy", "frame-ancestors 'self'")
+                self.send_header("X-Frame-Options", "SAMEORIGIN")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -8342,7 +8367,7 @@ def main() -> int:
               f"{', '.join(sorted(svc.helper_lane.classes))} calls (started with the first one)", flush=True)
     embeddings_api.start_idle_stop(svc.sidecars)
     try:                                                # 0.94: serve/websearch.py (off unless configured)
-        websearch.configure(cfg.get("web_tools"), public_url=public_url, mcp_hub=hub)
+        websearch.configure(cfg.get("web_tools"), public_url=public_url, public_peer=public_peer, mcp_hub=hub)
     except ValueError as e:
         raise SystemExit(f"[strata] config {e}")
     if websearch.describe():

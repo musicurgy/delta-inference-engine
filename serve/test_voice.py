@@ -13,6 +13,7 @@ from serve.voice import VoiceServer
 
 class _StubHandler(http.server.BaseHTTPRequestHandler):
     seen = None
+    token = None
 
     def do_GET(self):
         self._send(200, b"ok", "text/plain") if self.path == "/health" else self._send(404, b"{}", "application/json")
@@ -21,6 +22,7 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(n)
         _StubHandler.seen = (self.path, self.headers.get("Content-Type"), body)
+        _StubHandler.token = self.headers.get("X-Strata-Voice-Token")
         self._send(200, json.dumps({"text": "hello world", "bytes": len(body)}).encode(), "application/json")
 
     def _send(self, code, body, ctype):
@@ -59,6 +61,7 @@ class VoiceServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(out)["text"], "hello world")
         self.assertEqual(_StubHandler.seen, ("/v1/audio/transcriptions", "audio/wav", b"RIFFxxxx"))
+        self.assertEqual(_StubHandler.token, v.token)                   # 0.94: forwarded with the child's token
 
     def test_ensure_fails_cleanly_when_the_command_is_missing(self):
         v = VoiceServer("asr", {"cmd": "/nonexistent/definitely-not-here", "port": self.port,
@@ -91,6 +94,8 @@ class VoiceServerOptions(unittest.TestCase):
         self.assertEqual(args[0], ["py", "speech.py", "--port", "1"])
         self.assertEqual(kw["env"]["CUDA_VISIBLE_DEVICES"], "1")
         self.assertIn("PATH", {k.upper() for k in kw["env"]})      # the rest of the environment is kept
+        self.assertEqual(kw["env"]["STRATA_VOICE_TOKEN"], v.token)      # 0.94: the child takes POSTs with it only
+        self.assertGreaterEqual(len(v.token), 32)
         self.assertIsNone(kw["stderr"])                                # the child's lines in the server window
         quiet = VoiceServer("asr", {"cmd": "x"})
         self.assertEqual((quiet.env, quiet.show_log), ({}, False))

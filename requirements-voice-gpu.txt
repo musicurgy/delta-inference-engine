@@ -1,6 +1,12 @@
 # Voice on a second NVIDIA card ("Enable Voice.bat" gpu): sherpa-onnx's CUDA build (Apache-2.0, ~200 MB download) and
 # NVIDIA's CUDA 12 / cuDNN 9 runtime libraries (NVIDIA's redistributable licence; ~2.3 GB installed).  Read-aloud runs on the
 # card; dictation stays on the CPU (its int8 model is faster there).
+# Security (0.94): every line is pinned to one exact version, and sherpa-onnx's local version +cuda12.cudnn9 exists
+# only on the find-links page below (k2-fsa's own GitHub Pages), so PyPI cannot substitute another build. It is not
+# hash-pinned: pip's --hash mode would need a hash for every dependency of these packages, for every Python and
+# platform, and a wrong one fails the whole Enable Voice step. A compromised page or wheel host could still serve
+# other code under this version; the stronger fix is to mirror the wheel in this repo's release assets
+# and fetch it with get_engine's SHA-256 check.
 --find-links https://k2-fsa.github.io/sherpa/onnx/cuda.html
 sherpa-onnx==2.0.1+cuda12.cudnn9
 nvidia-cuda-runtime-cu12==12.9.79

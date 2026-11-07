@@ -11,12 +11,19 @@ from __future__ import annotations
 
 import math
 import re
+import time
 
 from serve import server_tools as ST
+
+try:
+    import regex as _regex            # requirements.txt: matches with a time limit (Python's re cannot be stopped)
+except ImportError:                   # pragma: no cover - without it a pattern is searched for as plain text
+    _regex = None
 
 MAX_RESULTS = 5
 MAX_PATTERN = 200
 TEXT_CAP = 4000                       # the characters of one tool that are searched (bounds a pathological pattern)
+SEARCH_S = 0.5                        # 0.94 (ReDoS): one search's time over all tools; a slower pattern is refused
 
 
 def _schema_text(schema, depth=0) -> list[str]:
@@ -48,22 +55,49 @@ def catalog(ctx: ST.Context) -> list[dict]:
 
 
 def regex_search(pattern: str, tools: list[dict], limit: int = MAX_RESULTS) -> list[str]:
-    """Names of the tools whose text matches `pattern` (Python re, case-insensitive); a name match ranks first.
-    ValueError("pattern_too_long" / "invalid_pattern") for a pattern this refuses."""
+    """Names of the tools whose text matches `pattern` (a Python regular expression, case-insensitive); a name match
+    ranks first.  ValueError("pattern_too_long" / "invalid_pattern") for a pattern this refuses.
+
+    0.94 (ReDoS): Python's re holds the GIL for a whole match, and a pattern like (.+)+x backtracks for hours on a
+    40-character description - every other request, /health and the page with it.  The match runs in the regex module
+    with a time limit (SEARCH_S for the whole search, the GIL released while it runs); a pattern that runs out of time
+    is an invalid_pattern."""
     if not isinstance(pattern, str) or not pattern:
         raise ValueError("invalid_pattern")
     if len(pattern) > MAX_PATTERN:
         raise ValueError("pattern_too_long")
     try:
-        rx = re.compile(pattern, re.IGNORECASE)
-    except re.error:
-        raise ValueError("invalid_pattern") from None
+        if _regex is not None:
+            rx = _regex.compile(pattern, _regex.IGNORECASE | _regex.V0)
+        else:
+            re.compile(pattern)                                    # still refused when it is not a valid pattern
+            rx = re.compile(re.escape(pattern), re.IGNORECASE)
+    except (re.error, ValueError, OverflowError, RecursionError) as e:
+        raise ValueError("invalid_pattern") from e
+    except Exception as e:  # noqa: BLE001 - regex.error is not re.error
+        if _regex is not None and isinstance(e, _regex.error):
+            raise ValueError("invalid_pattern") from None
+        raise
+    deadline = time.monotonic() + SEARCH_S
+
+    def found(text: str) -> bool:
+        if _regex is None:
+            return rx.search(text) is not None
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError
+        return rx.search(text, timeout=left, concurrent=True) is not None
+
     named, other = [], []
-    for t in tools:
-        if rx.search(t.get("name") or ""):
-            named.append(t["name"])
-        elif rx.search(tool_text(t)):
-            other.append(t["name"])
+    try:
+        for t in tools:
+            if found(t.get("name") or ""):
+                named.append(t["name"])
+            elif found(tool_text(t)):
+                other.append(t["name"])
+    except TimeoutError:
+        print(f"[strata] tool search: the pattern {pattern[:80]!r} took over {SEARCH_S} s; refused", flush=True)
+        raise ValueError("invalid_pattern") from None
     return (named + other)[:limit]
 
 

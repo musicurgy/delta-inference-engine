@@ -20,6 +20,7 @@ imports it, not the other way round.
 from __future__ import annotations
 
 import os
+import secrets
 import subprocess
 import threading
 import time
@@ -30,6 +31,10 @@ import urllib.request
 HEALTH_TIMEOUT_S = 2.0
 # How long a single forwarded request may take (a long clip on a busy card is still bounded).
 FORWARD_TIMEOUT_S = 120.0
+# 0.94: the child (serve/speech.py) takes POSTs only with this token, which it reads from TOKEN_ENV at start - so a web
+# page cannot use the fixed ports 5110 / 5210 directly (speech.py also refuses any request that carries an Origin)
+TOKEN_ENV = "STRATA_VOICE_TOKEN"
+TOKEN_HEADER = "X-Strata-Voice-Token"
 
 
 class VoiceServer:
@@ -45,6 +50,7 @@ class VoiceServer:
         self.reserve_mib = int(cfg.get("lazy_reserve_mib", 1800))   # VRAM the child needs, freed before it starts
         self.env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}   # e.g. CUDA_VISIBLE_DEVICES
         self.show_log = bool(cfg.get("show_log", False))   # the child's stderr in the server window (serve/speech.py)
+        self.token = secrets.token_urlsafe(24)             # new with each Strata start; another audio server ignores it
         self.proc = None
         self.stopped = True
         self.lock = threading.RLock()                      # ensure() calls stop() on a failed start, lock held
@@ -77,7 +83,7 @@ class VoiceServer:
                 self.proc = subprocess.Popen(               # noqa: S603 - the command comes from the config
                     args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=self._log or (None if self.show_log else subprocess.DEVNULL), text=True,
-                    env={**os.environ, **self.env} if self.env else None)
+                    env={**os.environ, **self.env, TOKEN_ENV: self.token})
             except OSError as e:
                 self.proc = None
                 raise RuntimeError(f"the {self.kind} server could not start: {e}") from None
@@ -133,6 +139,7 @@ class VoiceServer:
         """POST `body` to the child at `path`; return (status, bytes, content_type).  Never raises on an
         HTTP error status - the child's own error body is passed back to the caller."""
         req = urllib.request.Request(self.base_url + path, data=body, method="POST")  # noqa: S310
+        req.add_header(TOKEN_HEADER, self.token)
         if content_type:
             req.add_header("Content-Type", content_type)
         try:
