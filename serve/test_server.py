@@ -4778,6 +4778,12 @@ class ImageSources(unittest.TestCase):
                r"\??\UNC\host\share\x.png", r"/\host\share\x.png", "file://host/share/x.png",
                "file:////host/share/x.png", r"file://\\host\share\x.png"]
 
+    def setUp(self):
+        # these tests serve their pictures from 127.0.0.1, which public_url refuses by default (0.94, SSRF)
+        p = mock.patch.dict(os.environ, {"STRATA_IMAGE_FETCH_PRIVATE": "1"})
+        p.start()
+        self.addCleanup(p.stop)
+
     class Vision(ImageMarkers.FakeVision):
         def __init__(self, d):
             super().__init__(d)
