@@ -1,5 +1,9 @@
 # Strata - the details
 
+> **Reading this in Delta:** most of this page comes from upstream Strata and describes its models and versions.  Here
+> the settings file is `tools/v41/serve/ds41-windows.json` wherever it says `strata-<model>.json`, the context goes
+> up to 1M tokens, and agent setup is in the [README](../README.md#agents-chats-and-tools).
+
 The technical side of Strata: every measured number, the API, images, all settings and how the engine works.
 New here? Start with the [README](../README.md); installing step by step is in [INSTALL.md](INSTALL.md), the models in
 [MODELS.md](MODELS.md), common problems in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
@@ -874,27 +878,20 @@ print(r.choices[0].message.content)
   ```jsonc
   {
     "$schema": "https://opencode.ai/config.json",
-    "provider": {
-      "strata": {
-        "npm": "@ai-sdk/openai-compatible",
-        "name": "Strata (local)",
-        "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "none" },  // or your api_key
+    "providers": {
+      "delta": {
+        "name": "Delta (local)",
+        "package": "@opencode/ai/providers/openai-compatible",
+        "settings": { "baseURL": "http://127.0.0.1:8080/v1" },
         "models": {
-          "strata": {
-            "name": "Qwen3.8-Flash-Next (Strata)",
-            // context: what you chose in setup; output: what one reply may use (prompt + output must fit)
-            "limit": { "context": 262144, "output": 32768 },
-            "options": { "reasoningEffort": "high" },                  // sent as reasoning_effort
-            "variants": {                                              // switch between them in OpenCode
-              "low": { "reasoningEffort": "low" },
-              "medium": { "reasoningEffort": "medium" },
-              "none": { "reasoningEffort": "none" }
-            }
+          "deepseek-v4.1-flash-1017": {
+            "name": "DeepSeek V4.1 Flash",
+            // context: the server's context; output: what one reply may use (prompt + output must fit)
+            "limit": { "context": 1000000, "output": 32768 }
           }
         }
       }
-    },
-    "model": "strata/strata"
+    }
   }
   ```
 
@@ -902,11 +899,11 @@ print(r.choices[0].message.content)
   Keep `limit.output` well under it: a request whose prompt plus `max_tokens` runs past the context is refused (see
   **Context** below), or add `"fit_max_tokens": true` to `strata-<model>.json`. For a hard cap on the thinking, add
   `"reasoning_budget_tokens": N` to `strata-<model>.json` (see above).
-- **Claude Code** (Strata 0.1.17 or newer): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and
-  `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; Strata ignores the name), plus any
-  `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
+- **Claude Code**: set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`, any `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if
+  you set one), `ANTHROPIC_MODEL` to a name that does not start with `claude-` (the server answers under any name), and
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the context.  Without that last one, Claude Code assumes 200K and compacts there.
 - **Codex CLI** (0.1.39): see [the Responses API](#the-responses-api-and-codex-cli) below.
-- **Context.** Chosen in setup (8K-262K). Requests longer than that are refused, never silently cut. A request whose
+- **Context.** Up to 1M tokens in Delta (`--ctx` in `ds41-windows.json`). Requests longer than that are refused, never silently cut. A request whose
   `max_tokens` would run past the context is refused too (400); agents that always ask for their full output cap
   can instead get it shortened to the room left: add `"fit_max_tokens": true` to `strata-<model>.json` (or pass
   `--fit-max-tokens` to `serve/server.py`). A prompt that leaves no room at all is still refused.

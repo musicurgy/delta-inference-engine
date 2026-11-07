@@ -22,7 +22,8 @@ CPUs from before 2013.)
    a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 64 GB+ of RAM (128 GB+ recommended),
    ~320 GB free on a fast NVMe drive for the default model (its speed matters - see below).
 2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
-   asks before anything big:
+   asks before anything big.  Windows may first show a blue "Windows protected your PC" box, because these files are
+   not code-signed: if you got them from this repository, choose More info, then Run anyway.
    - Python and its packages (no Python 3.10-3.12 on the PC: it offers to install python.org's Python 3.11 with
      Windows' own winget, for your Windows user only),
    - the engine: the prebuilt one for your CPU from the
@@ -147,6 +148,46 @@ While it writes, a busy browser or game on the same PC can slow the CPU side dow
 normal priority.
 
 ## Agents, chats and tools
+
+**Connecting an agent or chat app.**  Start DeepSeek first.  The server is at `http://127.0.0.1:8080`, any API key
+works unless you set one, and it answers under any model name.  Give the app the real context size, or it may
+compact your conversation early.
+
+- **Claude Code**, in the Command Prompt you start it from:
+
+  ```bat
+  set ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+  set ANTHROPIC_AUTH_TOKEN=local
+  set ANTHROPIC_MODEL=deepseek-v4.1-flash-1017
+  set CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000
+  claude
+  ```
+
+  Without the last `set`, Claude Code assumes 200K tokens and compacts there.
+- **OpenCode**, in `opencode.jsonc` (in your project, or `~/.config/opencode/`):
+
+  ```jsonc
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "providers": {
+      "delta": {
+        "name": "Delta (local)",
+        "package": "@opencode/ai/providers/openai-compatible",
+        "settings": { "baseURL": "http://127.0.0.1:8080/v1" },
+        "models": {
+          "deepseek-v4.1-flash-1017": {
+            "name": "DeepSeek V4.1 Flash",
+            "limit": { "context": 1000000, "output": 32768 }
+          }
+        }
+      }
+    }
+  }
+  ```
+
+- **Cline, Aider, Continue, Open WebUI and other OpenAI-compatible apps:** base URL `http://127.0.0.1:8080/v1`, any API
+  key, model name `deepseek-v4.1-flash-1017`.  Where the app asks for a context window, enter `1000000`.
+- **Codex CLI:** see [the Responses API](docs/DETAILS.md#the-responses-api-and-codex-cli).
 
 - **Conversation cache:** the server keeps up to 8 conversations in memory (about 20 MB per 10k tokens). An agent that
   switches between conversations, or makes a side request between turns, resumes each one in a second or two instead
