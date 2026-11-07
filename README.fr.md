@@ -1,4 +1,4 @@
-> **Remarque :** cette traduction n'est plus à jour ; pour la version 0.93 (DeepSeek V4.1 Flash sous Windows), voir [README.md](README.md) (anglais).
+> **Remarque :** cette traduction décrit une version plus ancienne. Pour la version 0.94, la référence est le [README.md](README.md) (anglais).
 
 <h1 align="center">Strata</h1>
 

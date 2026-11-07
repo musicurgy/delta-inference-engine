@@ -17,6 +17,12 @@ This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), whi
 itself.  (Only if you set it up by hand: almost every PC wants `build-ds41-portable.zip`; the two `compat` zips are for
 CPUs from before 2013.)
 
+**Beware of fakes.** Get Delta only from [github.com/musicurgy/delta-inference-engine](https://github.com/musicurgy/delta-inference-engine).
+It downloads models only from the Hugging Face repositories written into its own scripts (the model ones are named in
+this README and in `Choose Model.bat`), and its engine only from this repository's Releases page.  It is free and never
+asks for payment, a login or an account.  A "Qwen 4" download, or a DeepSeek download that wants payment or a login,
+is not from this project.
+
 1. Get this folder (**Code > Download ZIP**, or
    `git clone -c core.longpaths=true https://github.com/musicurgy/delta-inference-engine C:\AI\Delta`) somewhere with
    a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 64 GB+ of RAM (128 GB+ recommended),
@@ -476,6 +482,30 @@ hand:
   you use it. An optional Engram hot set (`engram-hot-2g.bin` in the model folder) keeps the most-used rows in RAM
   from the start; build it with `ds41_engram_hot.exe` - the header of `tools/v41/engine/ds41_engram_hot.cpp` explains
   how.
+
+## Uninstall
+
+Delta installs nothing system-wide except Python, and only if the first start installed it for you.  To remove it:
+
+1. Stop DeepSeek (close its window).
+2. If you used "Use from your phone" and allowed it through Windows Firewall: in the chat page, Setup tab, press
+   **Remove the rule** - or run this in an administrator Command Prompt (`8080` is your `DS41_PORT`, if you changed it):
+   ```bat
+   netsh advfirewall firewall delete rule name="Delta DeepSeek 8080"
+   ```
+   If Windows' own firewall prompt asked instead and you allowed it, remove "Python" under Windows Security >
+   Firewall & network protection > Allow an app through firewall.
+3. Delete the model folder: `DS41_MODELS` in `ds41-paths.bat` (by default `models\` inside this folder, so step 4
+   deletes it too).
+4. Delete this folder.  That removes the engine, the Python environment (`.venv\`), your settings and the logs.
+
+Also, if you want:
+- Python 3.11, if the first start installed it: Settings > Apps, uninstall "Python 3.11".
+- Download caches in your Windows user folder: `%USERPROFILE%\.cache\huggingface` and `%LOCALAPPDATA%\pip\Cache`.
+- Saved chats live in your browser: delete them in the Chats list first, or clear the browser's data for
+  `127.0.0.1`.
+- Anything you changed yourself under "Windows settings for speed" (power plan, Lock pages in memory, Defender
+  exclusions) stays until you change it back.
 
 ## Credits
 

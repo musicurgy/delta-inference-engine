@@ -1,4 +1,4 @@
-> **注意：**此翻译已过时。0.93 版（Windows 上的 DeepSeek V4.1 Flash）请参阅 [README.md](README.md)（英文）。
+> **注意：**此翻译描述的是旧版本。0.94 版请以英文 [README.md](README.md) 为准。
 
 <h1 align="center">Strata</h1>
 
