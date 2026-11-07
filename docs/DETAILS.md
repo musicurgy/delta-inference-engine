@@ -850,6 +850,17 @@ print(r.choices[0].message.content)
   most 256 tokens, and gives way to the main conversation: a main request that arrives goes first, and a running
   suggestion is stopped (at its first token if it is still reading its prompt). Any other request is served as
   before. `"claude_code_helpers": false` in `strata-<model>.json` turns all of this off.
+- **Tool search: deferred tools stay out of the prompt (0.94).** Claude Code marks its MCP tools
+  `"defer_loading": true` and finds them with a search when it needs one. The server now leaves those tools out of the
+  tool list at the top of the prompt (with many MCP servers that is 10-50K tokens less on every new session) and
+  expands a `tool_reference` that a search returns into the tool's full definition, inside that tool result: the
+  model reads it where it was found, so everything before it stays the same and the conversation cache keeps it. A
+  request may also declare Anthropic's own search tools, `tool_search_tool_regex_20251119` (a Python regular
+  expression, case-insensitive) or `tool_search_tool_bm25_20251119` (plain words); the server runs them inside the
+  answer and returns `server_tool_use` and `tool_search_tool_result` blocks with up to 5 tools, as Anthropic's API
+  does. A request without deferred tools is rendered exactly as before. `"tool_search": "off"` in
+  `strata-<model>.json` lists every tool again. Whether the model calls a tool it found this way as reliably as one
+  in the list is not measured yet.
 - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every

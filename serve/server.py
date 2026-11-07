@@ -57,8 +57,8 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
+from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_request,  # noqa: E402
+                            anthropic_to_messages, forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
@@ -71,6 +71,8 @@ from serve.voice import VoiceServer, start_lazy_voice  # noqa: E402  local: the 
 from serve import images as images_api  # noqa: E402
 from serve import helpers as helper_calls  # noqa: E402
 from serve.helpers import MainFirst  # noqa: E402
+from serve import server_tools as server_tools_api  # noqa: E402
+from serve import toolsearch  # noqa: E402,F401  (registers the tool search server tools)
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -3260,6 +3262,7 @@ class Service:
         # checks without thinking, prompt suggestions after the main conversation ("claude_code_helpers": false: off)
         self.helper_calls = True
         self.main_first = MainFirst()
+        self.server_tool_rounds = 8                      # 0.94: server tool rounds (tool search, web) in one answer
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -4010,6 +4013,7 @@ class Service:
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens."""
+        tools = server_tools_api.shown(tools)          # 0.94: deferred tools (defer_loading) are not in the list
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
@@ -4861,7 +4865,7 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names):
+                 mcp_names, force=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -4869,13 +4873,16 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
-    could not reach the model before the client's)."""
+    could not reach the model before the client's).
+
+    `hub`: the MCP hub, or anything with its settings / routes() / call() (0.94: serve/server_tools.Runner, the
+    request's server tools).  `force`: the first round's forced call (Service.run's)."""
     max_rounds = int(hub.settings["max_rounds"])
     total, rounds, done = 0, 0, None
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
-        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
+        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, force=force):
             if kind == "done":
                 done = x
                 continue
@@ -4905,6 +4912,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                               "chars": 0, "truncated": False, "ms": 0}
             break
         rounds += 1
+        force = None
         results = []
         for c in calls:
             s, tool = hub.routes().get(c.name, (None, c.name))
@@ -4935,7 +4943,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r["text"])
-            yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
+            yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")},
+                          **{k: r[k] for k in ("block", "result_type", "usage_key") if k in r}}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
@@ -5111,7 +5120,11 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, run=None,
+                     server=None):
+    """`run` (0.94): the events to read instead of Service.run's - run_with_mcp driving the request's server tools,
+    whose ("mcp", {...}) items become server_tool_use and *_tool_result blocks; `server`: the request's
+    server_tools.Context."""
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
@@ -5122,9 +5135,48 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    srv_ids, srv_names, srv_shown, srv_uses = {}, {}, set(), {}   # 0.94: the server tools' calls
+    events = run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force)
+
+    def server_use(cid, name, arguments):
+        nonlocal index, open_kind
+        if open_kind is not None:
+            yield close()
+        open_kind = None
+        index += 1
+        srv_shown.add(cid)
+        yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": {
+            "type": "server_tool_use", "id": srv_ids.setdefault(cid, server_tools_api.server_tool_id()),
+            "name": name, "input": {}}}
+        yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
+            "type": "input_json_delta", "partial_json": json.dumps(arguments or {}, ensure_ascii=False)}}
+        yield close()
+    for kind, x in events:
         if kind == "ping":
             yield None
+            continue
+        if kind == "mcp":
+            e = x.get("event")
+            if e in ("start", "call"):
+                srv_names[x["id"]] = x["name"]
+            if e == "call":
+                yield from server_use(x["id"], x["name"], x.get("arguments"))
+            elif e == "result":
+                name = srv_names.get(x["id"])
+                entry = (server.server.get(name) if server is not None else None) or (None, None)
+                rtype = x.get("result_type") or (entry[0].result_type if entry[0] else None)
+                if rtype is None:
+                    continue
+                if x["id"] not in srv_shown:            # announced but never run (a client call in the same answer)
+                    yield from server_use(x["id"], name, {})
+                block = x.get("block") or {"type": rtype + "_error", "error_code": "unavailable"}
+                key = x.get("usage_key") or (entry[0].usage_key if entry[0] else None)
+                if key and not x.get("skipped"):
+                    srv_uses[key] = srv_uses.get(key, 0) + 1
+                index += 1
+                yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": {
+                    "type": rtype, "tool_use_id": srv_ids[x["id"]], "content": block}}
+                yield close()
             continue
         if kind == "event":
             ev: Event = x
@@ -5173,11 +5225,15 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             # which is cache_read_input_tokens (message_start could only say the whole prompt).  At least the last
             # prompt token is always read, and Claude Code takes an input_tokens of 0 as "not given" and keeps
             # message_start's whole prompt beside cache_read_input_tokens: the prompt counted twice (#1013)
-            reused = max(0, min(x.get("reused") or 0, len(ids) - 1))
+            total_in = int(x.get("prompt_tokens") or len(ids))       # run_with_mcp: the last round's prompt
+            reused = max(0, min(x.get("reused") or 0, total_in - 1))
+            usage = {"input_tokens": total_in - reused, "cache_read_input_tokens": reused,
+                     "output_tokens": x["completion_tokens"]}
+            if srv_uses:
+                usage["server_tool_use"] = dict(srv_uses)
             yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
                                                                        "stop_sequence": x.get("stop_sequence")},
-                                    "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
-                                              "output_tokens": x["completion_tokens"]}}
+                                    "usage": usage}
             yield "message_stop", {"type": "message_stop"}
 
 
@@ -6424,13 +6480,15 @@ def make_handler(svc: Service):
                 return
             svc.load()
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw, stx = anthropic_request(req, svc.anthropic_think_unasked)
             req, kw = helper_calls.apply(helper, req, kw)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            max_req = max_new = int(req.get("max_tokens") or 0)        # 0/-1: the rest of the context
+            # 0.94 (serve/server_tools.py): the server tools this request declared run here, mid-answer
+            runner = server_tools_api.Runner(stx, svc.server_tool_rounds) if stx.server and tools else None
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
@@ -6438,7 +6496,10 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            run = run_with_mcp(svc, runner, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                               runner.names(), force=force) if runner else None
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force, run=run,
+                                      server=stx)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
@@ -7312,6 +7373,10 @@ def main() -> int:
     if not isinstance(hc, bool):
         raise SystemExit(f"[strata] config \"claude_code_helpers\" must be true or false, not {hc!r}")
     svc.helper_calls = hc
+    ts = cfg.get("tool_search", "on")                   # 0.94: serve/toolsearch.py ("off": deferred tools listed as before)
+    if ts not in ("on", "off"):
+        raise SystemExit(f"[strata] config \"tool_search\" must be \"on\" or \"off\", not {ts!r}")
+    server_tools_api.TOOL_SEARCH = ts == "on"
     recovery = cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
