@@ -1,15 +1,33 @@
 # V4.1 image input
 
-## Windows (Delta Inference Engine, 0.92): on by default
+## Windows (Delta Inference Engine): on by default since 0.94
 
-Pictures work out of the box.  Setup downloads `DeepSeek-V4.1-Flash-1017-Vision.gguf` (0.97 GB, SHA-256 checked) from
-`nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF` into the model folder, with PyTorch's CPU build (124 MB) in `.venv`.
-DeepSeek's image code ships in `tools/v41/vision/deepseek/` (MIT, unchanged).  The encoder runs on the CPU: no VRAM is
-taken from the expert cache.  Measured on an RTX 3090 + i5-13600K: a 1024x701 photo (444 tokens) encodes in ~8 s, a
-450x308 one in ~2.6 s.  The first answer arrives in ~19 s and ~7 s; decode was 39.8 vs 42.1 tok/s text-only (one run
-each, within run-to-run spread); start 57 vs 52 s.  `vision-choice.txt` (or `DS41_VISION`) holds `cpu` (default), `gpu`
-(the engine's card: 0.15 s per photo, but 1.65 GiB of the expert cache) or `off`.  The output matches DeepSeek's BF16
-weights exactly (test_ds41_vision.py).
+0.92 and 0.93 shipped pictures off (`Enable Pictures.bat` turned them on); 0.94 turns them on.  The first start
+downloads `DeepSeek-V4.1-Flash-1017-Vision.gguf` (0.97 GB, SHA-256 checked) from
+`nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF` into the model folder, with PyTorch in `.venv`.  DeepSeek's image code
+ships in `tools/v41/vision/deepseek/` (MIT, unchanged).  `Disable Pictures.bat` turns them off, `Enable Pictures.bat`
+on again.
+
+Where the encoder runs (`vision-choice.txt` or `DS41_VISION`; `tools/v41/serve/ds41_local.py`, `vision_place`):
+
+| Choice | Where | Notes |
+| --- | --- | --- |
+| `on` (default) | the second card when the Setup card's multi-GPU switch is on and one is found (`setup_panel.helper_gpu`), else the CPU | never the engine's card |
+| `cpu` | the CPU, 6 threads | PyTorch's CPU build (124 MB); no VRAM |
+| `gpu:N` | card N (nvidia-smi's number) | PyTorch's CUDA build (cu130: 2.0 GB download, ~2.9 GB installed) |
+| `main` (old spelling `gpu`) | the engine's card | ~1.5 GiB of the expert cache |
+| `off` | text only | |
+
+On a card the encoder runs in bf16 alone on it (`cuda_device` in the config's `vision` section ->
+`CUDA_VISIBLE_DEVICES`).  On the multi-GPU helper's card the helper holds 2 GiB fewer experts
+(`VISION_GPU_GIB`).  A card choice without the CUDA build falls back to the CPU with one line; the next start offers the
+2.0 GB download.
+
+Measured 11-07 (a 1024x701 picture, 444 tokens): RTX 3060 bf16 0.41 s, 1.5 GiB on the card after the warm-up;
+i5-13600K 6 threads 11.5 s while another job ran (~8 s idle, 0.92 measurement).  OpenAI's `detail: "low"` caps a
+picture at 256 tokens (`ENCMAX 256` on the encoder's protocol): the same picture is 230 tokens, 0.20 s / 5.0 s.  Earlier
+(0.92): the first answer ~19 s on the CPU encoder; decode 39.8 vs 42.1 tok/s text-only (one run each, within run-to-run
+spread); start 57 vs 52 s.  The CPU output matches DeepSeek's BF16 weights exactly (test_ds41_vision.py).
 
 `ds41_generate --serve --vision` accepts image embeddings through `GENI`.
 `tools/v41/serve/serve_ds41.py` connects OpenAI and Anthropic image content blocks

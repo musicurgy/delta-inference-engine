@@ -21,11 +21,18 @@
 * "model_name" / "display_name": named after the model file the engine loads (deepseek-v4.1-flash-1017-ds4-q2 /
   -gsq-iq2_xs / -ud-iq1_s ...; "DeepSeek V4.1 Flash · Unsloth UD-IQ1_S"), so /v1/models and the chat page say which
   one runs.  A model_name of your own in the config is kept.  The server answers any model name a client sends.
-* "vision" (pictures, off by default): DS41_VISION, else vision-choice.txt: "cpu", "gpu" or "off" (default).
-  Set up (setup's pictures step: DeepSeek-V4.1-Flash-1017-Vision.gguf in the model folder, PyTorch in .venv; DeepSeek's
-  image code ships in tools/v41/vision/deepseek), the server runs tools/v41/vision/ds41_vision.py beside the engine and the
-  engine gets --vision.  "cpu" takes no VRAM; "gpu" encodes on the engine's card, its VRAM taken from the expert cache.
-  On but not set up: one line saying what is missing, and the model starts text only.
+* "vision" (pictures, on by default since 0.94): DS41_VISION, else vision-choice.txt:
+    on (default)      the second card when the Setup card's multi-GPU switch is on and there is one, else the CPU
+    cpu               the CPU (no VRAM)
+    gpu:N             card N (nvidia-smi's number)
+    main (old: gpu)   the engine's card: the fastest, but its ~1.5 GiB come out of the expert cache
+    off               text only
+  Set up (setup's pictures step: DeepSeek-V4.1-Flash-1017-Vision.gguf in the model folder, PyTorch in .venv - the CUDA
+  build only when the choice is a card; DeepSeek's image code ships in tools/v41/vision/deepseek), the server runs
+  tools/v41/vision/ds41_vision.py beside the engine and the engine gets --vision.  A card without PyTorch's CUDA build:
+  the CPU, said in one line.  On the multi-GPU helper's card the helper holds VISION_GPU_GIB less.  On but not set up:
+  one line saying what is missing, and the model starts text only.
+  "ds41_local.py --vision-setup" prints what the launchers need: the plan (off / cpu / cuda) and the PyTorch there is.
 """
 import ctypes
 import importlib.util
@@ -277,9 +284,10 @@ def expand(cfg):
             a[a.index("--vram-margin") + 1] = f"{margin:g}"
         else:
             a += ["--vram-margin", f"{margin:g}"]
+    vision = vision_section(m, out.get("gpu"))
     # the chat page's multi-GPU switch: the helper on the second card (serve_ds41.py starts it beside the engine)
-    plan = helper_plan(out, a)
-    hf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local", "helper.json")
+    plan = share_card(helper_plan(out, a), vision)
+    hf =os.path.join(os.path.dirname(os.path.abspath(__file__)), "local", "helper.json")
     if plan:
         os.makedirs(os.path.dirname(hf), exist_ok=True)
         with open(hf, "w", encoding="utf-8") as f:
@@ -288,12 +296,19 @@ def expand(cfg):
         print(f"ds41_local: multi-GPU on: {plan['gpu_name']} holds experts ({plan['gib']:g} GiB)")
     elif os.path.exists(hf):
         os.remove(hf)
-    vision = vision_section(m)
     if vision:
         out["vision"] = vision
         if "--vision" not in a:   # here, not by the server: it would add --vram-reserve-mib, which this engine refuses
             a.append("--vision")
     return out
+
+
+def share_card(plan, vision):
+    """The helper's plan with VISION_GPU_GIB fewer experts when the picture encoder runs on its card (else unchanged)."""
+    if plan and vision and vision.get("cuda_device") == plan["gpu"]:
+        plan = {**plan, "gib": plan["gib"] - VISION_GPU_GIB, "args": list(plan["args"])}
+        plan["args"][plan["args"].index("--gib") + 1] = f"{plan['gib']:g}"
+    return plan
 
 
 def helper_plan(out, a):
@@ -316,7 +331,14 @@ def helper_plan(out, a):
 
 
 VISION_FILE = "DeepSeek-V4.1-Flash-1017-Vision.gguf"   # nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF
-VISION_DEFAULT = "off"   # off by default (the user, 0.92); "cpu" takes no VRAM, decode unchanged (round 190)
+# on by default since 0.94 (the user, 11-07; off in 0.92 / 0.93), never on the engine's card unless asked: the CPU takes
+# no VRAM (decode unchanged, round 190); a second card reads a picture ~25x faster (RTX 3060, bf16: 0.41 vs 11.5 s on
+# 6 CPU threads for a 1024x701 picture, 11-07)
+VISION_DEFAULT = "on"
+VISION_OFF = ("off", "0", "no", "none", "false", "disable", "disabled")
+# what the encoder holds on a card: 1.4 GiB after its warm-up (bf16, a 1,001-token picture) + the CUDA context, 1.5 GiB
+# measured on an RTX 3060 (11-07); the multi-GPU helper keeps this much fewer experts when they share its card
+VISION_GPU_GIB = 2.0
 
 
 def vision_choice():
@@ -328,6 +350,51 @@ def vision_choice():
         except OSError:
             v = ""
     return v or VISION_DEFAULT
+
+
+def vision_place(mode, engine_gpu=None, gpus=None):
+    """Where pictures are read: ("off" | "cpu" | "gpu", the card's nvidia-smi number or None for the engine's own,
+    a note for the startup line); (None, None, why) for a choice that is not one.  "on" / "auto": the multi-GPU
+    helper's card when the Setup card's switch is on and such a card is there, else the CPU - never the engine's card
+    by default (it would take the experts' VRAM)."""
+    mode = (mode or VISION_DEFAULT).strip().lower()
+    if mode in VISION_OFF:
+        return "off", None, ""
+    if engine_gpu is None:
+        g = os.environ.get("DS41_GPU", "").strip()
+        engine_gpu = int(g) if g.isdigit() else None
+    if mode in ("on", "auto", "yes", "true", "1"):
+        if not page_settings().get("multi_gpu"):
+            return "cpu", None, ""
+        import setup_panel
+        h = setup_panel.helper_gpu(setup_panel.list_gpus() if gpus is None else gpus, engine_gpu)
+        if h is None:
+            return "cpu", None, "multi-GPU is on, but no second card was found"
+        return "gpu", h["index"], f"on {h['name']}, GPU {h['index']}: the multi-GPU card"
+    if mode == "cpu":
+        return "cpu", None, ""
+    main_card = "on the engine's card: its VRAM comes out of the expert cache"
+    if mode in ("main", "gpu"):
+        return "gpu", None, main_card
+    m = re.fullmatch(r"(?:gpu|cuda)\s*[:=]?\s*(\d+)", mode)
+    if m:
+        n = int(m.group(1))
+        if engine_gpu is not None and n == engine_gpu:
+            return "gpu", None, main_card
+        if gpus is None:
+            import setup_panel
+            gpus = setup_panel.list_gpus()
+        if gpus and not any(x["index"] == n for x in gpus):
+            return "cpu", None, f"there is no GPU {n} (nvidia-smi's numbers)"
+        return "gpu", n, f"on GPU {n}"
+    return None, None, f"pictures {mode!r} (DS41_VISION / vision-choice.txt): use on, cpu, gpu:N, main or off"
+
+
+def vision_plan():
+    """For the launchers (--vision-setup): "<plan> <torch>" - plan "off", "cpu" or "cuda" (pictures on a card: setup
+    installs PyTorch's CUDA build, a 2.0 GB download), torch the PyTorch in this Python: "none", "cpu" or "cuda"."""
+    where = vision_place(vision_choice())[0]
+    return f"{'cuda' if where == 'gpu' else where or 'off'} {torch_build() or 'none'}"
 
 
 def torch_build():
@@ -343,29 +410,36 @@ def torch_build():
     return "cpu" if re.search(r"^cuda\s*(?::[^=]*)?=\s*None", text, re.M) else "cuda"
 
 
-def vision_section(m):
+def vision_section(m, engine_gpu=None):
     """The server's "vision" section for the pictures choice, or None (off, or not set up: said in one line)."""
-    mode = vision_choice()
-    if mode in ("off", "0", "no", "none", "false"):
+    where, dev, note = vision_place(vision_choice(), engine_gpu)
+    if where is None:
+        print(f"ds41_local: {note} - text only")
         return None
-    if mode not in ("cpu", "gpu"):
-        print(f"ds41_local: pictures {mode!r} (DS41_VISION / vision-choice.txt): use cpu, gpu or off - text only")
+    if where == "off":
         return None
     side, ref = m + "/" + VISION_FILE, ROOT.replace("\\", "/") + "/tools/v41/vision/deepseek"
     missing = [os.path.basename(p) for p in (side, ref + "/vision.py") if not os.path.exists(p)]
     build = torch_build()
     if build is None:
         missing.append("PyTorch")
-    elif mode == "gpu" and build != "cuda":
-        missing.append("PyTorch with CUDA (this one is the CPU build: choose cpu, or install the CUDA build)")
     if missing:
-        print(f"ds41_local: pictures are on ({mode}) but not set up - missing {', '.join(missing)}: text only.  "
-              f"setup-ds41-models.bat pictures sets them up")
+        print(f"ds41_local: pictures are on but not set up - missing {', '.join(missing)}: text only.  "
+              f"Enable Pictures.bat sets them up (Disable Pictures.bat turns them off)")
         return None
+    if where == "gpu" and build != "cuda":
+        print(f"ds41_local: pictures would run {note}, but this PyTorch is the CPU build: they run on the CPU.  "
+              f"Enable Pictures.bat installs the CUDA build (a 2.0 GB download)")
+        where, note = "cpu", ""
+    elif note and where == "cpu":
+        print(f"ds41_local: pictures on the CPU ({note})")
     v = {"exe": ROOT.replace("\\", "/") + "/tools/v41/vision/ds41_vision.py", "mmproj": side,
-         "model": os.environ["DS41_GGUF"], "reference_dir": ref, "gpu": mode == "gpu"}
-    if mode == "gpu":   # DS41_VISION_DTYPE=f32: the CPU's exact output, ~1.1 GB more VRAM
+         "model": os.environ["DS41_GGUF"], "reference_dir": ref, "gpu": where == "gpu"}
+    if where == "gpu":   # DS41_VISION_DTYPE=f32: the CPU's exact output, ~1.1 GB more VRAM
         v["dtype"] = os.environ.get("DS41_VISION_DTYPE", "").strip().lower() or "bf16"
+        if dev is not None:   # the server starts the encoder with CUDA_VISIBLE_DEVICES=dev (server.vision_env)
+            v["cuda_device"] = dev
+        v["where"] = note
     else:   # i5-13600K: 6 threads 8.1 s for a 1024x701 photo, 14 threads 9.2 s (the E-cores slow it down)
         v["threads"] = max(1, min(6, os.cpu_count() or 1))
     return v
@@ -393,6 +467,9 @@ def model_names(path):
 
 
 def main():
+    if sys.argv[1:] == ["--vision-setup"]:   # first-start.bat, setup-ds41-models.bat: "<plan> <torch>"
+        print(vision_plan())
+        return
     if len(sys.argv) != 3:
         sys.exit(__doc__)
     try:
@@ -433,7 +510,8 @@ def main():
         print("ds41_local: tip - with this much RAM, Unsloth's UD-IQ1_S writes faster than the default (measured 36 / 31 "
               "vs 27 / 20 tok/s at 96 / 64 GB; 89.1 vs 89.9% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
     if cfg.get("vision"):
-        print(f"ds41_local: pictures on ({'on the GPU' if cfg['vision']['gpu'] else 'on the CPU'})")
+        where = (cfg["vision"].get("where") or "on the GPU") if cfg["vision"]["gpu"] else "on the CPU"
+        print(f"ds41_local: pictures on ({where}); Disable Pictures.bat turns them off")
     for p in missing:
         print(f"ds41_local: MISSING {p}  (see README.md, 'Setup')")
     sys.exit(1 if missing else 0)

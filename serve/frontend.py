@@ -177,6 +177,15 @@ def _image_source(part: dict) -> str:
     return url or ""
 
 
+def _image_detail(part: dict) -> dict:
+    """0.94: OpenAI's image detail ({"image_url": {"url": ..., "detail": "low"}}, or "detail" beside a Responses
+    input_image) as {"detail": "low" | "high"}; "auto", none or anything else: {} (the encoder's own size)."""
+    url = part.get("image_url")
+    d = url.get("detail") if isinstance(url, dict) else None
+    d = str(d or part.get("detail") or "").strip().lower()
+    return {"detail": d} if d in ("low", "high") else {}
+
+
 def _parts_of(content):
     """Message content for the template: a string when there is no image (unchanged behaviour), otherwise the
     template's list form - text items and image items, in order - whose image items carry their source."""
@@ -187,7 +196,7 @@ def _parts_of(content):
         if not isinstance(part, dict):
             continue
         if part.get("type") in IMAGE_PARTS:
-            items.append({"type": "image", "source": _image_source(part)})
+            items.append({"type": "image", "source": _image_source(part), **_image_detail(part)})
         elif part.get("type") in TEXT_PARTS and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -223,6 +232,12 @@ def _check_parts(content, path: str, kinds):
             LOGGER.debug("%s[%d].type: content part of type %r is not read by this server; left out of the prompt",
                          path, j, kind)
     return out
+
+
+def image_details_of(messages: list[dict]) -> list:
+    """Each image's detail ("low" / "high" / None), in the same order as images_of."""
+    return [item.get("detail") for m in messages if isinstance(m.get("content"), list)
+            for item in m["content"] if item.get("type") == "image"]
 
 
 def images_of(messages: list[dict]) -> list[str]:

@@ -79,7 +79,8 @@ def _content(content, param):
             if not part.get("image_url"):
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
-            parts.append({"type": "input_image", "image_url": part["image_url"]})
+            parts.append({"type": "input_image", "image_url": part["image_url"],
+                          **({"detail": part["detail"]} if part.get("detail") else {})})
         else:
             raise ResponsesError(f"content parts of type {kind!r} are not supported (text and images are)",
                                  f"{param}[{j}].type", "unsupported_parameter")

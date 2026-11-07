@@ -179,15 +179,22 @@ if not defined DS41_NO_DRAFTER if not exist "%M%\V41-1017-MTP-iq2xxs.gguf" (
   set "NEEDDRAFT=1"
   echo   missing: the speculative-decoding drafter ^(downloads 7.9 GB, keeps 4.2 GB^)
 )
-rem pictures: on unless vision-choice.txt / DS41_VISION says off (the vision GGUF, 0.97 GB, and PyTorch's CPU build)
-set "VIS=off"
-if exist "%ROOT%\vision-choice.txt" set /p VIS=<"%ROOT%\vision-choice.txt"
-if defined DS41_VISION set "VIS=%DS41_VISION%"
+rem pictures (on since 0.94) unless vision-choice.txt / DS41_VISION says off: the vision GGUF (0.97 GB) and PyTorch -
+rem its CPU build (124 MB), or its CUDA build (2.0 GB) when pictures go to a card (the second card with multi-GPU on).
+rem ds41_local.py --vision-setup: "<plan: off / cpu / cuda> <the PyTorch there is: none / cpu / cuda>"
+set "VPLAN=cpu"
+set "VTORCH=none"
+for /f "usebackq tokens=1,2" %%a in (`".venv\Scripts\python.exe" tools\v41\serve\ds41_local.py --vision-setup`) do (
+  set "VPLAN=%%a"
+  set "VTORCH=%%b"
+)
 set "NEEDVIS="
-if /i "%VIS%"=="cpu" set "NEEDVIS=1"
-if /i "%VIS%"=="gpu" set "NEEDVIS=1"
-if defined NEEDVIS if exist "%M%\DeepSeek-V4.1-Flash-1017-Vision.gguf.ok" ".venv\Scripts\python.exe" -c "import torch" >nul 2>&1 && set "NEEDVIS="
-if defined NEEDVIS echo   missing: pictures ^(the vision encoder, 0.97 GB, and PyTorch, 124 MB^)
+if /i not "%VPLAN%"=="off" set "NEEDVIS=1"
+if defined NEEDVIS if exist "%M%\DeepSeek-V4.1-Flash-1017-Vision.gguf.ok" if /i "%VTORCH%"=="cuda" set "NEEDVIS="
+if defined NEEDVIS if exist "%M%\DeepSeek-V4.1-Flash-1017-Vision.gguf.ok" if /i "%VTORCH%"=="cpu" if /i not "%VPLAN%"=="cuda" set "NEEDVIS="
+if defined NEEDVIS if /i "%VPLAN%"=="cuda" echo   missing: pictures on the second card ^(the vision encoder, 0.97 GB, unless it is there, and PyTorch's CUDA build, 2.0 GB; without it pictures are read on the CPU^)
+if defined NEEDVIS if /i not "%VPLAN%"=="cuda" echo   missing: pictures ^(the vision encoder, 0.97 GB, and PyTorch, 124 MB^)
+if defined NEEDVIS echo            ^(Disable Pictures.bat turns pictures off: then this is not asked again^)
 if not defined NEED if not defined NEEDDRAFT if not defined NEEDVIS exit /b 0
 rem what the README asks for, said before any download (the launcher's own notes come only once all is there)
 if defined VRAM_MIB if %VRAMN% LSS 11800 echo   Note: this card has %VRAM_MIB% MiB of VRAM. Under 12 GB is untested: the model may not fit on it.

@@ -11,6 +11,8 @@ PROTOCOL (strata_vision.cpp:12-16, 184-233)
            [--min-tokens N] [--flash-attn on|off|auto]        (server.py:1268 builds exactly this)
   stdout : "READY <n_embd>\\n" once (server.py:1297), then per stdin line
              "ENC <image path> <output path>"  ->  "OK <n> <nx> <ny> <ms>"  or  "ERR <message>"
+             "ENCMAX <n> <image path> <output path>": the same with a lower token cap for this picture (OpenAI's
+                                                    detail: "low"; never above --max-tokens)
              "QUIT"                            ->  exit 0
            The server reads `line.split()[1]` as the number of <|image_pad|> tokens to splice in
            (server.py:1384, server.py:2294).
@@ -40,6 +42,7 @@ ADAPTED (documented deviations from strata_vision.cpp)
 """
 
 import argparse
+import copy
 import functools
 import json
 import os
@@ -294,10 +297,15 @@ class Encoder:
                 setattr(self, n, getattr(self, n).to("cuda"))
         self.device = device
 
-    def encode(self, image_bytes):
-        """-> (span [n, n_embd] float32 CPU tensor, n_llm_h, n_llm_w, n_vit_h, n_vit_w)."""
+    def encode(self, image_bytes, max_tokens=None):
+        """-> (span [n, n_embd] float32 CPU tensor, n_llm_h, n_llm_w, n_vit_h, n_vit_w).  `max_tokens`: a lower cap for
+        this picture (detail "low"); it never raises the encoder's own."""
         torch = self.torch
-        patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = self.load_image({"data": image_bytes}, self.args)
+        args = self.args
+        if max_tokens and 8 <= int(max_tokens) < args.vision_max_n_token:
+            args = copy.copy(args)
+            args.vision_max_n_token = int(max_tokens)
+        patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = self.load_image({"data": image_bytes}, args)
         patches = patches.to(self.device).to(self.dtype)
         with torch.inference_mode():
             embeds = self.aligner(self.vit(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
@@ -357,10 +365,18 @@ def serve(enc, args):
         line = line.strip()
         if line == "QUIT":
             break
-        if not line.startswith("ENC "):
+        cap = None
+        if line.startswith("ENCMAX "):             # ENCMAX <n> <image> <output>: this picture's own token cap
+            head, _, rest = line[7:].partition(" ")
+            if not head.isdigit() or not rest:
+                print("ERR expected: ENCMAX <tokens> <image> <output>", flush=True)
+                continue
+            cap = int(head)
+        elif line.startswith("ENC "):
+            rest = line[4:]
+        else:
             print("ERR expected: ENC <image> <output>", flush=True)
             continue
-        rest = line[4:]
         cut = rest.rfind(" ")                       # strata_vision.cpp:46-54 (paths may contain spaces)
         if cut <= 0:
             print("ERR expected: ENC <image> <output>", flush=True)
@@ -370,7 +386,7 @@ def serve(enc, args):
         try:
             with open(img, "rb") as f:
                 data = f.read()
-            span, n_llm_h, n_llm_w, _, _ = enc.encode(data)
+            span, n_llm_h, n_llm_w, _, _ = enc.encode(data, cap) if cap else enc.encode(data)
             n = int(span.shape[0])
             nx, ny = sve_grid(n, n_llm_h, n_llm_w)
             write_sve(out, span, nx, ny)

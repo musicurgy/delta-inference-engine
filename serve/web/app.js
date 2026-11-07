@@ -101,8 +101,9 @@ let health = {model: "deepseek", images: false, max_context: 0};
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
-    $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
+    $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop or paste it here)"
                                           : "Attach a text file (or drop it here)";
+    $("screen-btn").hidden = $("camera-btn").hidden = !health.images;
     $("tab-btn-images").hidden = !health.image_generation;
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
@@ -1064,11 +1065,105 @@ for (const id of ["chat", "composer"]) {
   });
 }
 $("file").onchange = () => { addFiles($("file").files); $("file").value = ""; };
+function pastedPictures(e) {
+  return [...(e.clipboardData || {}).files || []].filter((f) => f.type.startsWith("image/"));
+}
 $("input").addEventListener("paste", (e) => {
   if (!health.images) return;
-  const files = [...(e.clipboardData || {}).files || []].filter((f) => f.type.startsWith("image/"));
+  const files = pastedPictures(e);
   if (files.length) { e.preventDefault(); addFiles(files); }
 });
+// a picture pasted anywhere on the chat (not only in the message box) is attached too
+document.addEventListener("paste", (e) => {
+  if (!health.images || tab !== "chat" || e.target.closest("textarea, input, [contenteditable]")) return;
+  const files = pastedPictures(e);
+  if (files.length) { e.preventDefault(); addFiles(files); $("input").focus(); }
+});
+
+// screenshot and camera buttons: one frame of a screen / window / tab (getDisplayMedia) or of the camera
+// (getUserMedia) becomes a picture attachment.  Browsers allow both only on https:// or http://127.0.0.1 / localhost.
+function captureUnavailable(what) {
+  toast("warn", `${what} is not available`, window.isSecureContext
+    ? "This browser does not offer it."
+    : `Browsers allow it only on pages opened as http://127.0.0.1 or https://. Open the chat at http://127.0.0.1:${location.port || 80}/ on this PC.`, 8000);
+}
+function frameOf(video) {
+  const c = document.createElement("canvas");
+  c.width = video.videoWidth;
+  c.height = video.videoHeight;
+  if (!c.width || !c.height) throw new Error("no picture came through");
+  c.getContext("2d").drawImage(video, 0, 0);
+  return c;
+}
+async function attachCanvas(c, base, png) {
+  let blob = await new Promise((r) => c.toBlob(r, png ? "image/png" : "image/jpeg", 0.92));
+  if (blob && blob.size > 20e6) blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));   // a huge screen
+  if (!blob) throw new Error("the picture could not be saved");
+  const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, "-");
+  const ext = blob.type === "image/png" ? "png" : "jpg";
+  addFiles([new File([blob], `${base}-${stamp}.${ext}`, {type: blob.type})]);
+  $("input").focus();
+}
+async function playStream(stream) {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.srcObject = stream;
+  await video.play();
+  return video;
+}
+$("screen-btn").onclick = async () => {
+  const md = navigator.mediaDevices;
+  if (!md || !md.getDisplayMedia) return captureUnavailable("Screen capture");
+  let stream;
+  try {
+    stream = await md.getDisplayMedia({video: true, audio: false});
+    const video = await playStream(stream);
+    await new Promise((r) => setTimeout(r, 300));   // the first frames can still be blank or show the picker
+    await attachCanvas(frameOf(video), "screenshot", true);   // PNG: small text stays sharp
+  } catch (e) {
+    if (e && e.name === "NotAllowedError") return;   // the user closed the picker
+    toast("error", "No screenshot", String(e && e.message || e), 8000);
+  } finally {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+  }
+};
+$("camera-btn").onclick = async () => {
+  const md = navigator.mediaDevices;
+  if (!md || !md.getUserMedia) return captureUnavailable("The camera");
+  let stream;
+  try {
+    stream = await md.getUserMedia({video: {width: {ideal: 1920}, height: {ideal: 1080}}, audio: false});
+  } catch (e) {
+    toast("warn", "No camera", e && e.name === "NotAllowedError" ? "The browser was not allowed to use the camera."
+                                                                  : String(e && e.message || e), 8000);
+    return;
+  }
+  // a small dialog with the live picture: Take photo / Cancel (Esc)
+  const dlg = document.createElement("dialog");
+  dlg.className = "capture-dialog";
+  dlg.setAttribute("aria-label", "Camera");
+  dlg.innerHTML = `<video autoplay muted playsinline></video>
+    <div class="capture-dialog__bar"><button type="button" class="st-btn st-btn--secondary" data-act="cancel">Cancel</button>
+    <button type="button" class="st-btn st-btn--primary" data-act="take">Take photo</button></div>`;
+  document.body.appendChild(dlg);
+  const video = dlg.querySelector("video");
+  video.srcObject = stream;
+  const done = () => { stream.getTracks().forEach((t) => t.stop()); dlg.remove(); };
+  dlg.addEventListener("close", done);
+  dlg.querySelector("[data-act=cancel]").onclick = () => dlg.close();
+  dlg.querySelector("[data-act=take]").onclick = async () => {
+    try {
+      const c = frameOf(video);
+      dlg.close();
+      await attachCanvas(c, "camera", false);
+    } catch (e) {
+      toast("error", "No photo", String(e && e.message || e), 8000);
+    }
+  };
+  dlg.showModal();
+  dlg.querySelector("[data-act=take]").focus();
+};
 
 // ------------------------------------------------------------------ the sampling drawer
 function openDrawer(open) {

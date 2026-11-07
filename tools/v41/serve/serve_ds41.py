@@ -264,6 +264,7 @@ def _expand_images_ds41(self, ids, encoded):
 
 S.Service.expand_image_tokens = _expand_images_ds41
 _Vision = S.Vision
+DETAIL_LOW_TOKENS = 256
 
 
 class Ds41Vision(_Vision):
@@ -278,6 +279,11 @@ class Ds41Vision(_Vision):
         if cfg.get("dtype"):     # "bf16" on a GPU: half the weights' VRAM (DeepSeek's reference runs the ViT in bf16)
             args += ["--dtype", str(cfg["dtype"])]
         self.spawn = (args, log, env)
+        # OpenAI's detail "low": at most DETAIL_LOW_TOKENS per picture instead of up to 1,024 (a 1024x701 picture: 230
+        # tokens instead of 444, read in 5.0 instead of 11.5 s on 6 CPU threads; 11-07).  Still above the model's
+        # minimum picture area (295,936 px = 184 tokens for a square)
+        top = int(cfg.get("max_tokens") or 1024)
+        self.DETAIL_TOKENS = {"low": DETAIL_LOW_TOKENS} if DETAIL_LOW_TOKENS < top else {}
         if not lazy and not self.lazy_vision and not self.elastic:
             try:
                 self._start()
@@ -285,7 +291,7 @@ class Ds41Vision(_Vision):
                 print(f"[strata] pictures: the image encoder did not start ({e}); the model starts without pictures - "
                       f"each picture tries it again", flush=True)
 
-    def encode(self, source, keep=()):
+    def encode(self, source, keep=(), detail=None):
         # the resident encoder died, timed out (STRATA_VISION_ENCODE_S) or never started: the base class writes to the
         # dead process and pictures stayed broken until a restart of the server - start it again for this picture
         if not self.alive() and not self.lazy_vision and not self.elastic:
@@ -294,7 +300,7 @@ class Ds41Vision(_Vision):
                 self.restart()
             except RuntimeError as e:
                 raise ValueError(f"pictures are not working: the image encoder did not start ({e})") from None
-        return super().encode(source, keep)
+        return super().encode(source, keep, detail)
 
 
 S.Vision = Ds41Vision
