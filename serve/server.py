@@ -82,6 +82,7 @@ from serve import response_store as store_api  # noqa: E402  (0.94: stored Respo
 from serve.response_store import ResponseStore, StoreBusy  # noqa: E402
 from serve.response_jobs import BackgroundJobs, JobError  # noqa: E402
 from serve import loop_guard  # noqa: E402  (0.94: a note when an agent repeats one tool call)
+from serve import timing  # noqa: E402  (0.94, opt-in: where a request's time goes outside the engine)
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -303,6 +304,8 @@ class MockEngine:
         self.last_prompt: list[int] = []
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        if timing.ON:
+            timing.stamp("sent")
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings
         if len(self.scripts) > 1:
@@ -2009,6 +2012,8 @@ class StrataEngine:
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
+            if timing.ON:
+                timing.stamp("sent")
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
@@ -2050,6 +2055,8 @@ class StrataEngine:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()                  # any line is output: T, PP, RESUME, INFO ...
+                if timing.ON:
+                    timing.stamp("first line")
                 beat = heard
                 if stall_state:
                     stall_state.clear()
@@ -4127,10 +4134,16 @@ class Service:
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         self.rendered.text = prompt                     # C11: for prepare's effort_check
+        if timing.ON:
+            timing.stamp("rendered", chars=len(prompt))
         if not changed:
-            return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt, self.literals)
-        return self.tok.encode(prompt, parse_special=True, plain=plain)
+            ids = self.tok.encode(prompt, parse_special=True)
+        else:
+            prompt, plain = unmark_think_literals(prompt, self.literals)
+            ids = self.tok.encode(prompt, parse_special=True, plain=plain)
+        if timing.ON:
+            timing.stamp("tokenized", tokens=len(ids))
+        return ids
 
     @contextlib.contextmanager
     def _turn(self, cancel=None):
@@ -4204,8 +4217,12 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
+        if timing.ON:
+            timing.stamp("converted")
         messages = self._loop_guard(messages)
         fetched = self._note_unreadable_tool_images(messages, cancel)
+        if timing.ON:
+            timing.stamp("images")
         self.rendered.text = None
         ids = self.encode_prompt(messages, tools, kwargs)
         if self.rendered.text is not None:
@@ -4282,6 +4299,8 @@ class Service:
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
+        if timing.ON:
+            timing.stamp("prepared")
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
@@ -4585,6 +4604,8 @@ class Service:
                     return
             if place is not None:
                 order.took(place)
+            if timing.ON:
+                timing.stamp("turn")
             with turn:
                 try:
                     with self.status_lock:
@@ -4609,6 +4630,8 @@ class Service:
                             with self.status_lock:
                                 self.status["queued"] -= 1
                         raise
+                    if timing.ON:
+                        timing.stamp("loaded")
                     with self.status_lock:
                         if par:
                             self.status["queued"] -= 1
@@ -4647,6 +4670,8 @@ class Service:
                                     yield "ping", None
                                     continue
                                 n += 1
+                                if timing.ON and n == 1:
+                                    timing.stamp("first token")
                                 if place is not None and n == 1:
                                     order.first_token(place)    # a suggestion told to stop ends here
                                 if trace is not None and trace["first_token_s"] is None:
@@ -5891,6 +5916,8 @@ def make_handler(svc: Service):
                         if key in obj:
                             self.record[key] = obj[key]
             body = json.dumps(obj, ensure_ascii=False).encode()
+            if timing.ON:
+                timing.stamp("first sent")                    # (the whole answer, without streaming)
             if self.watch_done is not None:                  # upstream #107: the answer is whole; a client that closes on its
                 self.watch_done.set()                        # last byte has not hung up.  A failed send still lands in OSError.
             self.send_response(code)
@@ -6179,11 +6206,16 @@ def make_handler(svc: Service):
                 self._post()
             except BadBody as e:                              # #893: a malformed or oversized chunked body
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            finally:
+                if timing.ON:                                 # 0.94 (opt-in): the request's timing line
+                    timing.finish()
 
         def _post(self):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            if timing.ON and path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                timing.start(path)
             if (path.startswith("/v1/") or path in ("/tokenize", "/detokenize", "/apply-template", "/rerank"))                     and self._foreign_page():
                 return
             if path in ("/v1/audio/transcriptions", "/v1/audio/speech"):   # local: the voice sidecar
@@ -6231,6 +6263,8 @@ def make_handler(svc: Service):
             try:
                 self.raw_body = self._body() or b"{}"
                 req = json.loads(self.raw_body)
+                if timing.ON:
+                    timing.stamp("parsed")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
                 if path == "/v1/responses/input_tokens":     # OpenAI's token count for a Responses request
@@ -6694,6 +6728,9 @@ def make_handler(svc: Service):
                     else:
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
+                    if timing.ON and c is not None and any(c["choices"][0]["delta"].get(k) for k in (
+                            "content", "reasoning_content", "tool_calls")):
+                        timing.stamp("first sent")
                 self.wfile.write(b"data: [DONE]\n\n")
             except OSError:
                 self._note(outcome="disconnected")
@@ -6797,6 +6834,8 @@ def make_handler(svc: Service):
                         send(e)
                         last = time.monotonic()
                     self.wfile.flush()
+                    if timing.ON and e is not None and str(e.get("type", "")).endswith(".delta"):
+                        timing.stamp("first sent")
             except OSError:
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
@@ -7330,6 +7369,8 @@ def make_handler(svc: Service):
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
+                    if timing.ON and item is not None and item[0] == "content_block_delta":
+                        timing.stamp("first sent")
             except OSError:
                 self._note(outcome="disconnected")
                 cancel.set()
@@ -8210,7 +8251,14 @@ def main() -> int:
         svc.loop_guard_repeats = loop_guard.setting(cfg.get("loop_guard"))
     except ValueError as e:
         raise SystemExit(f"[strata] config {e}") from None
-    rsd = cfg.get("responses_store_default", False)     # 0.94: store a response that does not say (OpenAI's default)
+    tm = cfg.get("timing", False)                       # 0.94 (opt-in): serve/timing.py, also STRATA_TIMING=1
+    if not isinstance(tm, bool):
+        raise SystemExit(f"[strata] config \"timing\" must be true or false, not {tm!r}")
+    if tm:
+        timing.ON = True
+    if timing.ON:
+        print("[strata] timing on: one line per request with the ms between its steps (serve/timing.py)", flush=True)
+    rsd =cfg.get("responses_store_default", False)     # 0.94: store a response that does not say (OpenAI's default)
     if not isinstance(rsd, bool):
         raise SystemExit(f"[strata] config \"responses_store_default\" must be true or false, not {rsd!r}")
     svc.responses_store_default = rsd
