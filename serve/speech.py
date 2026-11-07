@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hmac
 import io
 import json
 import os
@@ -431,12 +432,38 @@ class Tts:
 
 
 # ------------------------------------------------------------------------------------------------ the HTTP server
-def make_handler(kind: str, model, log):
+TOKEN_ENV = "STRATA_VOICE_TOKEN"          # serve/voice.py starts this server with a random token in this variable
+TOKEN_HEADER = "X-Strata-Voice-Token"     # and sends it with every request it forwards
+
+
+def make_handler(kind: str, model, log, token: str = ""):
+    """0.94 (cross-site requests): any web page could POST to 127.0.0.1:5110 / 5210 - a text/plain or multipart body
+    needs no CORS preflight - and keep the efficiency cores busy.  So a request that carries an Origin (browsers send
+    one with every POST; Strata's proxy and curl do not) or names another Host (DNS rebinding) is refused, read-aloud
+    takes application/json only, and with `token` (Strata's own start) every POST must carry it in TOKEN_HEADER."""
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
 
         def log_message(self, *a):
             pass
+
+        def refused(self, post: bool) -> bool:
+            """Answer 403 and True when the request is not from this PC's own programs (see make_handler)."""
+            port = self.server.server_address[1]
+            host = (self.headers.get("Host") or "").strip().lower()
+            if self.headers.get("Origin") is not None:
+                why = "requests from web pages are not accepted (send them through Strata's /v1/audio)"
+            elif host and host not in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"):
+                why = f"Host {host[:80]!r} is not this PC's address"
+            elif post and token and not hmac.compare_digest(self.headers.get(TOKEN_HEADER, "").encode(),
+                                                           token.encode()):
+                why = f"this server takes requests from Strata only (the {TOKEN_HEADER} header)"
+            else:
+                return False
+            if post:
+                self.close_connection = True             # the body is not read
+            self.error(403, why, "permission_error")
+            return True
 
         def send(self, code: int, body: bytes, ctype: str):
             self.send_response(code)
@@ -449,6 +476,8 @@ def make_handler(kind: str, model, log):
             self.send(code, json.dumps({"error": {"type": kind_, "message": message}}).encode(), "application/json")
 
         def do_GET(self):
+            if self.refused(post=False):
+                return
             if self.path.split("?")[0] == "/health":
                 self.send(200, json.dumps({"status": "ok", "kind": kind}).encode(), "application/json")
             elif self.path.split("?")[0] == "/v1/audio/voices" and kind == "tts":
@@ -457,7 +486,13 @@ def make_handler(kind: str, model, log):
                 self.error(404, "not found")
 
         def do_POST(self):
+            if self.refused(post=True):
+                return
             path = self.path.split("?")[0].rstrip("/")
+            if kind == "tts" and not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+                self.close_connection = True
+                self.error(415, "send the request as application/json")
+                return
             try:
                 n = int(self.headers.get("Content-Length", 0))
             except ValueError:
@@ -544,7 +579,7 @@ def main(argv=None) -> int:
     except Exception as e:   # noqa: BLE001
         log(f"could not load the model from {a.model}: {e}")
         return 1
-    httpd = ThreadingHTTPServer((a.host, a.port), make_handler(a.kind, model, log))
+    httpd = ThreadingHTTPServer((a.host, a.port), make_handler(a.kind, model, log, os.environ.get(TOKEN_ENV, "")))
     log(f"ready on port {a.port} ({os.path.basename(os.path.normpath(a.model))}, {where}; "
         f"loaded in {time.monotonic() - t0:.1f} s)")
     try:

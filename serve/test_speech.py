@@ -161,17 +161,18 @@ class FakeTts:
 
 
 class OverHttp(unittest.TestCase):
-    def serve(self, kind, model):
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(kind, model, lambda m: None))
+    def serve(self, kind, model, token=""):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(kind, model, lambda m: None, token))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
         return httpd.server_address[1]
 
-    def call(self, port, method, path, body=None, ctype="application/json"):
+    def call(self, port, method, path, body=None, ctype="application/json", headers=None):
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
         try:
-            c.request(method, path, body=body, headers={"Content-Type": ctype} if body is not None else {})
+            c.request(method, path, body=body,
+                      headers={**({"Content-Type": ctype} if body is not None else {}), **(headers or {})})
             r = c.getresponse()
             return r.status, r.read(), r.getheader("Content-Type")
         finally:
@@ -203,6 +204,38 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(self.call(port, "POST", "/v1/audio/speech", json.dumps({"input": " "}).encode())[0], 400)
         voices = json.loads(self.call(port, "GET", "/v1/audio/voices")[1])["voices"]
         self.assertEqual((len(voices), voices[3]), (54, "af_heart"))
+
+    def test_web_pages_and_other_host_names_are_refused(self):
+        # 0.94: any web page could POST text/plain or a form to 127.0.0.1:5210 / 5110 (no CORS preflight)
+        tts, asr = FakeTts(), FakeAsr()
+        tts.seen = None
+        tport, aport = self.serve("tts", tts), self.serve("asr", asr)
+        speak = json.dumps({"input": "Hi there."}).encode()
+        form, ftype = multipart({"file": ("a.wav", sine_wav(1.0))})
+        for headers in ({"Origin": "https://evil.example"}, {"Origin": "null"}, {"Host": f"evil.example:{tport}"}):
+            with self.subTest(headers=headers):
+                self.assertEqual(self.call(tport, "POST", "/v1/audio/speech", speak, headers=headers)[0], 403)
+                h = {**headers, "Host": f"evil.example:{aport}"} if "Host" in headers else headers
+                self.assertEqual(self.call(aport, "POST", "/v1/audio/transcriptions", form, ftype, h)[0], 403)
+        self.assertEqual(self.call(tport, "GET", "/health", headers={"Host": "evil.example"})[0], 403)
+        self.assertEqual(self.call(tport, "POST", "/v1/audio/speech", speak, "text/plain")[0], 415)
+        self.assertEqual((tts.seen, asr.seen), (None, None))                  # no model ran
+        self.assertEqual(self.call(tport, "GET", "/health", headers={"Host": f"localhost:{tport}"})[0], 200)
+
+    def test_with_a_token_only_strata_is_served(self):
+        from serve.voice import VoiceServer
+        tts = FakeTts()
+        tts.seen = None
+        port = self.serve("tts", tts, token="s3cret")
+        speak = json.dumps({"input": "Hi there.", "response_format": "wav"}).encode()
+        self.assertEqual(self.call(port, "POST", "/v1/audio/speech", speak)[0], 403)
+        self.assertEqual(self.call(port, "POST", "/v1/audio/speech", speak, headers={S.TOKEN_HEADER: "guess"})[0], 403)
+        self.assertIsNone(tts.seen)
+        self.assertEqual(self.call(port, "GET", "/health")[0], 200)                # Strata's health check needs none
+        v = VoiceServer("tts", {"cmd": "x", "port": port})
+        v.token = "s3cret"
+        status, out, _ = v.forward("/v1/audio/speech", speak, "application/json")
+        self.assertEqual((status, out[:4]), (200, b"RIFF"))
 
 
 class Voices(unittest.TestCase):
