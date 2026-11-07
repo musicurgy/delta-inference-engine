@@ -2064,6 +2064,16 @@ int main(int argc, char ** argv) {
             // a changed bias is applied again just before the decode: a repeated prompt (regenerate) runs no prompt pass,
             // and the passes are what turn the decode bias on - without this it decoded with the previous request's
             bool bias_changed = false;
+            // 0.94 phase-aware route bias (opt-in, STRATA_ANSWER_ROUTE_BIAS=<f>, STRATA_ANSWER_ROUTE_BIAS_FILE=<f>, default the
+            // same): the request's bias while the model thinks, this one from </think> on (the answer and its tool calls).
+            // The bias flips the trunk's top-1 on ~6% of tokens and each flip ends a draft pass (rounds 247/248: 2.08 vs
+            // 2.25 tokens/pass), so the answer gains exactness and acceptance; the thinking is unchanged.  A prompt that
+            // already ends its thinking (thinking off) starts in the answer phase.
+            static const float ans_rb = std::getenv("STRATA_ANSWER_ROUTE_BIAS") ? std::max(0.0f, (float) std::atof(std::getenv("STRATA_ANSWER_ROUTE_BIAS"))) : -1.0f;
+            static const float ans_rbf = std::getenv("STRATA_ANSWER_ROUTE_BIAS_FILE") ? std::max(0.0f, (float) std::atof(std::getenv("STRATA_ANSWER_ROUTE_BIAS_FILE"))) : ans_rb;
+            static const int think_beg_id = std::getenv("STRATA_THINK_BEGIN_ID") ? std::atoi(std::getenv("STRATA_THINK_BEGIN_ID")) : 128821;
+            static const int think_end_id = std::getenv("STRATA_THINK_END_ID") ? std::atoi(std::getenv("STRATA_THINK_END_ID")) : 128822;
+            bool in_answer = false;   // set from the prompt once its ids are read (below)
             if (req_rb != a.route_bias || req_rbf != a.route_bias_file || bias_top_changed) {
                 a.route_bias = req_rb;
                 a.route_bias_file = req_rbf;
@@ -2071,6 +2081,16 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: decode route bias %.2f, file penalty %.2f%s\n", req_rb, req_rbf,
                              (req_rb == 0.0f && req_rbf == 0.0f) ? " (exact routing)" : "");
             }
+            auto enter_answer = [&](int tok) {   // called on every emitted token
+                if (ans_rb < 0.0f || in_answer || tok != think_end_id) return;
+                in_answer = true;
+                if (a.route_bias != ans_rb || a.route_bias_file != ans_rbf) {
+                    a.route_bias = ans_rb;
+                    a.route_bias_file = ans_rbf;
+                    apply_bias();
+                    std::fprintf(stderr, "serve: answer phase: route bias %.2f, file penalty %.2f\n", ans_rb, ans_rbf);
+                }
+            };
             if ((req_rprot != cur_rprot || req_rpool != cur_rpool) && dense.set_route_select(req_rprot, req_rpool)) {
                 cur_rprot = req_rprot;
                 cur_rpool = req_rpool;
@@ -2079,6 +2099,20 @@ int main(int argc, char ** argv) {
             }
             std::vector<int> ids = csv.empty() ? std::vector<int>() : parse_csv(csv);
             if (ids.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); continue; }
+            if (ans_rb >= 0.0f) {   // phase-aware bias: a prompt that already ends its thinking starts in the answer phase
+                long last_beg = -1, last_end = -1;
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    if (ids[i] == think_beg_id) last_beg = (long) i;
+                    else if (ids[i] == think_end_id) last_end = (long) i;
+                }
+                in_answer = last_end > last_beg;
+                if (in_answer && (a.route_bias != ans_rb || a.route_bias_file != ans_rbf)) {
+                    a.route_bias = ans_rb;
+                    a.route_bias_file = ans_rbf;
+                    bias_changed = true;
+                    std::fprintf(stderr, "serve: answer phase from the start (thinking off): route bias %.2f\n", ans_rb);
+                }
+            }
             if ((int64_t) ids.size() + std::max(0, max_new) > ctxv) {
                 std::printf("ERR prompt (%zu) + max tokens (%d) exceed the context (%d)\n", ids.size(), max_new, ctxv);
                 std::fflush(stdout);
@@ -2777,6 +2811,7 @@ int main(int argc, char ** argv) {
                     std::printf("T %d\n", tok);
                     std::fflush(stdout);
                     ++gen;
+                    enter_answer(tok);
                     if (is_stop(tok)) { finish = "stop"; return false; }
                     if (max_new > 0 && gen >= max_new) return false;
                     return true;
@@ -2939,6 +2974,7 @@ int main(int argc, char ** argv) {
                 std::printf("T %d\n", tok);
                 std::fflush(stdout);
                 ++gen;
+                enter_answer(tok);
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
                 // STRATA_BIAS_REFRESH without a drafter: every N single steps (the verify loop above counts passes)
