@@ -18,7 +18,10 @@ if errorlevel 1 (
   exit /b 1
 )
 rem the card (DS41_GPU, from ds41-paths.bat) and the model folder (an engine from before 0.92 cannot open a path with
-rem letters outside A-Z: step 3 checks it)
+rem letters outside A-Z: step 3 checks it).  A DS41_MODELS set before ds41-paths.bat (in Windows' environment) is the
+rem user's own: the drive check in step 4 then only shows the drives.
+set "MODELS_ENV="
+if defined DS41_MODELS set "MODELS_ENV=1"
 call "%ROOT%\ds41-paths.bat"
 rem the engine is built with CUDA 13, which runs on compute capability 7.5 and newer (RTX 20, GTX 16 and later) - a GTX 10
 rem card (6.1) would only fail at its first CUDA call, after a newer driver and the downloads.  No answer (an old
@@ -199,6 +202,17 @@ if defined RAM_GB if %RAMN% LSS 120 if %RAMN% GEQ 56 echo         Under 128 GB i
 if defined RAM_GB if %RAMN% LSS 56 echo         With this little it will probably not start at all.
 rem no model yet: the user picks one - the one for this PC is marked, any other is fine, or none and their own
 if not defined NEEDMAIN goto picked
+rem before hundreds of GB arrive: this PC's drives (free space, NVMe / SATA / USB), the page file, the download time -
+rem and the user picks the folder (drive_check.py writes DS41_MODELS into ds41-paths.bat; advice only, never a stop)
+if defined MODELS_ENV goto drive_info
+".venv\Scripts\python.exe" tools\v41\serve\drive_check.py --pick "%M%"
+set "DS41_MODELS="
+call "%ROOT%\ds41-paths.bat"
+set "M=%DS41_MODELS:/=\%"
+goto drive_done
+:drive_info
+".venv\Scripts\python.exe" tools\v41\serve\drive_check.py --info "%M%"
+:drive_done
 ".venv\Scripts\python.exe" tools\v41\serve\pick_model.py --first
 set "PRC=%errorlevel%"
 if "%PRC%"=="0" set "NEEDMAIN="
