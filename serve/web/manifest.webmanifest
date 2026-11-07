@@ -1,0 +1,14 @@
+{
+  "name": "Delta - DeepSeek on your PC",
+  "short_name": "Delta",
+  "description": "Chat with the DeepSeek model running on your own PC.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#11181c",
+  "theme_color": "#11181c",
+  "icons": [
+    {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"}
+  ]
+}

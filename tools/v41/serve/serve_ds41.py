@@ -636,10 +636,17 @@ class _Setup:
 
     @staticmethod
     def post(svc, req):
+        if req.get("firewall") in ("add", "remove"):    # the user's click; Windows asks (UAC) before anything changes
+            on = _setup.change_firewall(req["firewall"] == "add")
+            return {"firewall": on}
+        if not _setup.needs_restart(req):               # auto-pause: saved, and in effect now
+            s = _setup.apply(req)
+            svc.auto_pause_mib = int(s.get("auto_pause_mib") or 0)
+            return {"restarting": False, "auto_pause_mib": svc.auto_pause_mib}
         with svc.status_lock:
             if svc.status.get("busy") or svc.status.get("queued"):
                 raise ValueError("a request is running: try again when it has finished")
-        _setup.apply(req)
+        s = _setup.apply(req)
 
         def restart():
             _time.sleep(0.5)                     # the page gets its answer first
@@ -651,7 +658,11 @@ class _Setup:
                     print(f"[strata] while stopping for the restart: {e}", flush=True)
             os._exit(_setup.RESTART_EXIT)
         _th.Thread(target=restart, daemon=True).start()
-        return {"restarting": True}
+        out = {"restarting": True}
+        if req.get("phone"):                            # the page keeps the key: from now on this PC's page needs it too
+            key = svc.api_key[0] if isinstance(svc.api_key, list) and svc.api_key else svc.api_key
+            out["api_key"] = (key or "").split(",")[0].strip() or s.get("phone_key") or ""
+        return out
 
 
 S.SETUP = _Setup

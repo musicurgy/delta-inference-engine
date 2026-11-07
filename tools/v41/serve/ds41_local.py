@@ -56,6 +56,21 @@ def page_settings():
         return {}
 
 
+def page_access(cfg, s):
+    """the chat page's Setup tab: "Use from your phone" listens on every network (0.0.0.0) with an API key - the key
+    already in the config, else the one the switch made (delta-settings.json, not in git); off: the config's own host
+    (this PC only by default).  "auto_pause_mib" (0 = off) goes into the config as well."""
+    if s.get("phone") and (cfg.get("api_key") or s.get("phone_key")):
+        if not cfg.get("api_key"):
+            cfg["api_key"] = s["phone_key"]
+        if str(cfg.get("host") or "127.0.0.1") in ("127.0.0.1", "localhost", "::1"):
+            cfg["host"] = "0.0.0.0"
+        print(f"ds41_local: Setup tab: reachable from other devices on this network (port {os.environ.get('DS41_PORT', '8080')}, "
+              "API key required)")
+    if isinstance(s.get("auto_pause_mib"), int) and s["auto_pause_mib"] > 0:
+        cfg["auto_pause_mib"] = s["auto_pause_mib"]
+
+
 def total_ram_gib():
     if os.name == "nt":
         class MS(ctypes.Structure):
@@ -401,6 +416,7 @@ def main():
     except (OSError, ValueError) as e:
         sys.exit(f"ds41_local: cannot read {sys.argv[1]}: {e}")
     cfg = expand(raw)
+    page_access(cfg, page_settings())
     args = cfg.get("args", [])
     if "-m" in args[:-1]:
         mid, shown = model_names(args[args.index("-m") + 1])

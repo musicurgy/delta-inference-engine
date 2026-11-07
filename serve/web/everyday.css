@@ -89,3 +89,17 @@
 .health-list li { display: flex; gap: var(--st-s-3); align-items: flex-start; }
 .health-list .st-badge { flex: none; margin-top: 2px; }
 .health-text { font-size: var(--st-fs-sm); font-weight: var(--st-fw-medium); color: var(--st-ink-soft); }
+
+/* ---------------------------------------------------------------- Use from your phone, auto-pause, mode label */
+.phone-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
+.phone-grid { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: var(--st-s-4); align-items: start; }
+.phone-qr { display: flex; align-items: center; justify-content: center; min-height: 200px; border: 1px dashed var(--st-line);
+            border-radius: var(--st-r-md); }
+.phone-qr .qr { width: 200px; height: 200px; border-radius: var(--st-r-sm); }
+.phone-facts p { margin: var(--st-s-2) 0 0; }
+.phone-fw { display: flex; align-items: center; gap: var(--st-s-3); flex-wrap: wrap; }
+.phone-fw .st-btn { height: 36px; }
+.phone-card pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.autopause { margin-top: var(--st-s-1); }
+.mode-label { margin-right: 2px; }
+@media (max-width: 640px) { .phone-grid { grid-template-columns: 1fr; } }

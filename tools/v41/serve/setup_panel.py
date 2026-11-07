@@ -2,7 +2,8 @@
 """setup_panel.py - what the web page's Setup card and the first start share: the models this PC can load, the one setting
 file, the check of a custom model, and the rollback after a start that failed.  Standard library only.
 
-  delta-settings.json (repository folder, not in git): {"mode": "fast|balanced|exact", "multi_gpu": true|false, "pending": ...}
+  delta-settings.json (repository folder, not in git): {"mode": "fast|balanced|exact", "multi_gpu": true|false, "pending": ...,
+    "phone": true|false, "phone_key": "<the API key the phone switch made>", "auto_pause_mib": N}
   model-choice.txt stays the model's one source, as for Choose Model.bat.
   python setup_panel.py --rollback    after a failed start: put the model back that last started (exit 0 = put back)
 """
@@ -145,7 +146,101 @@ def catalog(m=None) -> dict:
     gpus = list_gpus()
     return {"ram_gb": ram, "models": rows, "refused": [c for c in custom if not c["ok"]], "custom_folder": os.path.join(m, CUSTOM),
             "mode": s.get("mode") if s.get("mode") in MODES else "fast", "gpus": gpus, "multi_gpu": bool(s.get("multi_gpu")),
-            "helper_gpu": helper_gpu(gpus), "bias_override": "DS41_ROUTE_BIAS" in os.environ, "health": pc_health()}
+            "helper_gpu": helper_gpu(gpus), "bias_override": "DS41_ROUTE_BIAS" in os.environ, "health": pc_health(),
+            "phone": phone_state(s), "auto_pause_mib": int(s.get("auto_pause_mib") or 0)}
+
+
+# ---- use from other devices (a phone): the page's switch.  On: ds41_local.py writes "host": "0.0.0.0" and the API key
+# into this PC's config (the server refuses to listen beyond this PC without a key); the page shows the address and the
+# key as a QR code.  The Windows firewall rule is offered separately and only runs with Windows' own UAC prompt.
+LOCAL_CONFIG = os.path.join(HERE, "local", "ds41-windows.json")
+AUTO_PAUSE_CHOICES = (0, 512, 1024, 2048, 4096)
+
+
+def port() -> int:
+    p = os.environ.get("DS41_PORT", "").strip()
+    return int(p) if p.isdigit() else 8080
+
+
+def lan_ips() -> list:
+    """this PC's IPv4 addresses on its networks, the default route's first (sends nothing)"""
+    import socket
+    first, ips = None, set()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sk:
+            sk.connect(("10.255.255.255", 1))
+            first = sk.getsockname()[0]
+    except OSError:
+        pass
+    try:
+        ips = {i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+    except OSError:
+        pass
+    ok = lambda ip: ip and not ip.startswith(("127.", "169.254.", "0."))   # noqa: E731
+    return ([first] if ok(first) else []) + sorted(ip for ip in ips if ok(ip) and ip != first)
+
+
+def rule_name(p=None) -> str:
+    return f"Delta DeepSeek {p or port()}"
+
+
+def firewall_rule(p=None):
+    """True / False: the inbound rule for the port is there (read only, no admin); None: cannot tell (not Windows)"""
+    if os.name != "nt":
+        return None
+    try:
+        r = subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name(p)}"],
+                           capture_output=True, text=True, timeout=15)
+        return r.returncode == 0 and rule_name(p) in r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def firewall_command(add=True, p=None) -> str:
+    """the PowerShell line the page shows (and runs elevated, after Windows' UAC prompt, when the user asks)"""
+    p = p or port()
+    if add:
+        return (f'New-NetFirewallRule -DisplayName "{rule_name(p)}" -Direction Inbound -Protocol TCP -LocalPort {p} '
+                f'-Action Allow -Profile Private')
+    return f'Remove-NetFirewallRule -DisplayName "{rule_name(p)}"'
+
+
+def change_firewall(add=True) -> bool:
+    """run firewall_command elevated: Windows shows its UAC prompt and the user says yes or no there.  Never silent.
+    -> whether the rule is there afterwards"""
+    if os.name != "nt":
+        raise ValueError("the firewall rule is for Windows")
+    cmd = firewall_command(add).replace("'", "''")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        f"Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList "
+                        f"'-NoProfile','-Command','{cmd}'"], capture_output=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return bool(firewall_rule())
+
+
+def _local_config() -> dict:
+    try:
+        with open(LOCAL_CONFIG, encoding="utf-8") as f:
+            c = json.load(f)
+        return c if isinstance(c, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def phone_state(s=None) -> dict:
+    """for the page: is this server reachable from other devices now, at which addresses, with which key"""
+    s = load_settings() if s is None else s
+    c = _local_config()
+    host = str(c.get("host") or "127.0.0.1")
+    key = c.get("api_key")
+    key = key[0] if isinstance(key, list) and key else key.split(",")[0].strip() if isinstance(key, str) else ""
+    on = host not in ("127.0.0.1", "localhost", "::1", "")
+    p = port()
+    return {"on": on, "wanted": bool(s.get("phone")), "own_config": on and not s.get("phone"), "port": p,
+            "addresses": lan_ips() if on else [], "key": key if on else "", "firewall": firewall_rule(p) if on else None,
+            "firewall_add": firewall_command(True, p), "firewall_remove": firewall_command(False, p)}
 
 
 def pc_health():
@@ -201,6 +296,8 @@ def apply(req: dict) -> dict:
         raise ValueError("mode must be fast, balanced or exact")
     if req.get("multi_gpu") and not cat["helper_gpu"]:
         raise ValueError("no second NVIDIA card with 8 GB or more was found")
+    if "auto_pause_mib" in req and req["auto_pause_mib"] not in AUTO_PAUSE_CHOICES:
+        raise ValueError(f"auto_pause_mib must be one of {', '.join(map(str, AUTO_PAUSE_CHOICES))}")
     if model is not None:
         was = P.current()
         s["pending"] = {"model": was or ""}
@@ -210,8 +307,20 @@ def apply(req: dict) -> dict:
         s["mode"] = mode
     if "multi_gpu" in req:
         s["multi_gpu"] = bool(req["multi_gpu"])
+    if "phone" in req:
+        s["phone"] = bool(req["phone"])
+        if s["phone"] and not s.get("phone_key"):
+            import secrets
+            s["phone_key"] = secrets.token_urlsafe(24)       # 32 characters; kept for the next time it is switched on
+    if "auto_pause_mib" in req:
+        s["auto_pause_mib"] = int(req["auto_pause_mib"])
     save_settings(s)
     return s
+
+
+def needs_restart(req: dict) -> bool:
+    """an Apply that changes how the server starts (model, mode, cards, phone access); auto-pause applies at once"""
+    return any(k in req for k in ("model", "mode", "multi_gpu", "phone"))
 
 
 def started() -> None:

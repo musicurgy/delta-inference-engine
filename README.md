@@ -44,12 +44,16 @@ CPUs from before 2013.)
 
 **Every day in the chat page:**
 - **Pause / Resume** (top right): Pause frees the model's RAM and the graphics card for games or other programs;
-  Resume, or simply the next message or app request, loads it again (about a minute).
+  Resume, or simply the next message or app request, loads it again (about a minute).  Setup > "Pause by itself when
+  a game needs the graphics card" (off by default) does it for you while DeepSeek is idle - never during an answer.
+- **Use from your phone** (Setup tab): one switch makes an API key, listens on your home network and restarts; scan
+  the QR code with the phone (the page opens with the key in it), allow Windows Firewall when asked, and "Add to Home
+  Screen" makes it an app.  Off: this PC only again.
 - **Chats** (the list button beside the message box): turn on "Save chats in this browser" to keep a chat list with
   search, pins, rename, delete and export / import (JSON).  Off by default: then each chat lives in its tab only.
   "New temporary chat" makes one that is never saved.
-- **Modes** above the message box: Quick (no thinking), Think (the default), Code and Write; under them, how long
-  answers in that mode took to start on this PC.
+- **Modes** above the message box: Quick (no thinking), Think (the default), Code and Write - starting points, not
+  tuned presets (Sampling changes them); under them, how long answers in that mode took to start on this PC.
 - **Answer-ready notifications** (Setup > Settings, off by default): a Windows notification when an answer finishes
   while the tab is in the background (on `http://127.0.0.1` only; browsers refuse it on a LAN address).
 - **Connect an app** (Setup > Connect your tools): the exact settings for Claude Code, OpenCode, Cline / Aider /
@@ -227,9 +231,10 @@ compact your conversation early.
 
 ## Privacy
 
-- The server listens on this PC only (`127.0.0.1:8080`). To reach it from other devices, add `"host": "0.0.0.0"`
-  AND `"api_key": "<a long secret>"` to `tools/v41/serve/ds41-windows.json` (clients send the key as their API key;
-  without one, anyone on your network could use the model, and the server warns about it).
+- The server listens on this PC only (`127.0.0.1:8080`). To reach it from other devices, use the Setup tab's "Use
+  from your phone" switch (it makes the API key, kept in `delta-settings.json` on this PC), or add `"host": "0.0.0.0"`
+  AND `"api_key": "<a long secret>"` to `tools/v41/serve/ds41-windows.json` (clients send the key as their API key).
+  Without a key the server refuses to listen beyond this PC.
 - Nothing from your prompts or answers is written to disk unless you turn it on: conversations live in memory and
   are gone when the server stops. Opt-in only: the plain-text watch log (`STRATA_TEXT_LOG=<a file path>`), the
   request monitor page (`"api_monitor": true` in `tools/v41/serve/ds41-windows.json`; memory only) and, in the

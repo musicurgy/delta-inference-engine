@@ -42,6 +42,9 @@ async function pollModel() {
       lastLoadedAt = Date.now();
       if (was === "loading") toast("success", "DeepSeek is ready", "", 2500);
     }
+    if (was === "loaded" && modelState === "paused" && loadInfo && loadInfo.reason) {
+      toast("info", "DeepSeek paused by itself", loadInfo.reason.replace(/^Paused by itself: /, ""), 8000);
+    }
   } catch (e) {                                   // the server is restarting, stopped, or a failed start ended it
     healthFails += 1;
     if (modelState === "failed") loadInfo = {...(loadInfo || {}), gone: true};
@@ -77,11 +80,13 @@ function paintModelState() {
     card.querySelector(".msg-error").textContent = li.error || "The engine stopped while it was starting.";
     card.dataset.state = "failed";
     card.hidden = false;
-  } else if (st === "paused" && !messages.length) {
+  } else if (st === "paused" && (!messages.length || li.reason)) {
     card.innerHTML = `<div class="load-card__head"><span class="card-title">DeepSeek is paused</span>` +
       `<button class="st-btn st-btn--primary" type="button" data-resume>${p4icon("play")}Resume</button></div>` +
+      (li.reason ? `<div class="load-card__step"></div>` : "") +
       `<div class="muted small">The RAM and the graphics card are free for other programs. Resume, or just send a ` +
       `message: it loads first${li.last_s ? ` (about ${secs(li.last_s)})` : " (about a minute)"}.</div>`;
+    if (li.reason) card.querySelector(".load-card__step").textContent = li.reason;
     card.dataset.state = "paused";
     card.hidden = false;
   } else if (st === "gone") {
@@ -241,8 +246,11 @@ function modeWait(m) {
 }
 function paintModes() {
   const cur = currentMode();
-  $("modes").innerHTML = MODES.map((m) => `<button type="button" role="radio" class="mode-chip" data-mode="${m.id}" ` +
-    `aria-checked="${cur && cur.id === m.id}" title="${esc(m.tip)}">${esc(m.name)}</button>`).join("") +
+  // presets are starting points (not measured as the best for each kind of task): Sampling changes them
+  $("modes").innerHTML = `<span class="mode-label muted small" title="Presets of the Sampling settings - starting points; ` +
+    `change them in Sampling">Starting point:</span>` +
+    MODES.map((m) => `<button type="button" role="radio" class="mode-chip" data-mode="${m.id}" ` +
+    `aria-checked="${cur && cur.id === m.id}" title="${esc(m.tip)} A starting point: adjust it in Sampling.">${esc(m.name)}</button>`).join("") +
     `<span class="mode-wait muted small">${cur ? esc(`${cur.name}: ${modeWait(cur)}`) : "Custom settings (Sampling)"}</span>`;
 }
 $("modes").addEventListener("click", (e) => {
@@ -350,6 +358,122 @@ ext.afterSetup.push((c) => {
         `<div class="muted small">${esc(x.how || "")}</div></div></li>`).join("")}</ul>`
       : `<p class="muted small">${icon("check", "st-icon st-icon--sm")} All the checked Windows settings are as fast as they go.</p>`);
 });
+
+// ------------------------------------------------------------------ "Use from your phone" and auto-pause (Setup tab)
+// The switch makes the launcher listen on this network with an API key (it makes one if there is none; the server
+// refuses to listen beyond this PC without one) and restarts.  The QR code holds the address with the key after "#":
+// a phone that opens it keeps the key in its browser, and the part after "#" never reaches any server.
+let phoneShowKey = false;
+const isThisPc = ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
+async function postSetup(body) {
+  const r = await fetch("setup", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+  const b = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
+  return b;
+}
+async function waitForRestart(msgEl) {
+  msgEl.textContent = "Restarting with the new setting (about a minute); this page comes back by itself.";
+  await new Promise((d) => setTimeout(d, 3000));
+  for (let i = 0; i < 300; i++) {
+    try { if ((await fetch("health", {cache: "no-store"})).ok) { location.reload(); return; } } catch (e) { /* restarting */ }
+    await new Promise((d) => setTimeout(d, 2000));
+  }
+  msgEl.textContent = "It has not come back. Look at the DeepSeek window: it says why.";
+}
+function paintPhone(c) {
+  const ph = c.phone;
+  let card = $("phone-card");
+  if (!ph) { if (card) card.hidden = true; return; }
+  if (!card) {
+    card = document.createElement("div");
+    card.className = "st-card phone-card";
+    card.id = "phone-card";
+    ($("health-card") || $("setup-card")).after(card);
+  }
+  card.hidden = false;
+  const urls = (ph.addresses || []).map((ip) => `http://${ip}:${ph.port}/`);
+  const link = urls.length && ph.key ? `${urls[0]}#key=${encodeURIComponent(ph.key)}` : "";
+  const fw = ph.firewall === true ? "Windows Firewall lets other devices in (rule \"Delta DeepSeek " + ph.port + "\")."
+    : ph.firewall === false ? "Windows Firewall still blocks other devices." : "";
+  card.innerHTML = `<div class="req-head"><span class="card-title">Use from your phone</span>` +
+    `<span class="muted small">${ph.on ? "on: this network can reach it, with the key" : "off: this PC only"}</span></div>` +
+    `<div class="toggle-row"><span>Reachable from other devices on this network<br><span class="muted small">` +
+    `${ph.own_config ? "set in ds41-windows.json (\"host\" and \"api_key\"): change it there" :
+      "makes an API key, listens on this network (port " + ph.port + ") and restarts DeepSeek"}</span></span>` +
+    `<button class="st-toggle" role="switch" id="phone-toggle" aria-checked="${ph.on}" aria-label="Reachable from other devices"` +
+    `${ph.own_config ? " disabled" : ""}></button></div>` +
+    (ph.on ? `<div class="phone-grid"><div class="phone-qr" id="phone-qr">` +
+        (link ? `<button class="st-btn st-btn--secondary" type="button" id="phone-qr-btn">Show the QR code</button>` : "") + `</div>` +
+      `<div class="phone-facts"><dl class="facts">` +
+        urls.map((u) => `<dt>Address</dt><dd><code>${esc(u)}</code><button class="st-btn st-btn--icon" data-copy="${esc(u)}" aria-label="Copy">${icon("copy")}</button></dd>`).join("") +
+        `<dt>API key</dt><dd><code>${esc(phoneShowKey ? ph.key : "•".repeat(12))}</code>` +
+        `<button class="st-btn st-btn--icon" type="button" id="phone-key-show" title="${phoneShowKey ? "Hide" : "Show"}" aria-label="Show the key">${p4icon("search")}</button>` +
+        `<button class="st-btn st-btn--icon" data-copy="${esc(ph.key)}" aria-label="Copy the key">${icon("copy")}</button></dd></dl>` +
+        `<p class="muted small">Scan the code with the phone's camera: the page opens with the key already in it. Other ` +
+        `apps use the address + <code>v1</code> and the key. Anyone with the key can use the model: keep it like a password.</p></div></div>` +
+      `<div class="phone-fw"><span class="muted small">${esc(fw)}</span>` +
+        (isThisPc && ph.firewall !== true ? `<button class="st-btn st-btn--secondary" type="button" data-fw="add">Allow through Windows Firewall</button>` : "") +
+        (isThisPc && ph.firewall === true ? `<button class="st-btn st-btn--secondary" type="button" data-fw="remove">Remove the rule</button>` : "") +
+      `</div><details class="muted small"><summary>What the firewall button does</summary><p>Windows asks you first (an ` +
+        `administrator prompt). It adds this rule for private networks only:</p><pre><code>${esc(ph.firewall_add)}</code></pre>` +
+        `<p>To undo it: <code>${esc(ph.firewall_remove)}</code></p></details>`
+      : "") +
+    `<details class="muted small"><summary>Outside your home, and as an app on the phone</summary>` +
+      `<p>Away from home: install Tailscale (free for personal use) on this PC and the phone; the phone then reaches this ` +
+      `PC privately, as if it were at home. Never use Tailscale Funnel: it makes the page public.</p>` +
+      `<p>As an app: open the page on the phone, then the browser's menu > "Add to Home Screen" (iPhone: Share > ` +
+      `"Add to Home Screen"). On a plain http:// address it opens as a shortcut; notifications need https or this PC.</p></details>` +
+    `<span class="muted small" id="phone-msg" role="status"></span>`;
+  const qrBtn = $("phone-qr-btn");
+  if (qrBtn) qrBtn.onclick = () => { $("phone-qr").innerHTML = QR.qrSvg(link, "M") || "The address is too long for a QR code."; };
+  const show = $("phone-key-show");
+  if (show) show.onclick = () => { phoneShowKey = !phoneShowKey; paintPhone(c); };
+  for (const b of card.querySelectorAll("[data-fw]")) b.onclick = async () => {
+    $("phone-msg").textContent = "Windows asks for permission now (look for the prompt on this PC) …";
+    try {
+      const r = await postSetup({firewall: b.dataset.fw});
+      ph.firewall = r.firewall;
+      paintPhone(c);
+      $("phone-msg").textContent = r.firewall ? "Allowed." : b.dataset.fw === "add" ? "Not added (cancelled or refused)." : "Removed.";
+    } catch (e) { $("phone-msg").textContent = `Not changed: ${e.message || e}`; }
+  };
+  $("phone-toggle").onclick = async () => {
+    const on = !ph.on;
+    if (!confirm(on ? "DeepSeek restarts (about a minute) and then answers devices on this network that have the API key. " +
+                      "This page keeps the key. Continue?"
+                    : "DeepSeek restarts (about a minute) and then answers this PC only. Continue?")) return;
+    try {
+      const r = await postSetup({phone: on});
+      if (r.api_key) { store.set("apikey", r.api_key); $("api-key").value = r.api_key; }
+      $("phone-toggle").disabled = true;
+      waitForRestart($("phone-msg"));
+    } catch (e) { toast("error", "Not changed", String(e.message || e), 6000); }
+  };
+}
+function paintAutoPause(c) {
+  if (c.auto_pause_mib == null) return;
+  let row = $("autopause-row");
+  if (!row) {
+    row = document.createElement("div");
+    row.className = "autopause";
+    row.id = "autopause-row";
+    $("setup-apply").closest(".cfg-actions").before(row);
+  }
+  const mib = c.auto_pause_mib;
+  row.innerHTML = `<div class="toggle-row"><span>Pause by itself when a game needs the graphics card<br><span class="muted small">` +
+    `while DeepSeek is idle: when another program takes ${mib ? fmt(mib / 1024, 1) : "1"} GB or more of its memory, or keeps ` +
+    `it busy; the next message loads it again</span></span>` +
+    `<button class="st-toggle" role="switch" id="autopause-toggle" aria-checked="${mib > 0}" aria-label="Pause by itself for games"></button></div>`;
+  $("autopause-toggle").onclick = async () => {
+    try {
+      const r = await postSetup({auto_pause_mib: mib > 0 ? 0 : 1024});
+      c.auto_pause_mib = r.auto_pause_mib;
+      paintAutoPause(c);
+      toast("success", r.auto_pause_mib ? "Auto-pause on" : "Auto-pause off", r.auto_pause_mib ? "It pauses when a game needs the card." : "");
+    } catch (e) { toast("error", "Not changed", String(e.message || e), 6000); }
+  };
+}
+ext.afterSetup.push((c) => { paintPhone(c); paintAutoPause(c); });
 
 // ------------------------------------------------------------------ start
 $("history-btn").innerHTML = p4icon("list");

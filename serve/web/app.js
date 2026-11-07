@@ -96,7 +96,7 @@ function showTab(name) {
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
-window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
+window.addEventListener("hashchange", () => { if (!keyFromLink()) showTab(location.hash.slice(1)); });
 
 // ------------------------------------------------------------------ server access
 function headers(json = false) {
@@ -106,6 +106,17 @@ function headers(json = false) {
   if (json) h["Content-Type"] = "application/json";
   return h;
 }
+// a link with the key in it (the Setup tab's phone QR code: http://<this PC>:8080/#key=...): kept in this browser and
+// taken out of the address; the part after # is never sent to the server
+function keyFromLink() {
+  if (!location.hash.startsWith("#key=")) return false;
+  store.set("apikey", decodeURIComponent(location.hash.slice(5)));
+  history.replaceState(null, "", location.pathname);
+  const el = $("api-key");
+  if (el) el.value = store.get("apikey", "");
+  return true;
+}
+keyFromLink();
 $("api-key").value = store.get("apikey", "");
 $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
 
