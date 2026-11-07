@@ -55,7 +55,8 @@ if exist ".venv\Scripts\python.exe" (
 )
 echo Setting up the Python environment ^(.venv: ~0.3 GB of packages, a minute or two^) ...
 set "PYEXE="
-for %%v in (3.14 3.13 3.12 3.11 3.10) do if not defined PYEXE (
+rem 0.94 (BACKLOG #67): the versions every pinned package was tested on come first; 3.14 still works (PR #2)
+for %%v in (3.13 3.12 3.11 3.14 3.10) do if not defined PYEXE (
   py -%%v -c "import sys" >nul 2>&1 && set "PYEXE=py -%%v"
 )
 if not defined PYEXE (
