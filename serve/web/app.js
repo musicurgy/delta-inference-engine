@@ -17,6 +17,18 @@ const store = {
   set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
 };
 
+// extension points for everyday.js (loading screen, Pause, modes, notifications, connect card) and history.js (the chat
+// list), which load after this file: lists of functions run at these moments, and optional replacements
+const ext = {
+  afterRender: [],      // (metrics) after each Monitor poll is drawn
+  beforeSend: [],       // (body) a chat request's JSON before it is sent
+  afterAnswer: [],      // (message, {sentAt, answerAt, tokens}) an answer has finished (or stopped, or failed)
+  save: null,           // () the chat changed: keep it (history.js), instead of the one-chat localStorage copy
+  newChat: null,        // () -> true when it started the new chat itself
+  keepChanged: null,    // (on) "Keep chats" was switched in Sampling
+  afterSetup: [],       // (GET /setup's answer) the Setup card was drawn
+};
+
 // ------------------------------------------------------------------ toasts
 function toast(kind, title, text = "", ms = 3500, action = null) {
   const names = {info: "info", success: "check", warn: "warning", error: "error"};
@@ -210,6 +222,7 @@ function render(m) {
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "about") renderAbout(eng, hw, st);
+  for (const f of ext.afterRender) f(m);
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
@@ -540,6 +553,7 @@ async function loadSetup() {
   if (c.helper_gpu) $("setup-gpu-note").textContent = `${c.helper_gpu.name} holds part of the model, for more speed`;
   $("setup-card").hidden = false;
   setupPaint();
+  for (const f of ext.afterSetup) f(c);
 }
 $("setup-model").addEventListener("change", setupPaint);
 $("setup-refresh").addEventListener("click", loadSetup);
@@ -653,6 +667,7 @@ let busy = null;                      // {controller, msg}
 
 function forgetChat() { try { localStorage.removeItem("strata.chat"); } catch (e) { /* ignore */ } }
 function saveChat() {
+  if (ext.save) { ext.save(); return; }
   if (!settings.keep) return;
   store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
                                            files: (m.files || []).map((f) => ({name: f.name}))})));
@@ -886,8 +901,10 @@ async function send() {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  for (const f of ext.beforeSend) f(body);
 
-  let firstAt = null, thinkStart = null, usage = null, frame = 0;
+  let firstAt = null, thinkStart = null, usage = null, frame = 0, answerAt = null;
+  const sentAt = performance.now();
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
   try {
     const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
@@ -926,6 +943,7 @@ async function send() {
         }
         if (d.content) {
           if (!firstAt) firstAt = performance.now();
+          if (!answerAt) answerAt = performance.now();
           if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
           if (lastTool && m.text && lastTool.at === m.text.length) m.text += "\n\n";
           m.text += d.content;
@@ -956,6 +974,7 @@ async function send() {
   updateAssistant(el, m, false);
   saveChat();
   scrollDown();
+  for (const f of ext.afterAnswer) f(m, {sentAt, answerAt, tokens: n});
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
@@ -968,6 +987,7 @@ $("input").addEventListener("input", autosize);
 
 $("new-btn").onclick = () => {
   if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (ext.newChat && ext.newChat()) return;
   if (!messages.length) return;
   const backup = messages;
   messages = [];
@@ -1146,8 +1166,10 @@ $("s-apply").onclick = async () => {
               keep: $("s-keep").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
+  const keepWas = !!store.get("sampling", {}).keep;
   store.set("sampling", settings);
-  if (settings.keep) saveChat(); else forgetChat();   // switched off: the saved copy goes now, the tab keeps its chat
+  if (ext.keepChanged) { if (keepWas !== settings.keep) ext.keepChanged(settings.keep); }
+  else if (settings.keep) saveChat(); else forgetChat();   // switched off: the saved copy goes now, the tab keeps its chat
   const share = $("s-share").getAttribute("aria-checked") === "true";
   openDrawer(false);
   if (share || sharedOn) {

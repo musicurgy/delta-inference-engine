@@ -1,0 +1,91 @@
+/* everyday.js and history.js: the loading card, Pause / Resume, modes, "Connect an app", the chat list.  Colours, type
+   and radii from tokens.css only. */
+
+/* ---------------------------------------------------------------- the chat view: list | chat */
+.view--chat { display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+.view--chat > .history { grid-row: 1 / 3; grid-column: 1; }
+.view--chat > .chat-scroll { grid-row: 1; grid-column: 2; }
+.view--chat > .composer-wrap { grid-row: 2; grid-column: 2; }
+
+/* ---------------------------------------------------------------- Pause / Resume */
+.pause-btn { height: 32px; padding: 0 12px; gap: 6px; font-size: var(--st-fs-sm); }
+.pause-btn .st-icon { width: 16px; height: 16px; }
+.pause-btn:disabled { opacity: .6; cursor: default; }
+
+/* ---------------------------------------------------------------- loading card */
+.load-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
+.load-card__head { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-3); flex-wrap: wrap; }
+.load-card__head .st-btn { height: 36px; }
+.load-card__head .st-btn .st-icon { width: 16px; height: 16px; }
+.load-card__step { font-weight: var(--st-fw-medium); color: var(--st-ink-soft); }
+.load-card .st-progress__bar { transition: width 900ms linear; }
+.load-card[data-state="loading"] .st-progress__bar { background: var(--st-info); }
+
+/* ---------------------------------------------------------------- modes */
+.modes { max-width: 860px; margin: 0 auto var(--st-s-2); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.mode-chip { height: 28px; padding: 0 12px; border-radius: var(--st-r-pill); border: 1px solid var(--st-line);
+             background: var(--st-surface); color: var(--st-ink-muted); font: 500 var(--st-fs-xs)/1 var(--st-font); cursor: pointer; }
+.mode-chip[aria-checked="true"] { background: var(--st-accent-tint); border-color: var(--st-accent); color: var(--st-accent-text);
+                                  font-weight: var(--st-fw-bold); }
+.mode-wait { margin-left: var(--st-s-2); }
+
+/* ---------------------------------------------------------------- Connect an app */
+.connect { display: flex; flex-direction: column; gap: var(--st-s-3); padding-top: var(--st-s-3); border-top: 1px solid var(--st-line-soft); }
+.connect__head { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-3); flex-wrap: wrap; }
+.connect__head .card-title { display: inline-flex; align-items: center; gap: 6px; }
+.connect__head .st-input { height: 38px; max-width: 100%; }
+.connect pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ---------------------------------------------------------------- the chat list */
+.history { width: 280px; min-height: 0; display: flex; flex-direction: column; background: var(--st-surface);
+           border-right: 1px solid var(--st-line); }
+.history[data-open="false"] { display: none; }
+.history__head { display: flex; align-items: center; gap: 4px; padding: var(--st-s-3) var(--st-s-3) var(--st-s-2) var(--st-s-4); }
+.history__head .spacer, .history .spacer { flex: 1; }
+.h-close .st-icon { transform: rotate(90deg); }
+.history__search { display: flex; align-items: center; gap: 6px; margin: 0 var(--st-s-3) var(--st-s-2); padding: 0 10px; height: 36px;
+                   border: 1.5px solid var(--st-line); border-radius: var(--st-r-md); color: var(--st-ink-muted); }
+.history__search input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--st-ink);
+                         font: 400 var(--st-fs-sm) var(--st-font); }
+.history__list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 var(--st-s-2) var(--st-s-2); }
+.h-group { font-size: var(--st-fs-xs); font-weight: var(--st-fw-bold); color: var(--st-ink-muted); padding: var(--st-s-3) var(--st-s-2) 4px; }
+.h-item { display: flex; align-items: center; gap: 2px; border-radius: var(--st-r-sm); }
+.h-item:hover, .h-item.is-current { background: var(--st-surface-2); }
+.h-item.is-current .h-open { color: var(--st-ink); font-weight: var(--st-fw-medium); }
+.h-open { flex: 1; min-width: 0; height: 34px; padding: 0 var(--st-s-2); border: 0; background: transparent; text-align: left; cursor: pointer;
+          color: var(--st-ink-soft); font: 400 var(--st-fs-sm)/34px var(--st-font); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.h-actions { display: none; flex: none; }
+.h-item:hover .h-actions, .h-item:focus-within .h-actions, .h-item.is-current .h-actions { display: flex; }
+.h-actions .st-btn--icon { width: 26px; height: 26px; border-radius: 6px; }
+.h-actions .st-icon { width: 15px; height: 15px; }
+.h-actions [aria-pressed="true"] { color: var(--st-accent); }
+.h-rename { flex: 1; min-width: 0; height: 32px; padding: 0 8px; font-size: var(--st-fs-sm); }
+.h-note { margin: var(--st-s-2); }
+.h-temp { display: flex; align-items: center; gap: 6px; margin: 0 var(--st-s-3) var(--st-s-2); padding: 6px 8px; border-radius: var(--st-r-sm);
+          background: var(--st-warn-tint); color: var(--st-warn-text); font-size: var(--st-fs-xs); }
+.h-temp span { flex: 1; }
+.h-temp .st-btn { height: 28px; padding: 0 10px; font-size: var(--st-fs-xs); }
+.history__foot { border-top: 1px solid var(--st-line-soft); padding: var(--st-s-3) var(--st-s-4); display: flex; flex-direction: column; gap: var(--st-s-3); }
+.h-buttons { display: flex; align-items: center; gap: 4px; }
+.h-buttons .st-btn--secondary { height: 34px; padding: 0 10px; font-size: var(--st-fs-xs); flex: 1; }
+#history-btn[aria-expanded="true"] { color: var(--st-accent); }
+
+/* ---------------------------------------------------------------- narrow screens: the list slides over the chat */
+@media (max-width: 900px) {
+  .view--chat > .history { position: fixed; top: 60px; left: 0; bottom: 0; z-index: 41; width: min(320px, 88vw);
+                           box-shadow: var(--st-sh-pop); }
+  .view--chat { grid-template-columns: minmax(0, 1fr); }
+  .view--chat > .chat-scroll, .view--chat > .composer-wrap { grid-column: 1; }
+}
+@media (max-width: 640px) {
+  .pause-btn span { display: none; }
+  .st-header__model { display: none; }          /* room for the Pause button */
+  .pause-btn { padding: 0 8px; }
+  .mode-wait { flex-basis: 100%; margin-left: 2px; }
+}
+
+/* ---------------------------------------------------------------- This PC's health */
+.health-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--st-s-3); }
+.health-list li { display: flex; gap: var(--st-s-3); align-items: flex-start; }
+.health-list .st-badge { flex: none; margin-top: 2px; }
+.health-text { font-size: var(--st-fs-sm); font-weight: var(--st-fw-medium); color: var(--st-ink-soft); }

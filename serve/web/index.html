@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
 <link rel="stylesheet" href="web/app.css">
+<link rel="stylesheet" href="web/everyday.css">
 <script>
   // the theme before the first paint: the saved choice, else the system's
   try {
@@ -39,6 +40,7 @@
   <span class="st-header__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
     <span class="st-pill__dot"></span><span id="pill-text">Connecting&hellip;</span></span>
+  <button class="st-btn st-btn--secondary pause-btn" id="pause-btn" type="button" hidden></button>
   <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark">
     <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
 </header>
@@ -46,8 +48,10 @@
 <main>
   <!-- ============================ Chat ============================ -->
   <section class="view view--chat" id="view-chat" role="tabpanel" aria-labelledby="tab-btn-chat">
+    <aside class="history" id="history" aria-label="Chats" data-open="false"></aside>
     <div class="chat-scroll" id="chat-scroll">
       <div class="chat" id="chat">
+        <div class="st-card load-card" id="load-card" role="status" aria-live="polite" hidden></div>
         <div class="chat-empty" id="chat-empty">
           <div class="chat-empty__title">Ask anything</div>
           <div class="chat-empty__sub" id="chat-empty-sub">Frontier AI on your own hardware.</div>
@@ -55,6 +59,7 @@
       </div>
     </div>
     <div class="composer-wrap">
+      <div class="modes" id="modes" role="radiogroup" aria-label="Mode"></div>
       <form class="st-composer" id="composer">
         <div class="attachments" id="attachments" hidden></div>
         <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message"></textarea>
@@ -62,6 +67,7 @@
           <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file">
             <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
           <input type="file" id="file" multiple hidden>
+          <button type="button" class="st-btn st-btn--icon" id="history-btn" title="Chats" aria-label="Chats"></button>
           <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
@@ -218,6 +224,7 @@
         <span class="card-title">Connect your tools</span>
         <p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
         <dl class="facts" id="facts-api"></dl>
+        <div class="connect" id="connect"></div>
       </div>
       <div class="st-card">
         <span class="card-title">Settings</span>
@@ -227,7 +234,10 @@
         </div>
         <div class="toggle-row"><span>Dark theme</span>
           <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
-        <p class="muted small">Chats, settings and the key are kept in this browser only.
+        <div class="toggle-row"><span>Tell me when an answer is ready<br><span class="muted small" id="notify-note">a
+          Windows notification while this tab is in the background</span></span>
+          <button class="st-toggle" id="notify-toggle" role="switch" aria-checked="false" aria-label="Tell me when an answer is ready"></button></div>
+        <p class="muted small">Chats (only if you turn on "Save chats"), settings and the key are kept in this browser only.
           <a href="https://github.com/musicurgy/delta-inference-engine" target="_blank" rel="noopener noreferrer">Delta Inference Engine on GitHub</a></p>
       </div>
       <div class="st-card cfg-card" id="cfg-card" hidden>
@@ -278,9 +288,9 @@
     </div>
     <div class="toggle-row"><span>Show thinking<br><span class="muted small">expanded while it streams</span></span>
       <button class="st-toggle" id="s-show" role="switch" aria-checked="true" aria-label="Show thinking"></button></div>
-    <div class="toggle-row"><span>Keep chats in this browser<br><span class="muted small">off: the chat lives in this
-      tab's memory only - nothing is written to disk</span></span>
-      <button class="st-toggle" id="s-keep" role="switch" aria-checked="false" aria-label="Keep chats in this browser"></button></div>
+    <div class="toggle-row"><span>Save chats in this browser<br><span class="muted small">on: the chat list (Chats);
+      off: the chat lives in this tab's memory only - nothing is written to disk</span></span>
+      <button class="st-toggle" id="s-keep" role="switch" aria-checked="false" aria-label="Save chats in this browser"></button></div>
     <div class="toggle-row" id="mcp-row" hidden><span>Use tools from MCP servers<br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers"></button></div>
@@ -299,5 +309,7 @@
 <div class="scrim" id="scrim" hidden></div>
 <div class="st-toasts" id="toasts" aria-live="polite"></div>
 <script src="web/app.js"></script>
+<script src="web/everyday.js"></script>
+<script src="web/history.js"></script>
 </body>
 </html>
