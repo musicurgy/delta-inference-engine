@@ -141,7 +141,6 @@ class Structured(unittest.TestCase):
             for fmt in formats:
                 with self.subTest(fmt=fmt):
                     self.assertEqual(self.chat(response_format=fmt)[0], 400)
-            self.assertEqual(self.chat(tools=[{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}])[0], 400)
             self.assertEqual(self.chat(strata_mcp=True)[0], 400)
             self.assertEqual(self.request("/v1/chat/completions", [])[0], 400)
             load.assert_not_called()

@@ -285,13 +285,63 @@ def request_tools(req: dict):
                 add({"type": "function", **member}, f"{param}.tools[{j}]", tool.get("name"),
                     tool.get("description") or "")
         elif kind in HOSTED_TOOLS or isinstance(kind, str):
-            skipped.append(kind)                     # the model cannot run OpenAI's hosted tools: left out
+            # the model cannot run OpenAI's hosted tools: left out (C3: frontend.SERVER_TOOLS is where a hosted tool
+            # this server learns to run is registered; Codex's web_search stays out until then)
+            skipped.append(kind)
         else:
             raise ResponsesError("a tool needs a type", param + ".type")
     choice = req.get("tool_choice")
     if choice == "none":
         return None, names, skipped
     return tools or None, names, skipped
+
+
+def _all_tools(req: dict) -> list:
+    given = req.get("tools") if isinstance(req.get("tools"), list) else []
+    extra = [t for item in (req.get("input") if isinstance(req.get("input"), list) else [])
+             if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list)
+             for t in item["tools"]]
+    return [t for t in list(given) + extra if isinstance(t, dict)]
+
+
+def tool_choice(req: dict, names: dict):
+    """C4: Responses' `tool_choice` in the shape frontend.forced_call reads, with a tool's name as the prompt spells
+    it.  "auto" / "none" / "required"; {"type": "function" | "custom", "name": N} (a namespaced tool by its own name or
+    as "namespace.name"); {"type": "allowed_tools", "mode": "required" | "auto", ...} (the tools stay as sent: the
+    prompt does not change).  A hosted tool's choice ({"type": "web_search"}) is passed on and logged as unsupported."""
+    choice = req.get("tool_choice")
+    if not isinstance(choice, dict):
+        return choice
+    kind = choice.get("type")
+    if kind == "allowed_tools":
+        return "required" if choice.get("mode") == "required" else "auto"
+    if kind in ("function", "custom") and isinstance(choice.get("name"), str):
+        name, namespace = choice["name"], choice.get("namespace")
+        if namespace and f"{namespace}.{name}" in names:
+            return {"type": "function", "name": f"{namespace}.{name}"}
+        if name not in names:
+            found = [flat for flat, (ns, own, _k) in names.items()
+                     if own == name and flat == (f"{ns}.{own}" if ns else own)]
+            if len(found) == 1:
+                name = found[0]
+        return {"type": "function", "name": name}
+    return choice
+
+
+def strict_tools(req: dict) -> list:
+    """C4: the function tools marked `"strict": true`, as {"name": prompt name, "parameters", "strict"} (namespaced
+    members by "namespace.name")."""
+    out = []
+    for tool in _all_tools(req):
+        if tool.get("type") == "function" and tool.get("strict") is True:
+            out.append({"name": tool.get("name"), "parameters": tool.get("parameters"), "strict": True})
+        elif tool.get("type") == "namespace":
+            for member in tool.get("tools") or []:
+                if isinstance(member, dict) and member.get("type", "function") == "function" and \
+                        member.get("strict") is True:
+                    out.append({"name": f"{tool.get('name')}.{member.get('name')}",
+                                "parameters": member.get("parameters"), "strict": True})
+    return out
 
 
 def _turn_body(req: dict):

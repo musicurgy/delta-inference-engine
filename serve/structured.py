@@ -80,7 +80,43 @@ def _only_objects(node, root, refs=()):
     return isinstance(branches, list) and any(_only_objects(b, root, refs) for b in branches)
 
 
-def prepare_format(response_format, messages, with_tools=False):
+def _check_refs(node, what):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("$ref", "$dynamicRef") and isinstance(value, str) and not value.startswith("#"):
+                raise ValueError(f"{what} supports only local schema references (#...)")
+            _check_refs(value, what)
+    elif isinstance(node, list):
+        for value in node:
+            _check_refs(value, what)
+
+
+def schema_validator(schema, what="response_format"):
+    """A validator for `schema` (local references only, never fetched); without jsonschema: one JSON object."""
+    _check_refs(schema, what)
+    modules = jsonschema_modules()
+    if modules is None:
+        return _ObjectOnly()
+    validators, SchemaError, Registry, NoSuchResource = modules
+
+    def no_remote(uri):
+        raise NoSuchResource(ref=uri)
+
+    try:
+        cls = validators.validator_for(schema)
+        cls.check_schema(schema)
+        return cls(schema, registry=Registry(retrieve=no_remote))
+    except SchemaError as exc:
+        raise ValueError(f"invalid {what} schema: {exc.message}") from exc
+
+
+# C4: where the format instruction goes.  "end" (the default): at the end of the last user turn, so a conversation's
+# turns with and without a format render the same prompt up to there and the conversation cache carries across the
+# switch.  "start": appended to the first system message, as through 0.93 (the config's "format_instruction").
+DIRECTIVE_POSITIONS = ("end", "start")
+
+
+def prepare_format(response_format, messages, with_tools=False, position="end"):
     if response_format is None:
         return messages, None
     if not isinstance(response_format, dict):
@@ -90,7 +126,7 @@ def prepare_format(response_format, messages, with_tools=False):
         return messages, None
     if kind == "json_object":
         schema = {"type": "object"}
-        modules = None                 # the standard library is enough for "one JSON object"
+        validator = _ObjectOnly()      # the standard library is enough for "one JSON object"
     elif kind == "json_schema":
         spec = response_format.get("json_schema")
         if not isinstance(spec, dict) or not isinstance(spec.get("schema"), dict):
@@ -103,34 +139,9 @@ def prepare_format(response_format, messages, with_tools=False):
         if not _only_objects(schema, schema):
             raise ValueError("response_format schema must accept only JSON objects at its root "
                              "(type object, or anyOf/oneOf of object schemas)")
-        modules = jsonschema_modules()
+        validator = schema_validator(schema)
     else:
         raise ValueError("response_format.type must be text, json_object or json_schema")
-
-    def check_refs(node):
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if key in ("$ref", "$dynamicRef") and isinstance(value, str) and not value.startswith("#"):
-                    raise ValueError("response_format supports only local schema references (#...)")
-                check_refs(value)
-        elif isinstance(node, list):
-            for value in node:
-                check_refs(value)
-    check_refs(schema)
-    if modules is None:
-        validator = _ObjectOnly()
-    else:
-        validators, SchemaError, Registry, NoSuchResource = modules
-
-        def no_remote(uri):
-            raise NoSuchResource(ref=uri)
-
-        try:
-            cls = validators.validator_for(schema)
-            cls.check_schema(schema)
-            validator = cls(schema, registry=Registry(retrieve=no_remote))
-        except SchemaError as exc:
-            raise ValueError(f"invalid response_format schema: {exc.message}") from exc
     directive = ("OUTPUT FORMAT REQUIREMENT: Return exactly one JSON object matching the JSON Schema below. "
                  "No Markdown, headings, code fences, commentary, or text outside the JSON. "
                  "Use every required field, correct types, and only allowed fields. "
@@ -141,7 +152,18 @@ def prepare_format(response_format, messages, with_tools=False):
         directive += ("\nThis applies only to your final answer. To use a tool, call it as usual; the JSON object is "
                       "what you write once you are done with the tools.")
     messages = [dict(message) for message in messages]
-    if messages and messages[0].get("role") == "system":
+    last = messages[-1].get("role") if messages else None
+    if position == "end" and last == "user":
+        # after the user's own words, in the same turn: everything before them renders as without a format
+        content = messages[-1].get("content")
+        if isinstance(content, list):
+            messages[-1]["content"] = content + [{"type": "text", "text": "\n\n" + directive}]
+        else:
+            messages[-1]["content"] = (content or "") + "\n\n" + directive
+    elif position == "end" and last == "tool":
+        # an agent's turn after tool results: a short user turn of its own after them
+        messages.append({"role": "user", "content": directive})
+    elif messages and messages[0].get("role") == "system":
         content = messages[0].get("content") or ""
         if isinstance(content, list):
             messages[0]["content"] = content + [{"type": "text", "text": directive}]
@@ -150,6 +172,75 @@ def prepare_format(response_format, messages, with_tools=False):
     else:
         messages.insert(0, {"role": "system", "content": directive})
     return messages, validator
+
+
+def anthropic_format(req: dict):
+    """C4: Anthropic's structured output - `output_config.format` (and the older beta's `output_format`) as the chat
+    path's response_format, or None.  {"type": "json_schema", "schema": {...}}."""
+    cfg = req.get("output_config")
+    fmt = cfg.get("format") if isinstance(cfg, dict) else None
+    if fmt is None:
+        fmt = req.get("output_format")
+    if fmt is None:
+        return None
+    if not isinstance(fmt, dict):
+        raise ValueError("output_config.format must be an object")
+    kind = fmt.get("type")
+    if kind in (None, "text"):
+        return None
+    if kind == "json_schema":
+        return {"type": "json_schema", "json_schema": {"name": fmt.get("name") or "output", "schema": fmt.get("schema")}}
+    if kind == "json_object":
+        return {"type": "json_object"}
+    raise ValueError("output_config.format.type must be json_schema")
+
+
+def strict_tool_validators(tools) -> dict:
+    """C4: {tool name: validator} for the tools a request marks `"strict": true` (chat {"type": "function",
+    "function": {..., "strict": true}}, Responses' flat function tools, Anthropic's tools).  Only an explicit true
+    counts.  Without jsonschema installed nothing is checked (said once in the server window)."""
+    out = {}
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        if fn.get("strict") is not True or not isinstance(fn.get("name"), str):
+            continue
+        schema = fn.get("parameters", fn.get("input_schema"))
+        if not isinstance(schema, dict) or jsonschema_modules() is None:
+            continue
+        out[fn["name"]] = schema_validator(schema, f"tool {fn['name']}")
+    return out
+
+
+def check_tool_call(name, arguments, validators) -> None:
+    """Raises StructuredOutputError when a strict tool's call does not match its schema."""
+    validator = validators.get(name)
+    if validator is None:
+        return
+    try:
+        error = next(validator.iter_errors(arguments), None)
+    except Exception as exc:
+        raise StructuredOutputError(f"could not validate the call of strict tool {name}: {exc}") from exc
+    if error is not None:
+        path = "/" + "/".join(str(part) for part in error.absolute_path)
+        raise StructuredOutputError(f"the model's call of strict tool {name} failed its schema at {path}: "
+                                    f"{error.message}")
+
+
+def strict_checked(run, validators):
+    """Service.run's items, each complete call of a strict tool checked against its schema before it goes on.  A call
+    that fails ends the request (StructuredOutputError: a 502, or the stream's error event)."""
+    if not validators:
+        yield from run
+        return
+    try:
+        for item in run:
+            if item[0] == "event" and item[1].kind == "tool_call" and item[1].call is not None:
+                check_tool_call(item[1].call.name, item[1].call.arguments, validators)
+            yield item
+    finally:
+        run.close()
 
 
 def _extract_json(text: str) -> str:
