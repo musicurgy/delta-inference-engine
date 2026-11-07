@@ -28,6 +28,8 @@ from pathlib import Path
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+from serve import documents
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -202,12 +204,13 @@ ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_resu
 
 def _check_parts(content, path: str, kinds):
     """A request's content parts (on chat) or content blocks (on messages), looked at while the request is converted.
-    A part whose type this server does not read (a file, audio, a document, Anthropic's tool_reference,
-    search_result, server_tool_use / web_search_tool_result blocks, ...) is left out of the prompt exactly as it always
-    was, with a debug line: real clients (Claude Code, Codex, opencode, Cline, Continue, Open WebUI) send such parts
-    next to text the model can answer from, so refusing them would break requests that work.  A "refusal" part is read
-    as its text, as /v1/responses does.  Content that is not a list, and a part that is not an object, passes through
-    unchanged."""
+    A document (Anthropic `document`, OpenAI `file`, Responses `input_file`: PDF, Word, Excel, PowerPoint, HTML or
+    text) is read as its text between a header and a footer (serve/documents.py); one that cannot be read is a one-line
+    note saying why.  A part whose type this server does not read (audio, Anthropic's tool_reference, search_result,
+    server_tool_use / web_search_tool_result blocks, ...) is left out of the prompt exactly as it always was, with a
+    debug line: real clients (Claude Code, Codex, opencode, Cline, Continue, Open WebUI) send such parts next to text
+    the model can answer from, so refusing them would break requests that work.  A "refusal" part is read as its text,
+    as /v1/responses does.  Content that is not a list, and a part that is not an object, passes through unchanged."""
     if not isinstance(content, list):
         return content
     out = content
@@ -219,10 +222,22 @@ def _check_parts(content, path: str, kinds):
             if out is content:
                 out = list(content)
             out[j] = {"type": "text", "text": part.get("refusal") or ""}
+        elif kind in documents.DOCUMENT_PARTS:
+            if out is content:
+                out = list(content)
+            out[j] = {"type": "text", "text": document_text(part, j > 0, j < len(content) - 1)}
         elif kind not in kinds:
             LOGGER.debug("%s[%d].type: content part of type %r is not read by this server; left out of the prompt",
                          path, j, kind)
     return out
+
+
+def document_text(part: dict, before: bool = False, after: bool = False) -> str:
+    """A document part's prompt text, set apart by a blank line from the parts before and after it (text parts are
+    joined with nothing between them)."""
+    text = documents.part_text(part)
+    sep = "\n\n"
+    return (sep if before else "") + text + (sep if after else "")
 
 
 def images_of(messages: list[dict]) -> list[str]:

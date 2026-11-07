@@ -68,6 +68,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve.voice import VoiceServer, start_lazy_voice  # noqa: E402  local: the voice sidecar (ASR/TTS)
+from serve import documents  # noqa: E402  PDF / Office / text documents -> prompt text
 from serve import images as images_api  # noqa: E402
 
 IM_END = "<|im_end|>"
@@ -5498,6 +5499,27 @@ def make_handler(svc: Service):
                 server.touch()
             self._raw(status, out, ctype)
 
+        def _extract(self):
+            """POST /v1/extract {"name": "report.pdf", "data": "<base64 or a data: URL>", "media_type": optional}: the
+            document's prompt text (serve/documents.py), what it costs in tokens and roughly how long the model takes
+            to read it the first time.  The web chat shows that before sending; nothing goes to the model here."""
+            try:
+                req = json.loads(self._body() or b"{}")
+                if not isinstance(req, dict) or not isinstance(req.get("data"), str):
+                    raise ValueError("send {\"name\": ..., \"data\": base64}")
+                mt, data = documents._data_url(req["data"])
+            except ValueError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            name = str(req.get("name") or "document")
+            doc = documents.extract(data, name, str(req.get("media_type") or mt))
+            text = doc.render()
+            tokens = len(svc.tok.encode(text))
+            self._json(200, {"name": name, "type": documents.KIND_NAMES.get(doc.kind, doc.kind), "pages": doc.pages,
+                             "chars": len(doc.text), "tokens": tokens, "error": doc.error or None,
+                             "note": doc.note or None, "read_seconds": round(documents.estimate_seconds(tokens), 1),
+                             "text": text})
+
         def _authorized(self) -> bool:
             if not svc.api_key:
                 return True
@@ -5605,6 +5627,8 @@ def make_handler(svc: Service):
                                  "display_name": getattr(svc, "display_name", None),
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
+                                 # the chat's microphone and read-aloud buttons (serve/speech.py, started on first use)
+                                 "voice": {"asr": "asr" in svc.voice_servers, "tts": "tts" in svc.voice_servers},
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
@@ -5705,6 +5729,9 @@ def make_handler(svc: Service):
                 return
             if path in ("/v1/audio/transcriptions", "/v1/audio/speech"):   # local: the voice sidecar
                 self._audio(path)
+                return
+            if path == "/v1/extract":                     # a document's text, token count and first-read time
+                self._extract()
                 return
             if path == "/settings":
                 self._settings()

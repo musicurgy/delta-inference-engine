@@ -93,7 +93,7 @@ class Parsing(unittest.TestCase):
         for items, param in (([{"type": "item_reference", "id": "msg_1"}], "input[0]"),
                              ([{"type": "web_search_call"}], "input[0].type"),
                              ([{"role": "user", "content": [{"type": "input_file", "file_id": "f"}]}],
-                              "input[0].content[0].type"),
+                              "input[0].content[0]"),
                              ([{"role": "robot", "content": "x"}], "input[0].role")):
             with self.assertRaises(ResponsesError) as e:
                 input_messages({"input": items})
