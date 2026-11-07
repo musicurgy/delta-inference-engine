@@ -245,6 +245,16 @@ class Placement(unittest.TestCase):
         self.assertNotIn("cuda_device", v)
         self.assertIn("2.0 GB", said)
 
+    def test_cpu_encoder_lazy_under_110_gib(self):
+        # 1107 review: the CPU encoder's 3.9 GB stays out of RAM on a 64 / 96 GB PC until the first picture
+        for gib, want in ((63.8, True), (95.7, True), (127.7, False), (191.8, False)):
+            v, _ = self.section("cpu", "cpu", ram=gib)                       # section() patches total_ram_gib
+            self.assertEqual(bool(v.get("lazy")), want, gib)
+            if want:
+                self.assertEqual((v["lazy_idle_s"], v["lazy_reserve_mib"]), (L.VISION_LAZY_IDLE_S, 0))
+        self.assertNotIn("lazy", self.section("cpu", "cpu", ram=63.8, lazy="0")[0])
+        self.assertNotIn("lazy", self.section("on", "cuda", ram=63.8)[0])     # a card encoder: never lazy here
+
     def test_section_main_card_has_no_device(self):
         v, _ = self.section("main", "cuda", multi=False)
         self.assertTrue(v["gpu"])

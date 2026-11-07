@@ -386,12 +386,6 @@ VISION_GPU_GIB = 2.0
 # read-aloud (Kokoro, onnxruntime CUDA) on the helper's card: "about 1.5 GB" (voice_section's note); without this the
 # helper's 2.5 GiB of headroom was all that was left for it
 VOICE_GPU_GIB = 1.5
-# Pictures on the CPU below this much RAM: the encoder starts with the first picture and stops after VISION_LAZY_IDLE_S
-# without one.  Resident it holds ~2.4 GB (4.0 GB committed) and peaks at ~4.3 GB while it loads, beside the engine's
-# own load (measured 11-07, docs/win3090/brainstorm_1107/review_lowram.md) - RAM the 28 GiB reserve does not count, on a
-# 64 / 96 GB PC that has ~11 GB left after a long prompt.  DS41_VISION_LAZY=1 / 0 decides on any PC.
-LAZY_VISION_RAM_GIB = 110
-VISION_LAZY_IDLE_S = 300
 
 
 def vision_choice():
@@ -495,10 +489,26 @@ def vision_section(m, engine_gpu=None):
         v["where"] = note
     else:   # i5-13600K: 6 threads 8.1 s for a 1024x701 photo, 14 threads 9.2 s (the E-cores slow it down)
         v["threads"] = max(1, min(6, os.cpu_count() or 1))
-        lz = os.environ.get("DS41_VISION_LAZY", "").strip()
-        if lz == "1" or (lz != "0" and total_ram_gib() < LAZY_VISION_RAM_GIB):
-            v["lazy"], v["lazy_idle_s"] = True, VISION_LAZY_IDLE_S
+        if vision_lazy():
+            # 1107 review: the CPU encoder holds 3.9 GB of RAM (4.3 GB peak; PyTorch alone 1.5 GB), taken from the
+            # ~14 GiB the RAM reserve leaves Windows on a 64 / 96 GB PC.  There it starts with the first picture (a few
+            # seconds, once) and stops after VISION_LAZY_IDLE_S without one; serve_ds41 skips lazy mode's VRAM step
+            # (this engine has no VRAM command)
+            v.update({"lazy": True, "lazy_idle_s": VISION_LAZY_IDLE_S, "lazy_reserve_mib": 0})
+            print(f"ds41_local: pictures on the CPU, started with the first picture ({total_ram_gib():.0f} GiB of RAM)")
     return v
+
+
+VISION_LAZY_BELOW_GIB, VISION_LAZY_IDLE_S = 110, 600
+
+
+def vision_lazy():
+    """A CPU encoder that starts with the first picture: under VISION_LAZY_BELOW_GIB of RAM, or DS41_VISION_LAZY=1
+    (=0: resident whatever the RAM)."""
+    v = os.environ.get("DS41_VISION_LAZY", "").strip()
+    if v in ("0", "1"):
+        return v == "1"
+    return total_ram_gib() < VISION_LAZY_BELOW_GIB
 
 
 # Voice (off by default): dictation and read-aloud, serve/speech.py run by sherpa-onnx, started on first use and stopped

@@ -300,10 +300,26 @@ class Ds41Vision(_Vision):
                 self.restart()
             except RuntimeError as e:
                 raise ValueError(f"pictures are not working: the image encoder did not start ({e})") from None
-        return super().encode(source, keep, detail)
+        try:
+            return super().encode(source, keep, detail)
+        except RuntimeError as e:   # a lazy encoder starts inside the base encode(): its failure is the picture's 400
+            raise ValueError(f"pictures are not working: the image encoder did not start ({e})") from None
 
 
 S.Vision = Ds41Vision
+_start_lazy_vision = S.Service.start_lazy_vision
+
+
+def _start_lazy_vision_ds41(self, reserve_mib, idle_s):
+    # 1107 review: lazy mode (a CPU encoder on a 64 / 96 GB PC, ds41_local.vision_lazy) asks an "elastic" engine to
+    # shrink its expert cache before the encoder starts and to grow it after (`VRAM <mib>`), and takes an engine as
+    # elastic unless its info says otherwise.  ds41_generate has no VRAM command: each picture's start would wait
+    # 120 s for an answer and then take the engine for dead.  The encoder only starts and stops here.
+    self.engine.info["vram_elastic"] = False
+    _start_lazy_vision(self, reserve_mib, idle_s)
+
+
+S.Service.start_lazy_vision = _start_lazy_vision_ds41
 
 # ---- tool calls: DSML
 CALLS_OPEN = f"<{E.dsml_token}{E.tool_calls_block_name}>"           # <｜DSML｜ calls>
