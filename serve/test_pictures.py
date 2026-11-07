@@ -211,6 +211,19 @@ class Placement(unittest.TestCase):
         self.assertNotIn("cuda_device", v)
         self.assertIn("2.0 GB", said)
 
+    def test_cpu_encoder_lazy_under_110_gib(self):
+        # 1107 review: the CPU encoder's 3.9 GB stays out of RAM on a 64 / 96 GB PC until the first picture
+        for gib, want in ((63.8, True), (95.7, True), (127.7, False), (191.8, False)):
+            with mock.patch.object(L, "total_ram_gib", lambda g=gib: g), mock.patch.dict(os.environ, {"DS41_VISION_LAZY": ""}):
+                v, _ = self.section("cpu", "cpu")
+            self.assertEqual(bool(v.get("lazy")), want, gib)
+            if want:
+                self.assertEqual((v["lazy_idle_s"], v["lazy_reserve_mib"]), (L.VISION_LAZY_IDLE_S, 0))
+        with mock.patch.object(L, "total_ram_gib", lambda: 63.8), mock.patch.dict(os.environ, {"DS41_VISION_LAZY": "0"}):
+            self.assertNotIn("lazy", self.section("cpu", "cpu")[0])
+        with mock.patch.object(L, "total_ram_gib", lambda: 63.8):
+            self.assertNotIn("lazy", self.section("on", "cuda")[0])          # a card encoder: never lazy here
+
     def test_section_main_card_has_no_device(self):
         v, _ = self.section("main", "cuda", multi=False)
         self.assertTrue(v["gpu"])

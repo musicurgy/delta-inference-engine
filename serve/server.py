@@ -3841,8 +3841,8 @@ class Service:
                         continue
                     v.unload()
                     out = self.engine.vram(self.vram_reserve) if elastic and self.loaded() else {}
-                    print(f"[strata] lazy vision: encoder stopped after {idle_s:.0f} s idle; expert cache grown back "
-                          f"({out.get('expert_slots')} slots)", flush=True)
+                    print(f"[strata] lazy vision: encoder stopped after {idle_s:.0f} s idle"
+                          + (f"; expert cache grown back ({out.get('expert_slots')} slots)" if out else ""), flush=True)
                 except Exception as e:                  # the thread keeps running
                     print(f"[strata] lazy vision: {e}", flush=True)
                 finally:
