@@ -27,9 +27,9 @@ RANK = {"sse": 0, "avx": 1, "avx2": 2, "avx512": 3}
 # folder -> the level it needs when it has no cpu-level.txt
 BUILDS = [("build-ds41", None), ("build-ds41-portable", "avx2"), ("build-ds41-compat-avx", "avx"),
           ("build-ds41-compat", "sse")]
-# text only an engine that reads Q5_K Engram tables contains (0.93: Unsloth's UD-IQ2_XXS / UD-Q2_K_XL read their own;
-# the row reader's message in ds41_engram.cpp) - an older engine counts as out of date and is replaced
-ENGINE_MARK = b" is not IQ4_NL / MXFP8 / Q5_K ["
+# text only a 0.94 engine contains (bounded replay's start-up line, ds41_generate.cpp; 0.93 used the Q5_K Engram reader's
+# message) - an older engine counts as out of date and is replaced, so an update gets the 0.94 engine fixes
+ENGINE_MARK = b"enc-bound: layers past"
 # text only an engine built with utf8.manifest contains: it opens paths with any letter; older ones only plain A-Z
 # ones ("cannot open C:/Users/Jos?/..."), so they count as out of date where the project or model folder needs it
 UTF8_MARK = b"activeCodePage"
