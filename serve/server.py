@@ -64,7 +64,8 @@ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
-from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.structured import (DIRECTIVE_POSITIONS, StructuredOutputError, anthropic_format,  # noqa: E402
+                              prepare_format, strict_checked, strict_tool_validators, validated_json)
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve.voice import VoiceServer, start_lazy_voice  # noqa: E402  local: the voice sidecar (ASR/TTS)
@@ -214,6 +215,8 @@ def focused_recovery_prompt(tok, ids, generated):
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
+ANTHROPIC_PING_S = 15.0     # C8: a quiet /v1/messages stream turns its next keep-alive into a ping event after this
+COUNT_CACHE_MAX = 32        # R8: token counts kept (count_tokens, /v1/responses/input_tokens)
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
@@ -3079,6 +3082,17 @@ class Detokenizer:
 OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
 
 
+def one_call_only(req) -> bool:
+    """C4: the request allows one tool call per turn - OpenAI's (chat, Responses) `"parallel_tool_calls": false` or
+    Anthropic's `tool_choice.disable_parallel_tool_use: true`."""
+    if not isinstance(req, dict):
+        return False
+    if req.get("parallel_tool_calls") is False:
+        return True
+    choice = req.get("tool_choice")
+    return isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True
+
+
 def stop_strings(req: dict) -> list[str]:
     """The request's stop strings: OpenAI's `stop` (a string or a list of up to 4) or Anthropic's `stop_sequences`
     (a list).  Empty strings are left out.  A bad value is a ValueError, so a 400 before anything is generated."""
@@ -3254,6 +3268,10 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        self.format_instruction = "end"                   # C4: where a JSON format's instruction goes (structured.py)
+        self.count_cache = collections.OrderedDict()      # R8: request body hash -> token count (count_tokens)
+        self.count_cache_lock = threading.Lock()
+        self.codex_base_instructions_file = None          # the Codex catalog's base instructions (a text file)
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -3957,7 +3975,9 @@ class Service:
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True},
+                                  "constrained_decoding": False, "stream_buffered": True,
+                                  # C4: a format with tools is for the final answer; strict tools' calls are checked
+                                  "with_tools": True, "strict_tools": True, "instruction": self.format_instruction},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -4311,6 +4331,8 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        # C4: parallel_tool_calls false / disable_parallel_tool_use: the reply ends at its first complete call
+        single, one_done = bool(tools) and one_call_only(sampling), False
         think_end_id = getattr(self, "think_end_id", None)
         if think_end_id is not None:
             parser.end_tokens = 0       # token mode: only the end-of-thinking token closes the reasoning
@@ -4490,6 +4512,12 @@ class Service:
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
+                                    if single and ev.kind == "tool_call":
+                                        one_done = True     # nothing after the first call is sent
+                                        break
+                                if one_done:
+                                    finish = "stop"         # gen.close() below STOPs the engine
+                                    break
                                 if evs:
                                     last_out = time.perf_counter()
                                 elif time.perf_counter() - last_out >= KEEPALIVE_S:
@@ -4739,12 +4767,13 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
-            yield "event", ev
+            if not one_done:                            # C4: a second call held in the parser is not sent
+                yield "event", ev
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
                   f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
-        if stops is not None and stops.hit is None and stops.held:
+        if stops is not None and stops.hit is None and stops.held and not one_done:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n,
@@ -5082,6 +5111,10 @@ def structured_chunks(chunks, validator):
                 yield chunk if progress else None
         result = openai_collect(buffered)
         choice = result["choices"][0]
+        if choice["message"].get("tool_calls"):
+            # C4 (#782's rule, as /v1/responses): a turn that calls a tool is not the final answer - sent as it is
+            yield from buffered
+            return
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
         yield buffered[0]
         delta = {"content": content}
@@ -5094,7 +5127,8 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, run=None):
+    """`run`: the events to send instead of Service.run's (C4: checked for strict tools)."""
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
@@ -5105,7 +5139,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
         if kind == "ping":
             yield None
             continue
@@ -5196,6 +5230,152 @@ def anthropic_collect(events) -> dict:
     return msg
 
 
+# Anthropic's error types by HTTP status (its API answers {"type": "error", "error": {"type", "message"}})
+ANTHROPIC_PATHS = ("/v1/messages", "/v1/messages/count_tokens")
+ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+                         404: "not_found_error", 413: "request_too_large", 415: "invalid_request_error",
+                         429: "rate_limit_error", 503: "overloaded_error", 529: "overloaded_error"}
+ANTHROPIC_ERRORS = set(ANTHROPIC_ERROR_TYPES.values()) | {"api_error"}
+
+
+def anthropic_error(code: int, obj):
+    """An error body in Anthropic's envelope: {"type": "error", "error": {"type": <one of Anthropic's types>, "message",
+    ...}}; the server's own type (model_busy, structured_output_failed, ...) and code stay beside it."""
+    if not isinstance(obj, dict) or obj.get("type") == "error" or not isinstance(obj.get("error"), dict):
+        return obj
+    err = dict(obj["error"])
+    kind = err.get("type")
+    if kind not in ANTHROPIC_ERRORS:
+        if kind is not None:
+            err.setdefault("code", kind)
+        err["type"] = ANTHROPIC_ERROR_TYPES.get(code, "api_error")
+    err.setdefault("message", "")
+    return {**{k: v for k, v in obj.items() if k != "error"}, "type": "error", "error": err}
+
+
+# ------------------------------------------------------------------------------------------------ model metadata
+STARTED_AT = int(time.time())       # /v1/models' "created": when this server started
+
+
+def model_fields(svc) -> dict:
+    """The fields agents read from a /v1/models entry beside OpenAI's id/object: Anthropic's (type, display_name,
+    created_at), the context under the names the OpenAI ecosystem uses (context_length: OpenRouter / LM Studio,
+    max_model_len: vLLM, context_window / max_input_tokens / max_output_tokens: LiteLLM and agents) and what the
+    model can do.  max_output_tokens is the context: a request's answer may use whatever its prompt leaves."""
+    ctx, started = svc.reported_ctx(), int(getattr(svc, "started_at", None) or STARTED_AT)
+    return {"created": started, "owned_by": "strata", "type": "model",
+            "display_name": getattr(svc, "display_name", None) or svc.model,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+            "context_length": ctx, "max_context_length": ctx, "max_model_len": ctx, "context_window": ctx,
+            "max_input_tokens": ctx, "max_output_tokens": ctx,
+            "capabilities": {"chat": True, "streaming": True, "tools": True, "tool_choice": True,
+                             "parallel_tool_calls": True, "reasoning": True, "structured_output": True,
+                             "vision": svc.vision is not None, "embeddings": False}}
+
+
+def effort_levels() -> list[str]:
+    """The reasoning levels a request can name that differ from each other (frontend.effort_kwargs, which a model
+    adapter replaces with its own): low / medium / high, and max where it is more than high (DeepSeek V4.1)."""
+    import serve.frontend as fe
+    levels, seen = [], []
+    for name in ("low", "medium", "high", "max"):
+        try:
+            kw = fe.effort_kwargs(name)
+        except ValueError:
+            continue
+        if kw not in seen:
+            seen.append(kw)
+            levels.append(name)
+    return levels
+
+
+CODEX_LEVEL_TEXT = {"low": "Fast responses with lighter reasoning", "medium": "Balanced reasoning",
+                    "high": "Thorough reasoning (the model's default)", "max": "The most reasoning the model does"}
+
+
+def codex_catalog(svc) -> dict:
+    """A Codex model catalog ({"models": [ModelInfo]}, Codex's `model_catalog_json`), in the shape DeepSeek's Codex
+    guide ships: the context window Codex should plan with, the reasoning levels, the freeform apply_patch tool,
+    shell_command and parallel calls.  Codex needs base instructions for a catalog model: the config's
+    "codex_base_instructions_file" (a text file) gives them, else the entry has none (DETAILS.md says what to do)."""
+    ctx = svc.reported_ctx()
+    levels = effort_levels()
+    default = svc.effort_default()
+    default = default if default in levels else "high" if "high" in levels else (levels[-1] if levels else None)
+    base = ""
+    path = getattr(svc, "codex_base_instructions_file", None)
+    if path:
+        try:
+            base = Path(path).read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"[strata] codex_base_instructions_file: {e}", flush=True)
+    entries = []
+    for slug in [svc.model, *svc.aliases]:
+        entries.append({
+            "slug": slug, "display_name": getattr(svc, "display_name", None) or slug,
+            "description": "Served by Strata on this PC", "default_reasoning_level": default,
+            "supported_reasoning_levels": [{"effort": x, "description": CODEX_LEVEL_TEXT[x]} for x in levels],
+            "shell_type": "shell_command", "visibility": "list", "supported_in_api": True, "priority": 1,
+            "availability_nux": None, "upgrade": None, "base_instructions": base,
+            "supports_reasoning_summaries": False, "default_reasoning_summary": "none",
+            "support_verbosity": False, "default_verbosity": None, "apply_patch_tool_type": "freeform",
+            "web_search_tool_type": "text", "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "supports_parallel_tool_calls": True, "supports_image_detail_original": False,
+            "context_window": ctx, "max_context_window": ctx, "effective_context_window_percent": 95,
+            "experimental_supported_tools": [],
+            "input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
+            "prefer_websockets": False, "supports_search_tool": False})
+    return {"models": entries}
+
+
+def structured_anthropic(events, validator):
+    """C4: `output_config.format` on /v1/messages - the events held until the answer is checked, as
+    structured_chunks does for chat.  The text blocks become one text block holding the validated JSON (after the
+    thinking); a turn that calls a tool is sent as it is (its schema is for the final answer).  Heartbeats pass."""
+    buffered = []
+    heartbeat = time.monotonic()
+    try:
+        for item in events:
+            if item is not None and item[0] == "message_start":
+                yield item                  # no content in it; a stream's pings may only follow it
+                continue
+            if item is not None:
+                buffered.append(item)
+            if item is None or time.monotonic() - heartbeat >= 1:
+                heartbeat = time.monotonic()
+                yield None
+        kinds = {e["index"]: e["content_block"]["type"] for name, e in buffered if name == "content_block_start"}
+        if "tool_use" in kinds.values():
+            yield from buffered
+            return
+        text = "".join(e["delta"]["text"] for name, e in buffered
+                       if name == "content_block_delta" and e["delta"]["type"] == "text_delta")
+        delta = next((e for name, e in buffered if name == "message_delta"), None)
+        stop = (delta or {}).get("delta", {}).get("stop_reason")
+        content = validated_json(text, validator, "stop" if stop in ("end_turn", "stop_sequence") else
+                                 "length" if stop == "max_tokens" else stop)
+        index, renumber = -1, {}
+        for name, e in buffered:
+            if name in ("content_block_start", "content_block_delta", "content_block_stop"):
+                if kinds.get(e["index"]) == "text":
+                    continue
+                if e["index"] not in renumber:
+                    index += 1
+                    renumber[e["index"]] = index
+                yield name, {**e, "index": renumber[e["index"]]}
+                continue
+            if name == "message_delta":
+                index += 1
+                yield "content_block_start", {"type": "content_block_start", "index": index,
+                                              "content_block": {"type": "text", "text": ""}}
+                yield "content_block_delta", {"type": "content_block_delta", "index": index,
+                                              "delta": {"type": "text_delta", "text": content}}
+                yield "content_block_stop", {"type": "content_block_stop", "index": index}
+            yield name, e
+    finally:
+        events.close()
+
+
 # ------------------------------------------------------------------------------------------------ HTTP
 CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding: chunked body may hold (read into memory)
 
@@ -5226,6 +5406,7 @@ def make_handler(svc: Service):
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
         body_read = False                                   # whether a handler took this request's body
+        raw_body = None                                     # R8: the JSON body as it came (count_tokens' memo key)
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
 
         def log_message(self, fmt, *args):
@@ -5446,7 +5627,25 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def do_HEAD(self):
+            """A reachability probe (Claude Code's `HEAD /api/hello` warm-up): 200 with no body for /api/hello, the
+            root page, /health and /v1/models; 404 for anything else.  The API key is checked as GET checks it (a 401,
+            no body); the Host check ran in parse_request."""
+            path = self.path.split("?")[0].rstrip("/")
+            if path not in ("", "/api/hello", "/health", "/api/health", "/v1/models", "/models"):
+                code = 404
+            elif path not in ("", "/health", "/api/health") and not self._key_ok():
+                code = 401
+            else:
+                code = 200
+            self.send_response(code)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def _json(self, code, obj, headers=None):
+            if code >= 400 and getattr(self, "path", "").split("?")[0].rstrip("/") in ANTHROPIC_PATHS:
+                obj = anthropic_error(code, obj)            # Anthropic's envelope on its own endpoints
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -5498,12 +5697,16 @@ def make_handler(svc: Service):
                 server.touch()
             self._raw(status, out, ctype)
 
-        def _authorized(self) -> bool:
+        def _key_ok(self) -> bool:
+            """No API key is set, or the request carries it (Authorization: Bearer, or x-api-key)."""
             if not svc.api_key:
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if key_matches(given, svc.api_key):
+            return key_matches(given, svc.api_key)
+
+        def _authorized(self) -> bool:
+            if self._key_ok():
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -5639,7 +5842,8 @@ def make_handler(svc: Service):
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
                              "meta": {"n_ctx": svc.reported_ctx()},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
-                                              "output_modalities": ["text"]}}
+                                              "output_modalities": ["text"]},
+                             **model_fields(svc)}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
                         loaded = True
@@ -5650,7 +5854,13 @@ def make_handler(svc: Service):
                     if svc.images is not None:            # the image model: POST /v1/images/generations
                         data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
                                      "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
-                    self._json(200, {"object": "list", "data": data})
+                    # Anthropic's list fields beside OpenAI's (Claude Code's gateway model discovery reads this list)
+                    self._json(200, {"object": "list", "data": data, "has_more": False,
+                                     "first_id": data[0]["id"] if data else None,
+                                     "last_id": data[-1]["id"] if data else None})
+            elif path == "/v1/codex/models.json":            # a Codex model catalog (model_catalog_json)
+                if self._authorized():
+                    self._json(200, codex_catalog(svc))
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -5701,7 +5911,8 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
-            if path.startswith("/v1/") and self._foreign_page():
+            if (path.startswith("/v1/") or path in ("/tokenize", "/detokenize", "/apply-template")) \
+                    and self._foreign_page():
                 return
             if path in ("/v1/audio/transcriptions", "/v1/audio/speech"):   # local: the voice sidecar
                 self._audio(path)
@@ -5743,9 +5954,16 @@ def make_handler(svc: Service):
                                headers={"Retry-After": int(ra)} if ra else None)
                 return
             try:
-                req = json.loads(self._body() or b"{}")
+                self.raw_body = self._body() or b"{}"
+                req = json.loads(self.raw_body)
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if path == "/v1/responses/input_tokens":     # OpenAI's token count for a Responses request
+                    self._input_tokens(req)
+                    return
+                if path in ("/tokenize", "/detokenize", "/apply-template"):   # llama.cpp's text tools
+                    self._text_tools(path, req)
+                    return
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -6155,9 +6373,12 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
-            messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError("structured response_format with tools/MCP is not supported")
+            # C4: with tools the format is for the final answer, as on /v1/responses (#782); not with MCP tools
+            messages, validator = prepare_format(req.get("response_format"), messages, with_tools=bool(tools),
+                                                 position=svc.format_instruction)
+            if validator is not None and req.get("strata_mcp"):
+                raise ValueError("structured response_format with MCP tools is not supported")
+            strict = strict_tool_validators(req.get("tools") if tools else None)   # C4: "strict": true tools
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
@@ -6181,6 +6402,8 @@ def make_handler(svc: Service):
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
+            if strict and run is None:
+                run = strict_checked(svc.run(ids, thinking, tools, max_new, req, cancel, force=force), strict)
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
@@ -6239,7 +6462,7 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
-                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
+                ids, thinking, tools, max_new, asm, validator, req, force, strict = self._responses_prepare(req, cancel)
             except ClientGone:
                 self._note(outcome="disconnected")
                 return
@@ -6256,7 +6479,8 @@ def make_handler(svc: Service):
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+                for kind, x in strict_checked(svc.run(ids, thinking, tools, max_new, req, cancel,
+                                                      **({"force": force} if force else {})), strict):
                     if kind == "ping":
                         yield None
                     elif kind == "event":
@@ -6331,7 +6555,8 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ResponsesError(str(e), "input") from None
             try:
-                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools))
+                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools),
+                                                     position=svc.format_instruction)
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
@@ -6339,6 +6564,13 @@ def make_handler(svc: Service):
                 print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
                       f"(this server cannot run them)", flush=True)
                 noted.update(skipped)
+            # C4: a forced tool_choice ("required", a named function), written as on chat and messages
+            force = forced_call(responses_api.tool_choice(req, names), tools) if tools else None
+            forcing = {"force": force} if force else {}       # (a request without one: prepare() as before)
+            try:
+                strict = strict_tool_validators(responses_api.strict_tools(req) if tools else None)
+            except ValueError as e:
+                raise ResponsesError(str(e), "tools") from None
             if req.get("max_output_tokens") is None and "max_tokens" in svc.shared:   # the shared Chat settings
                 req = {**req, "max_output_tokens": svc.shared["max_tokens"]}
             try:
@@ -6360,13 +6592,13 @@ def make_handler(svc: Service):
             try:
                 try:
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req,
-                                                          cancel=cancel)
+                                                          cancel=cancel, **forcing)
                 except ValueError:
                     if shown is tools:
                         raise
                     shown = tools                            # too long with the kept tools: the request as sent
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req,
-                                                          cancel=cancel)
+                                                          cancel=cancel, **forcing)
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
@@ -6379,16 +6611,107 @@ def make_handler(svc: Service):
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
-            return ids, thinking, tools, max_new, asm, validator, req
+            return ids, thinking, tools, max_new, asm, validator, req, force, strict
+
+        def _counted(self, api, count) -> int:
+            """R8: a token count, memoized by the request body and what else shapes the prompt (the shared Chat
+            settings, the config's effort and format placement).  A count renders and tokenizes the whole prompt on
+            the request's thread, where it competes with a running request's prepare() for the GIL; agents ask for
+            the same count again and again (Claude Code's context figure), so the answer is kept (a small LRU)."""
+            key = hashlib.sha256(json.dumps([api, svc.shared, svc.config_effort, svc.format_instruction,
+                                             svc.anthropic_think_unasked], sort_keys=True, default=str).encode()
+                                 + b"\0" + (self.raw_body or b"")).hexdigest()
+            with svc.count_cache_lock:
+                if key in svc.count_cache:
+                    svc.count_cache.move_to_end(key)
+                    return svc.count_cache[key]
+            n = count()
+            with svc.count_cache_lock:
+                svc.count_cache[key] = n
+                while len(svc.count_cache) > COUNT_CACHE_MAX:
+                    svc.count_cache.popitem(last=False)
+            return n
+
+        def prompt_text(self, messages, tools, kw) -> str:
+            """The prompt as text: what encode_prompt tokenizes (a literal tag in a message stays that text)."""
+            marked, marked_tools, changed = mark_think_literals(messages, tools, svc.literals)
+            prompt = svc.render_prompt(marked, marked_tools, kw)
+            return unmark_think_literals(prompt, svc.literals)[0] if changed else prompt
+
+        def _input_tokens(self, req):
+            """POST /v1/responses/input_tokens: OpenAI's token count of a Responses request - the prompt /v1/responses
+            would read (instructions, input, tools, text.format), rendered and tokenized; the model does not run."""
+            def count():
+                responses_api.check_request(req)
+                messages = responses_api.input_messages(req)
+                tools, _names, _skipped = responses_api.request_tools(req)
+                kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
+                try:
+                    messages, _ = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools),
+                                                 position=svc.format_instruction)
+                except ValueError as e:
+                    raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
+                return len(svc.encode_prompt(messages, tools, kw))
+            try:
+                n = self._counted("responses", count)
+            except ResponsesError as e:
+                return self._json(e.status, e.body())
+            except ValueError as e:
+                return self._json(400, responses_error_body(str(e)))
+            self._json(200, {"object": "response.input_tokens", "input_tokens": n})
+
+        def _text_tools(self, path, req):
+            """llama.cpp's /tokenize {"content", "parse_special" (true), "with_pieces" (false)} -> {"tokens"};
+            /detokenize {"tokens"} -> {"content"}; /apply-template {"messages", "tools", ...} (a chat request) ->
+            {"prompt"}: the prompt this server would read for it, as text.  No model is needed."""
+            tok = svc.tok
+            if path == "/tokenize":
+                content = req.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("content: the text to tokenize (a string)")
+                ids = tok.encode(content, parse_special=req.get("parse_special", True) is not False)
+                if not req.get("with_pieces"):
+                    return self._json(200, {"tokens": ids})
+                piece_bytes = getattr(tok, "token_bytes", None)
+                out = []
+                for i in ids:
+                    raw = piece_bytes(i) if piece_bytes else tok.decode([i]).encode("utf-8")
+                    try:
+                        piece = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        piece = list(raw)                    # a piece that is part of a character: its bytes
+                    out.append({"id": i, "piece": piece})
+                return self._json(200, {"tokens": out})
+            if path == "/detokenize":
+                ids, size = req.get("tokens"), len(getattr(tok, "tokens", ()) or ())
+                if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) and i >= 0
+                                                        and (not size or i < size) for i in ids):
+                    raise ValueError("tokens: a list of token ids" + (f" (0 to {size - 1})" if size else ""))
+                return self._json(200, {"content": tok.decode(ids)})
+            messages, tools, kw = openai_to_messages(req)
+            if tool_choice_of(req.get("tool_choice"))[0] == "none":
+                tools = None
+            messages, _ = prepare_format(req.get("response_format"), messages, with_tools=bool(tools),
+                                         position=svc.format_instruction)
+            self._json(200, {"prompt": self.prompt_text(messages, tools, kw)})
 
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
-            req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            stop_strings(req)                                 # the same 400 as the request itself would get
-            check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
-            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+            def count():
+                shared = svc.with_shared(req, "anthropic")
+                messages, tools, kw = anthropic_to_messages(shared, svc.anthropic_think_unasked)
+                stop_strings(shared)                          # the same 400 as the request itself would get
+                check_request_sampling(shared)                # ... likewise a sampling field of the wrong type
+                if tool_choice_of(shared.get("tool_choice"))[0] == "none":   # as _anthropic renders it
+                    tools = None
+                try:
+                    messages, _ = prepare_format(anthropic_format(shared), messages, with_tools=bool(tools),
+                                                 position=svc.format_instruction)
+                except ValueError as e:
+                    raise ValueError(str(e).replace("response_format", "output_config.format")) from None
+                return len(svc.encode_prompt(messages, tools, kw))
+            self._json(200, {"input_tokens": self._counted("anthropic", count)})
 
         def _anthropic(self, req):
             svc.load()
@@ -6398,6 +6721,13 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
+            # C4: output_config.format (JSON schema): prompt + validate, as response_format on chat
+            try:
+                messages, validator = prepare_format(anthropic_format(req), messages, with_tools=bool(tools),
+                                                     position=svc.format_instruction)
+            except ValueError as e:
+                raise ValueError(str(e).replace("response_format", "output_config.format")) from None
+            strict = strict_tool_validators(req.get("tools") if tools else None)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
@@ -6406,17 +6736,27 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            run = strict_checked(svc.run(ids, thinking, tools, max_new, req, cancel, force=force), strict) \
+                if strict else None
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force, run=run)
+            if validator is not None:
+                events = structured_anthropic(events, validator)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()
+            started, last = False, time.monotonic()
             try:
                 for item in events:
+                    if item is None and started and time.monotonic() - last >= ANTHROPIC_PING_S:
+                        # C8: while a long prompt is read, Anthropic's own keep-alive - a ping event (the official
+                        # API sends them; a client's idle watchdog may count events, not SSE comments)
+                        item = ("ping", {"type": "ping"})
                     if item is None:
                         self.wfile.write(b": keep-alive\n\n")
                     else:
                         name, e = item
+                        started, last = started or name == "message_start", time.monotonic()
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
@@ -6426,6 +6766,10 @@ def make_handler(svc: Service):
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except StructuredOutputError as e:               # C4: the JSON answer or a strict call failed its check
+                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -7276,7 +7620,13 @@ def main() -> int:
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
-    recovery = cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
+    position = str(cfg.get("format_instruction") or "end")   # C4: "start" = in the first system message, as 0.93
+    if position not in DIRECTIVE_POSITIONS:
+        raise SystemExit(f"[strata] config format_instruction must be \"end\" or \"start\", not {position!r}")
+    svc.format_instruction = position
+    cbi = cfg.get("codex_base_instructions_file")         # /v1/codex/models.json: Codex's base instructions
+    svc.codex_base_instructions_file = str(Path(cfg.get("cwd") or ".") / cbi) if isinstance(cbi, str) and cbi else None
+    recovery =cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
     svc.tool_call_recovery = recovery

@@ -501,6 +501,47 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
     return _stable_tool_order(tools, lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
 
 
+# C3: Anthropic server tools - tools the API provider runs itself (web search, web fetch, code execution, tool search).
+# They come with a "type" such as "web_search_20250305" and no input schema; offered to the model they were an empty
+# tool the client cannot run (Claude Code's WebSearch then failed), so they are left out with one line in the log.
+# SERVER_TOOLS is the hook for the ones this server can run: a type prefix (e.g. "web_search_") -> its runner.  Empty
+# for now; a type listed there is kept.
+ANTHROPIC_SERVER_TOOLS = ("web_search_", "web_fetch_", "code_execution_", "tool_search_tool_")
+SERVER_TOOLS: dict = {}
+_SERVER_TOOLS_NOTED: set = set()
+
+
+def server_tool_runner(kind):
+    """The runner registered in SERVER_TOOLS for a server tool type (by its prefix), or None."""
+    if not isinstance(kind, str):
+        return None
+    for prefix, runner in SERVER_TOOLS.items():
+        if kind == prefix or kind.startswith(prefix):
+            return runner
+    return None
+
+
+def is_anthropic_server_tool(tool) -> bool:
+    kind = tool.get("type") if isinstance(tool, dict) else None
+    return isinstance(kind, str) and kind.startswith(ANTHROPIC_SERVER_TOOLS)
+
+
+def drop_server_tools(tools: list[dict], where: str) -> list[dict]:
+    """`tools` without the Anthropic server tools this server cannot run (said once per type in the log)."""
+    keep, dropped = [], []
+    for t in tools:
+        if is_anthropic_server_tool(t) and server_tool_runner(t.get("type")) is None:
+            dropped.append(t.get("type"))
+        else:
+            keep.append(t)
+    new = sorted(set(dropped) - _SERVER_TOOLS_NOTED)
+    if new:
+        _SERVER_TOOLS_NOTED.update(new)
+        print(f"[strata] {where}: left out the server tools {', '.join(new)} (this server cannot run them)",
+              flush=True)
+    return keep
+
+
 def tool_arguments(raw) -> dict:
     """A call's arguments from a client's history -> the mapping the template renders (both APIs).  A JSON object
     (as text or already parsed) is used as it is; empty is {}; anything else (cut-off or malformed JSON, a list, a
@@ -639,7 +680,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 out["tool_calls"] = calls
             messages.append(out)
     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
-             for t in _tool_list(req.get("tools"), None)] or None
+             for t in drop_server_tools(_tool_list(req.get("tools"), None), "/v1/messages")] or None
     kwargs = {}
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
     # "output_config": {"effort": "low" | "medium" | "high"}
