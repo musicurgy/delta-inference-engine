@@ -199,11 +199,20 @@ compact your conversation early.
 - **Tool calls** (OpenAI `tools`, including a forced `tool_choice`: `"required"` or a named function) and **JSON
   output** (`response_format` `json_object` / `json_schema`) work through the OpenAI-compatible API. Requests sent at
   the same time are answered one after another.
-- **Pictures** are off by default. Double-click **`Enable Pictures.bat`** once, then start DeepSeek again: it downloads
-  DeepSeek's vision encoder (0.97 GB, checked) and PyTorch's CPU build (124 MB). Then attach, drop or paste a picture
-  in the chat page, or send one through the OpenAI (`image_url`) or Anthropic (`image`) API. The encoder runs on the
-  CPU and takes no VRAM. On an i5-13600K a 1024x701 photo takes ~8 s to read and its first answer ~19 s; writing speed
-  stays the same. To turn pictures off again, put `off` in `vision-choice.txt`.
+- **Pictures** are on. The first start downloads DeepSeek's vision encoder (0.97 GB, checked) and PyTorch (124 MB).
+  In the chat page, attach, drop or paste a picture, or use the screen and camera buttons; apps send one through the
+  OpenAI (`image_url`) or Anthropic (`image`) API. Pictures never take VRAM from the model's card:
+  - **One graphics card:** pictures are read on the CPU. A 1024x701 photo takes ~8-11 s on an i5-13600K; writing
+    speed stays the same.
+  - **Multi-GPU on** (the chat page's Setup card): pictures are read on the second card, in under half a second. This
+    needs PyTorch's CUDA build, a 2.0 GB download that the next start offers; the second card keeps ~2 GB less for
+    the model's experts.
+  - **Faster, smaller pictures:** an app can send `"detail": "low"` with a picture (OpenAI's `image_url`): at most 256
+    tokens instead of up to 1,024, read about twice as fast. Small text may become hard to read.
+  - **Turn them off:** double-click **`Disable Pictures.bat`** and start DeepSeek again. **`Enable Pictures.bat`** turns
+    them back on. To choose where pictures are read, put one word in `vision-choice.txt`: `on` (the default), `cpu`,
+    `gpu:1` (a card by its `nvidia-smi` number), `main` (the model's own card: fastest, but ~1.5 GB of its VRAM) or
+    `off`.
 
 ## Privacy
 
