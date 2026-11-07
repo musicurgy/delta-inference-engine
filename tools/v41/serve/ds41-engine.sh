@@ -32,6 +32,9 @@ export STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.6}"
 # >= 4096 new tokens, so the prompt batch is wider (16.8K fresh prompt: 263 -> 314 tok/s; re-load 2.6 s).  =0 = off.
 export STRATA_SERVE_LOOKUP="${STRATA_SERVE_LOOKUP:-14}"
 export STRATA_SERVE_DSPARK_EVICT="${STRATA_SERVE_DSPARK_EVICT:-4096}"
+# Bounded replay: layers 21-39 run on a prompt's last 128 tokens only (agent sessions -4.6 to -6.6 %, quality inside
+# run-to-run noise on short and long turns, rounds 350 / 352 / 353).  =0 = off.
+export STRATA_ENC_BOUND="${STRATA_ENC_BOUND:-128}"
 # Dense half (attention + shared expert + head, the file's Q8_0) re-quantized to Q6_K at load (ggml, file untouched):
 # 7.59 -> 5.86 GB, +1.6 GiB of VRAM expert slots -> decode +11 % after a 6.5K prompt, +15-35 % after 16.8K, edits
 # +9 %; prefill on long prompts -9 % (Q6_K MMQ).  Quality on the 100 API fixtures (S6, same bf16 path): KL vs FP8

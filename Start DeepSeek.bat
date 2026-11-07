@@ -123,6 +123,9 @@ set STRATA_ENGRAM_THREADS=64
 set STRATA_KGATHER=1
 set STRATA_PRESTAGE_GIB=0
 set STRATA_SERVE_DSPARK_EVICT=4096
+rem Bounded replay (0.94): only a prompt's last 128 tokens run layers 21-39, as DeepSeek's own design does.  Agent
+rem sessions -4.6 to -6.6 %%, quality inside run-to-run noise on short and long turns (rounds 350, 352, 353).  0 = off.
+if not defined STRATA_ENC_BOUND set STRATA_ENC_BOUND=128
 set STRATA_SERVE_REWIND1=1
 set STRATA_D3_PF_NOISYOR=1
 set STRATA_SERVE_CACHE_SLOTS=8
