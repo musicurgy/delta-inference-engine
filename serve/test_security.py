@@ -147,6 +147,21 @@ class OverHttp(unittest.TestCase):
             self.assertEqual(log.count("\n"), 1, path)                          # one log line each
             self.assertIn("evil.example.com", log)
 
+    def test_pages_cannot_be_framed_by_other_sites(self):
+        # 0.94 (clickjacking): the chat page and the API monitor say so in both headers
+        self.start(api_monitor=True)
+        for path in ("/", "/api-monitor"):
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+            try:
+                c.request("GET", path)
+                r = c.getresponse()
+                r.read()
+                self.assertEqual(r.status, 200, path)
+                self.assertEqual(r.getheader("Content-Security-Policy"), "frame-ancestors 'self'", path)
+                self.assertEqual(r.getheader("X-Frame-Options"), "SAMEORIGIN", path)
+            finally:
+                c.close()
+
     def test_local_names_and_ips_pass(self):
         self.start()
         for host in (f"127.0.0.1:{self.port}", f"localhost:{self.port}", f"[::1]:{self.port}",
