@@ -69,9 +69,27 @@ rem    so the output is the main model's own).  DeepSeek's MTP heads come from t
 rem    checked), are repacked into a sidecar GGUF, and its experts shrunk to IQ2_XXS (4.2 GB, ~5 min), which leaves more
 rem    VRAM for the main model.  The three shards are deleted afterwards.  Skipped where it is not used (under 14 GB of
 rem    VRAM first-start sets DS41_NO_DRAFTER).
+rem    0.94: the experts are shrunk with the drafter's own importance matrix (drafter-imatrix.bin, beside the engine's
+rem    v41_sidecar_requant.exe, or tools\v41\serve\ in a source checkout) into a NEW file, V41-1017-MTP-iq2xxs-imx.gguf
+rem    (+0.6% drafts accepted, +1.2% on prose thinking, same size).  An install from 0.93 has only the old uniform file,
+rem    V41-1017-MTP-iq2xxs.gguf: the new one is made once (the shards are downloaded again: the full-size drafter was
+rem    deleted after 0.93's requant), and the launcher uses whichever is there, the new one first.
 if defined DS41_NO_DRAFTER goto main
-if exist "%M%\V41-1017-MTP-iq2xxs.gguf" goto main
+if exist "%M%\V41-1017-MTP-iq2xxs-imx.gguf" goto drafter_done
+rem the engine build this CPU runs (cpu_level.py: this PC's own build, else the portable or an older-CPU one)
+set "REQ="
+for /f "usebackq delims=" %%b in (`""%PY%" tools\v41\serve\cpu_level.py --pick-build"`) do set "REQ=%%b\v41_sidecar_requant.exe"
+if not defined REQ set "REQ=build-ds41\v41_sidecar_requant.exe"
+set "IMX="
+for %%r in ("%REQ%") do if exist "%%~dprdrafter-imatrix.bin" set "IMX=%%~dprdrafter-imatrix.bin"
+if not defined IMX if exist "tools\v41\serve\drafter-imatrix.bin" set "IMX=tools\v41\serve\drafter-imatrix.bin"
+rem an engine build from before 0.94 does not know --imatrix (it answers "unknown arg"; a 0.94 one prints its usage):
+rem keep the uniform drafter then, instead of downloading the shards again on every run
+if defined IMX if exist "%REQ%" "%REQ%" --imatrix probe 2>&1 | findstr /c:"unknown arg" >nul && set "IMX="
+rem no importance matrix (an engine from before 0.94, no source copy) and the uniform drafter is there: keep it as it is
+if not defined IMX if exist "%M%\V41-1017-MTP-iq2xxs.gguf" goto main
 if exist "%M%\V41-1017-MTP.gguf" goto requant
+if exist "%M%\V41-1017-MTP-iq2xxs.gguf" echo Making the 0.94 drafter once: the drafter's 7.9 GB of official shards are downloaded again ^(the old drafter keeps working until it is done^).
 "%PY%" tools\v41\serve\hf_get.py %DS% model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors --local-dir "%D%" || exit /b 1
 "%PY%" tools\v41\hf_verify.py --repo %DS% --dir "%D%" model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors || exit /b 1
 set "V41_SRC=%D%"
@@ -82,20 +100,31 @@ move /y "%M%\V41-1017-MTP.gguf.part" "%M%\V41-1017-MTP.gguf" >nul || exit /b 1
 for %%s in (44 45 46) do del /q "%D%\model-000%%s-of-00048.safetensors" "%D%\model-000%%s-of-00048.safetensors.ok" 2>nul
 
 :requant
-rem the engine build this CPU runs (cpu_level.py: this PC's own build, else the portable or an older-CPU one)
-set "REQ="
-for /f "usebackq delims=" %%b in (`""%PY%" tools\v41\serve\cpu_level.py --pick-build"`) do set "REQ=%%b\v41_sidecar_requant.exe"
-if not defined REQ set "REQ=build-ds41\v41_sidecar_requant.exe"
 if not exist "%REQ%" (
   echo No v41_sidecar_requant.exe - build first ^(build-ds41.bat^), then run this again.
   exit /b 1
 )
 echo Shrinking the drafter's experts to IQ2_XXS: ~5 minutes on a fast CPU, ~20 on a 4-core one.  It prints little
 echo until each block of experts is done - it is not stuck.
+if not defined IMX goto requant_uniform
+"%REQ%" --in "%M%\V41-1017-MTP.gguf" --out "%M%\V41-1017-MTP-iq2xxs-imx.gguf.part" --type IQ2_XXS --imatrix "%IMX%" && goto requant_imx_ok
+rem an engine build from before 0.94 does not know --imatrix (the matrix came with a source checkout): the uniform drafter
+echo This engine build cannot use the drafter's importance matrix - making the uniform drafter instead.
+del /q "%M%\V41-1017-MTP-iq2xxs-imx.gguf.part" 2>nul
+if exist "%M%\V41-1017-MTP-iq2xxs.gguf" goto requant_cleanup
+:requant_uniform
 "%REQ%" --in "%M%\V41-1017-MTP.gguf" --out "%M%\V41-1017-MTP-iq2xxs.gguf.part" --type IQ2_XXS --uniform-imatrix || exit /b 1
 move /y "%M%\V41-1017-MTP-iq2xxs.gguf.part" "%M%\V41-1017-MTP-iq2xxs.gguf" >nul || exit /b 1
+goto requant_cleanup
+:requant_imx_ok
+move /y "%M%\V41-1017-MTP-iq2xxs-imx.gguf.part" "%M%\V41-1017-MTP-iq2xxs-imx.gguf" >nul || exit /b 1
+:requant_cleanup
 rem the full-size drafter (7.9 GB) is only the requant's input
 del /q "%M%\V41-1017-MTP.gguf" 2>nul
+
+:drafter_done
+rem the 0.93 drafter is not deleted here: it is the user's file.  Say once that it can go.
+if exist "%M%\V41-1017-MTP-iq2xxs-imx.gguf" if exist "%M%\V41-1017-MTP-iq2xxs.gguf" echo The older drafter V41-1017-MTP-iq2xxs.gguf ^(4.2 GB^) in the model folder is no longer used: you can delete it.
 
 :main
 rem 5. Pictures (on unless vision-choice.txt or DS41_VISION says off; "setup-ds41-models.bat pictures ..." sets it):

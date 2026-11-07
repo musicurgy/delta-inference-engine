@@ -53,8 +53,10 @@ rem SSD read-ahead: the experts the next layers will need that live only on the 
 rem while the current layers run (exact; +22% writing speed on a 64 GB PC).  The engine skips it when every expert
 rem is in RAM (128 GB and up), so it costs nothing there.
 set STRATA_D3_SPEC=8
-set "STRATA_SERVE_DSPARK=%DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf"
-if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" set STRATA_SERVE_DSPARK=
+rem the drafter: 0.94's (experts shrunk with the drafter's importance matrix: +0.6% drafts accepted) first, else 0.93's
+set STRATA_SERVE_DSPARK=
+if exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" set "STRATA_SERVE_DSPARK=%DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf"
+if exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs-imx.gguf" set "STRATA_SERVE_DSPARK=%DS41_MODELS%/V41-1017-MTP-iq2xxs-imx.gguf"
 rem the card's VRAM (README.md, "What you need"):
 rem   under 20 GB: at most 48 GiB of the RAM arena pinned - a 12 GB RTX 3060 ran out of memory at its first request with
 rem            ~91 GiB pinned; on a 16 GB budget the cap costs ~2% (31.1 vs 31.8 tok/s)
@@ -78,7 +80,7 @@ if defined SMALLCARD (
 )
 if defined VRAM_MIB if %VRAMN% LSS 11800 echo Under 12 GB of VRAM is untested: the model may not fit on this card.
 rem (no ( ... ) block around a line that prints a path: a ")" in the folder's name, "...-main (1)", would end the block)
-if not defined SMALLCARD if not defined STRATA_SERVE_DSPARK echo No DSpark drafter at %DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf - running without it, slower. See README.md.
+if not defined SMALLCARD if not defined STRATA_SERVE_DSPARK echo No DSpark drafter at %DS41_MODELS_W%\V41-1017-MTP-iq2xxs-imx.gguf ^(or the older V41-1017-MTP-iq2xxs.gguf^) - running without it, slower. See README.md.
 set STRATA_DSPARK_KEEP=tools/v41/serve/dspark_expert_counts.txt:64
 rem 0.94 (round 358): a card of 22 GB or more keeps all 128 of the drafter's experts per block (4.2 instead of 2.4 GB):
 rem +8 percent drafts accepted, about +3 percent writing speed, prompts no slower.  Smaller cards keep the 64 most-used.
