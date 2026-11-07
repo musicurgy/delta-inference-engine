@@ -101,8 +101,8 @@ let health = {model: "deepseek", images: false, max_context: 0};
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
-    $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
-                                          : "Attach a text file (or drop it here)";
+    $("attach-btn").title = health.images ? "Attach a document, a text file or a picture (or drop it here)"
+                                          : "Attach a document or a text file (or drop it here)";
     $("tab-btn-images").hidden = !health.image_generation;
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
@@ -697,7 +697,8 @@ function msgEl(m, i) {
     el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
       `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body thinking"></div></details>` +
       `<div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
-      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button></div>`;
+      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button>` +
+      `<button class="st-btn st-btn--icon" data-msg-speak aria-label="Read the answer aloud" title="Read aloud" hidden></button></div>`;
     updateAssistant(el, m, false);
   }
   return el;
@@ -776,6 +777,7 @@ function updateAssistant(el, m, streaming) {
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
+  if (window.media) media.speakButton(el.querySelector("[data-msg-speak]"), m, streaming);   // media.js: read aloud
 }
 function renderChat() {
   const chat = $("chat");
@@ -861,6 +863,7 @@ function setBusy(on) {
 async function send() {
   const text = $("input").value.trim();
   if ((!text && !attachments.length) || busy) return;
+  if (attachments.some((a) => a.pending)) { toast("info", "Still reading a document", "Send once its chip shows the token count."); return; }
   messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
                  files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
   attachments = [];
@@ -1006,6 +1009,7 @@ function addFiles(files) {
       r.readAsDataURL(f);
       continue;
     }
+    if (window.media && media.isDocument(f)) { media.addDocument(f); continue; }   // PDF / Office: read by the server
     if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${health.images ? " or pictures" : ""}.`); continue; }
     if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
     const r = new FileReader();
@@ -1020,6 +1024,7 @@ function addFiles(files) {
 }
 // a file's text in the message, fenced with more backticks than it contains itself
 function fileBlock(f) {
+  if (f.doc) return f.text;                       // a document: the server's text already has its header and footer
   const longest = Math.max(2, ...(f.text.match(/`+/g) || []).map((s) => s.length));
   const fence = "`".repeat(longest + 1);
   return `File: ${f.name}\n${fence}\n${f.text}\n${fence}`;
@@ -1037,6 +1042,7 @@ function renderAttachments() {
     c.className = "chip";
     c.innerHTML = icon(a.kind === "file" ? "attach" : "image", "st-icon st-icon--sm");
     c.append(a.name);
+    if (window.media) media.chipInfo(c, a);         // a document's token count, or "reading..."
     const x = document.createElement("button");
     x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", "Remove");
     x.innerHTML = icon("trash");
@@ -1044,6 +1050,7 @@ function renderAttachments() {
     c.appendChild(x);
     box.appendChild(c);
   });
+  if (window.media) media.attachmentSummary(box, attachments);   // tokens and the first-read time, before sending
 }
 $("attach-btn").onclick = () => $("file").click();
 // drop files on the chat or the message box

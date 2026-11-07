@@ -1,0 +1,11 @@
+/* serve/web/media.css - documents, dictation and read-aloud in the chat (media.js) */
+.media-chip-info { color: var(--st-ink-muted); font-size: var(--st-fs-xs); font-variant-numeric: tabular-nums; }
+.media-att-sum { align-self: center; color: var(--st-ink-muted); font-size: var(--st-fs-xs); font-variant-numeric: tabular-nums; padding: 0 4px; }
+.media-att-sum--over { color: var(--st-danger-text); }
+#mic-btn.media-rec { color: var(--st-danger); animation: media-pulse 1.2s ease-in-out infinite; }
+@keyframes media-pulse { 50% { opacity: .45; } }
+.media-spin { transform-origin: 12px 12px; animation: media-turn .9s linear infinite; }
+@keyframes media-turn { to { transform: rotate(360deg); } }
+#talk-btn[aria-pressed="true"] { color: var(--st-accent-text); background: var(--st-accent-tint); }
+#talk-btn[data-state="listening"] { color: var(--st-danger); }
+@media (prefers-reduced-motion: reduce) { #mic-btn.media-rec, .media-spin { animation: none; } }
