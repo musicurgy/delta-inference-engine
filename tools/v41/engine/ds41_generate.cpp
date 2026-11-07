@@ -1966,6 +1966,24 @@ int main(int argc, char ** argv) {
         const bool pass_bias = !(std::getenv("STRATA_SERVE_PASS_BIAS") && std::getenv("STRATA_SERVE_PASS_BIAS")[0] == '0');
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) resident_all(),
                     (long long) tier.arena_experts());
+#if defined(DS41_HAVE_DSPARK)
+        // STRATA_DSPARK_PREFETCH=0 turns it off: the drafter loads on the first request (open_cache), 2.6-4.9 s from a
+        // cold file against 1.1-1.4 s when the file is already in the OS cache (the in-run reloads of rounds 104 / 124).
+        // Read the file once here, after the arena is pinned, on a detached thread: it only warms the OS cache - no VRAM,
+        // no change to any output - so the user's first turn pays the upload alone (round 354: 2.8 s of turn 1).
+        if (dsp_path && !(std::getenv("STRATA_DSPARK_PREFETCH") && std::getenv("STRATA_DSPARK_PREFETCH")[0] == '0')) {
+            std::thread([p = std::string(dsp_path)]() {
+                const double t0 = now_ms();
+                FILE * f = std::fopen(p.c_str(), "rb");
+                if (!f) return;
+                std::vector<char> buf((size_t) 16 << 20);
+                size_t n = 0, got;
+                while ((got = std::fread(buf.data(), 1, buf.size(), f)) > 0) n += got;
+                std::fclose(f);
+                std::fprintf(stderr, "serve: DSpark file read ahead, %.2f GB in %.1f s\n", n / 1e9, (now_ms() - t0) / 1000.0);
+            }).detach();
+        }
+#endif
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
