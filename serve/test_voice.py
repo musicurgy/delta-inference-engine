@@ -70,8 +70,9 @@ class VoiceServerTest(unittest.TestCase):
     def test_ensure_counts_the_start_as_use(self):
         # the idle loop stops a child once time.time() - last_used >= idle_s; before this, last_used stayed 0
         # until the caller touched it AFTER ensure(), so a tick during a slow start killed the first request
-        import time
-        v = VoiceServer("asr", {"cmd": "/bin/sleep", "args": ["30"], "port": self.port, "start_timeout_s": 5})
+        import sys, time
+        v = VoiceServer("asr", {"cmd": sys.executable, "args": ["-c", "import time; time.sleep(30)"], "port": self.port,
+                                "start_timeout_s": 5})   # a portable sleeper (no /bin/sleep on Windows)
         self.addCleanup(v.stop)
         v.ensure()                               # the stub answers /health, so this returns at once
         self.assertTrue(v.alive())
