@@ -166,6 +166,29 @@ def t_parser():
                     if c.strip() != "Reading.":
                         bad.append((cut, step, c))
             check(f"{name}: cut anywhere, no markup in the content (thinking={thinking})", not bad, bad[:2])
+    # round 359's agent trace (UD-IQ2_XXS, greedy, bias 0.28): a stray word in the marker's place inside a calls block
+    o, cl = "<" + E.dsml_token, "</" + E.dsml_token
+    stray = (f'Checking.\n\n{o} calls>\n<name invoke name="read_file">\n{o} parameter name="path" string="true">a.txt{cl} parameter>\n'
+             f'{o} parameter name="lines" string="false">3{cl} parameter>\n{cl} invoke>\n{cl} calls>')
+    bad = []
+    for cut in range(len("Checking."), len(stray) + 1):
+        for step in (1, 7, 4096):
+            p, ev = F.OutputParser(thinking=False, tools=TOOLS), []
+            for i in range(0, cut, step):
+                ev += p.feed(stray[:cut][i:i + step])
+            ev += p.finish("stop" if cut == len(stray) else "length")
+            c = "".join(e.text for e in ev if e.kind == "content")
+            k = [(e.call.name, e.call.arguments) for e in ev if e.kind == "tool_call"]
+            if c.strip() != "Checking." or (cut == len(stray) and k != want):
+                bad.append((cut, step, c[-40:], k))
+    check("a stray word for the marker inside a calls block: one call, cut anywhere no markup in the content", not bad, bad[:2])
+    r, c, k = run_parser(f'{o} calls>\n{o} invoke name="read_file">\n{o} parameter name="path" string="true">'
+                         f'a <name invoke name="x"> b{cl} parameter>\n{cl} invoke>\n{cl} calls>', False, 3)
+    check("a stray-word tag inside a value is text", k == [("read_file", {"path": 'a <name invoke name="x"> b'})], (c, k))
+    for text in ('See <name invoke name="read_file"> here.', '<name invoke name="read_file">\n', "<b>bold</b> and <i>x</i>",
+                 "a <div class=\"x\"> b"):
+        r, c, k = run_parser(text, False, 3)
+        check(f"prose stays text (stray word): {text[:24]!r}", c == text and not k, (c, k))
     for text in ('Never run < invoke name="rm"> here.', 'Use `< invoke name="read_file">` for that.',
                  '```\n< invoke name="read_file">\n```\n', "if a < b and c > d: pass", "x <invoke> y", "1 < 2 < 3", "a <\\ b"):
         r, c, k = run_parser(text, False, 3)
