@@ -69,6 +69,8 @@ from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve.voice import VoiceServer, start_lazy_voice  # noqa: E402  local: the voice sidecar (ASR/TTS)
 from serve import images as images_api  # noqa: E402
+from serve import helpers as helper_calls  # noqa: E402
+from serve.helpers import MainFirst  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -3254,6 +3256,10 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        # 0.94 (serve/helpers.py): Claude Code's helper calls - the quota probe answered here, titles and command
+        # checks without thinking, prompt suggestions after the main conversation ("claude_code_helpers": false: off)
+        self.helper_calls = True
+        self.main_first = MainFirst()
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -4372,9 +4378,14 @@ class Service:
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
             self.status["queued"] += 1
+        # 0.94 (serve/helpers.py): a prompt suggestion yields the turn to the main conversation
+        order = self.main_first if self.helper_calls and not par else None
+        place = order.enter(cancel, bool((sampling or {}).get("strata_preemptible"))) if order else None
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
+            if place is not None:
+                turn.callback(order.leave, place)
             if not getattr(self.engine, "batch", 0):
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
@@ -4382,7 +4393,7 @@ class Service:
                 got = False
                 try:
                     while not got:
-                        got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                        got = order.acquire(place, self.fifo, QUEUE_BEAT_S) if order else                             self.fifo.acquire(timeout=QUEUE_BEAT_S)
                         if got:
                             turn.callback(self.fifo.release)
                         elif cancel.is_set():
@@ -4392,13 +4403,17 @@ class Service:
                 except BaseException:                    # the consumer closed us at a ping: no longer queued
                     with self.status_lock:
                         self.status["queued"] -= 1
+                    turn.close()
                     raise
                 if not got:                              # cancelled while queued
                     with self.status_lock:
                         self.status["queued"] -= 1
+                    turn.close()
                     yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
                                    "reasoning_tokens": 0, "reasoning_recoveries": 0}
                     return
+            if place is not None:
+                order.took(place)
             with turn:
                 try:
                     with self.status_lock:
@@ -4461,6 +4476,8 @@ class Service:
                                     yield "ping", None
                                     continue
                                 n += 1
+                                if place is not None and n == 1:
+                                    order.first_token(place)    # a suggestion told to stop ends here
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
@@ -6391,9 +6408,24 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
+            helper = helper_calls.classify(req) if svc.helper_calls else None
+            if helper is not None:
+                print(f"[strata] helper call: {helper}", flush=True)
+                if self.record is not None:
+                    self.record["helper"] = helper
+            if helper == helper_calls.QUOTA:              # answered here: the model is not needed (nor started)
+                events = helper_calls.quota_events(svc.model_for(req))
+                if not req.get("stream"):
+                    return self._json(200, anthropic_collect(events))
+                self._sse()
+                for name, e in events:
+                    self.wfile.write(f"event: {name}\n".encode() + b"data: " + json.dumps(e).encode() + b"\n\n")
+                self.wfile.flush()
+                return
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            req, kw = helper_calls.apply(helper, req, kw)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
@@ -7276,6 +7308,10 @@ def main() -> int:
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
+    hc = cfg.get("claude_code_helpers", True)           # 0.94: serve/helpers.py (on unless turned off)
+    if not isinstance(hc, bool):
+        raise SystemExit(f"[strata] config \"claude_code_helpers\" must be true or false, not {hc!r}")
+    svc.helper_calls = hc
     recovery = cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")

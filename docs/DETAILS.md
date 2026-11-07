@@ -841,6 +841,15 @@ print(r.choices[0].message.content)
   with no `"thinking"`, effort or budget thinks as the model's template does. `"anthropic_thinking": "on_request"` in
   `strata-<model>.json` renders such a request without thinking - Anthropic's own rule, and what Claude Code's short
   helper calls (a session title in a few dozen tokens) need; its real turns ask for thinking when it is on there.
+- **Claude Code's helper calls (0.94, on by default).** Besides the conversation, Claude Code sends small requests of
+  its own. The server recognises five of them by narrow, fixed signatures and logs `helper call: <kind>` for each:
+  the quota probe at start (answered at once, without the model), the session title and new-topic check, the Bash
+  command-prefix check before a Bash call and the file-path extraction after it (these four run without thinking:
+  they used to think for hundreds of tokens before writing a few words), and the prompt suggestion after each reply.
+  A suggestion keeps its thinking setting (changing it would make the whole conversation be read again), thinks at
+  most 256 tokens, and gives way to the main conversation: a main request that arrives goes first, and a running
+  suggestion is stopped (at its first token if it is still reading its prompt). Any other request is served as
+  before. `"claude_code_helpers": false` in `strata-<model>.json` turns all of this off.
 - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
