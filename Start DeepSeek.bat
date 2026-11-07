@@ -80,6 +80,9 @@ if defined VRAM_MIB if %VRAMN% LSS 11800 echo Under 12 GB of VRAM is untested: t
 rem (no ( ... ) block around a line that prints a path: a ")" in the folder's name, "...-main (1)", would end the block)
 if not defined SMALLCARD if not defined STRATA_SERVE_DSPARK echo No DSpark drafter at %DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf - running without it, slower. See README.md.
 set STRATA_DSPARK_KEEP=tools/v41/serve/dspark_expert_counts.txt:64
+rem 0.94 (round 358): a card of 22 GB or more keeps all 128 of the drafter's experts per block (4.2 instead of 2.4 GB):
+rem +8 percent drafts accepted, about +3 percent writing speed, prompts no slower.  Smaller cards keep the 64 most-used.
+if defined VRAM_MIB if %VRAMN% GEQ 22000 set STRATA_DSPARK_KEEP=
 set STRATA_DSPARK_DEPTH=5
 set STRATA_DSPARK_CONF=0.6
 rem sampled drafts (exact): at temperature > 0 the drafter samples its drafts from its own sharpened distribution
