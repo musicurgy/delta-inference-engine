@@ -83,7 +83,9 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
 ## What's new in 0.94
 
 - **Pictures are on by default.** Paste, drop, screenshot or photograph a picture into the chat. On one graphics card
-  pictures are read on the CPU, so the model keeps all its memory; with a second card they are read there.
+  pictures are read on the CPU, so the model keeps all its graphics memory; with a second card they are read there.
+  On PCs with less than about 170 GB of RAM the picture reader starts with the first picture (about 7 s once, longer
+  while the model is writing) and stops after 10 idle minutes.
 - **Documents:** attach PDF, Word, Excel, PowerPoint and text files to a chat.
 - **Voice (optional, `Enable Voice.bat`):** talk instead of typing, have answers read aloud, or use a hands-free talk mode.
 - **The page opens at once** and shows the model loading. **Pause** frees the memory and the graphics card (for a game)
@@ -91,9 +93,13 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
 - **Chat history** (search, pins, export), **use it from your phone** (a QR code), and downloads you can leave alone.
 - **Better with coding agents:** Claude Code's small background requests are fast and never hold up your real ones;
   pressing Esc no longer makes the next message re-read the whole conversation; chats with pictures no longer re-read
-  everything each turn.
-- **A bit faster:** agent sessions about 5-10%, the first message after a start about 30%, writing about 3%.
-- **Safer:** the server will not open itself to your network without an API key.
+  everything each turn; an agent that repeats the same tool call 4 times gets a short note to try something else.
+- **A bit faster:** writing (SPEED CARD: 0.94 writing tok/s on UD-IQ2_XXS at 192 GB, default sampling and greedy,
+  against 0.93's 40 / 41).  Prompts are read about 10% faster (about 5% of a whole agent session): the model's later
+  layers read only the last 128 tokens of a prompt, as DeepSeek's own design does.  New installs get a slightly better
+  drafter (+0.6% of its guesses accepted, greedy).
+- **Safer:** the server will not open itself to your network without an API key.  When it listens on your network, it
+  no longer reads pictures by a file path on this PC (`"image_local_files": true` allows it).
 
 What was new in 0.93 (a model picker and Setup tab, Unsloth's UD-IQ2_XXS as the default from 128 GB, 64 and 96 GB of
 RAM supported, the second-GPU helper, release zips built by GitHub) and the full list for every version are on the
@@ -101,17 +107,19 @@ RAM supported, the second-GPU helper, release zips built by GitHub) and the full
 
 ## Speed
 
-These numbers are from an RTX 3090 with an NVMe SSD, through the server:
+These numbers are from an RTX 3090 with an NVMe SSD, through the server.  In this README a speed was measured with
+0.93 (or earlier) unless it says 0.94.  0.94 changes the drafter and turns pictures on, so the 0.93 figures may
+differ slightly.
 
-| UD-IQ2_XXS (the default from 128 GB up) | 192 GB RAM | 128 GB RAM |
-|---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **41 tok/s** | **34 tok/s** |
-| Writing, the default sampling (temperature 1, top-p 0.95) | **40 tok/s** | - |
-| Reading a long prompt (~64K tokens) | **up to 740 tok/s** | **up to 600 tok/s** |
+| UD-IQ2_XXS (the default from 128 GB up) | 192 GB RAM, 0.94 | 192 GB RAM, 0.93 | 128 GB RAM, 0.93 |
+|---|---|---|---|
+| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **(SPEED CARD: 0.94 greedy tok/s)** | 41 tok/s | 34 tok/s |
+| Writing, the default sampling (temperature 1, top-p 0.95) | **(SPEED CARD: 0.94 default-sampling tok/s)** | 40 tok/s | - |
+| Reading a long prompt (~64K tokens) | **(SPEED CARD: 0.94 ~64K-token prompt read, tok/s; or drop this cell)** | up to 740 tok/s | up to 600 tok/s |
 
 The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  Greedy means temperature 0 in the
 request; the default sampling is what a client gets when it sends no temperature.  Sampling accepts fewer of the
-drafter's guesses, so it writes a little slower (ds4 Q2 40.7 -> 40.3 tok/s, UD-IQ2_XXS 41.1 -> 39.7).  0.93 narrowed
+drafter's guesses, so it writes a little slower (0.93: ds4 Q2 40.7 -> 40.3 tok/s, UD-IQ2_XXS 41.1 -> 39.7).  0.93 narrowed
 that gap from ~12%: the drafter's guesses are now
 sampled instead of taken as its top pick (`STRATA_DSPARK_SAMPLE` in `Start DeepSeek.bat`); the answers'
 distribution is unchanged.
@@ -126,11 +134,11 @@ long prompts, but the output is the same.
 
 ### 96 GB and 64 GB of RAM
 
-Measured on the same PC with the RAM a 96 or 64 GB PC would not have locked away (so neither Windows' file cache nor
-the pagefile could use it). Writing speed through the server; agreement = how often the next token matches DeepSeek's
-own model:
+Measured with 0.93 on the same PC with the RAM a 96 or 64 GB PC would not have locked away (so neither Windows' file
+cache nor the pagefile could use it). Writing speed through the server; agreement = how often the next token matches
+DeepSeek's own model:
 
-| Model | Agreement | 192 GB | 128 GB | **96 GB** | **64 GB** |
+| Model | Agreement | 192 GB, 0.93 | 128 GB, 0.93 | **96 GB, 0.93** | **64 GB, 0.93** |
 |---|---|---|---|---|---|
 | **Unsloth UD-IQ2_XXS** (the default from 128 GB up) | 91.1% | 41 | 34 | 29 | 21 |
 | ds4 Q2 | 89.9% | 41 | 36 | 27 | 20 |
@@ -139,16 +147,19 @@ own model:
 | Unsloth UD-IQ3_XXS | 92.7% | 28 | 23 | 18 | 12 |
 | GSQ IQ1_M (exact routing) | 85.5% | 42 | 37.5 | **34** | **28** |
 
+Every speed in this table was measured with 0.93; 0.94 changes the drafter and turns pictures on, so they may differ
+slightly.  The default model's 0.94 speeds at 192 GB are in the first table above.
+
 - **Under ~110 GB of RAM, use Unsloth's UD-IQ1_S**: about a point less agreement than ds4 Q2 and much faster.  New prompts
   take longer than on 192 GB: UD-IQ1_S reads a ~180-token prompt in ~4.3 s at 96 GB and ~8.3 s at 64 GB. The first start offers
   UD-IQ1_S instead of the default on such a PC; `Choose Model.bat` downloads it on an existing install.
-- ds4 Q2's 96 / 64 GB numbers are this release's launcher as it ships: the expert memory it gives such a PC
+- ds4 Q2's 96 / 64 GB numbers are 0.93's launcher as it shipped: the expert memory it gives such a PC
   (61 and 31 GiB; it was 51 and 21) and the SSD read-ahead (`STRATA_D3_SPEC=8`, which reads the experts the next
   layers will need while the current ones run - exact, +22% at 64 GB).  Before those two changes the same rows were
   22 and 16.  The SSD matters most here: everything was read from a PCIe 4.0 NVMe (~3.5 GiB/s).
 - Below 56 GB of RAM it will probably not start.
 
-On the 192 GB PC, a new 6k-token prompt takes about 15 s and a 25k-token prompt about 41 s (UD-IQ2_XXS). Writing is fastest on
+Measured with 0.93 on the 192 GB PC: a new 6k-token prompt takes about 15 s and a 25k-token prompt about 41 s (UD-IQ2_XXS). Writing is fastest on
 maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the prompt and the thinking, a client sees
 ~38 tok/s.
 
@@ -156,7 +167,9 @@ maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the pr
 
 The Setup tab in the chat page has a Multi-GPU switch: a helper on a second card of 8 GB or more holds experts the
 main card has no room for.  The main card needs 20 GB or more for this switch; the engine itself runs from 12 GB.  With
-an RTX 3060 12 GB in an x4 slot beside the 3090 it adds about 7% writing speed.  It does not split the model across cards, so it
+an RTX 3060 12 GB in an x4 slot beside the 3090 it adds about 7% writing speed (0.93).  The second card must be an RTX 20
+or newer; of two equal cards, the one on the wider PCIe link is used.  If the helper stops or cannot start, the model
+still starts and runs on one card (the server window says so).  It does not split the model across cards, so it
 does not scale: for two or more big cards use [Project Maya](https://github.com/mw00/project-maya), which runs
 DeepSeek in tensor parallel.
 
@@ -242,7 +255,11 @@ compact your conversation early.
   In the chat page, attach, drop or paste a picture, or use the screen and camera buttons; apps send one through the
   OpenAI (`image_url`) or Anthropic (`image`) API. Pictures never take VRAM from the model's card:
   - **One graphics card:** pictures are read on the CPU. A 1024x701 photo takes ~8-11 s on an i5-13600K; writing
-    speed stays the same.
+    speed was within run-to-run spread of text-only in our one measurement (0.92).  On PCs with less than about
+    170 GB of RAM the picture reader starts with the first picture (about 7 s once, longer while the model is
+    writing) and stops after 10 idle minutes, so its ~4 GB of RAM is free the rest of the time.
+  - **If the picture reader cannot start** (a broken PyTorch, say), the model still starts and answers text; a
+    picture then gets an error that says why.
   - **Multi-GPU on** (the chat page's Setup card): pictures are read on the second card, in under half a second. This
     needs PyTorch's CUDA build, a 2.0 GB download that the next start offers; the second card keeps ~2 GB less for
     the model's experts.
@@ -296,7 +313,11 @@ Every model is in the tables under "Other quants".
 
 - **Want the most agreement?** Set `DS41_ROUTE_BIAS=0` in `ds41-paths.bat` for exact routing: +1.4 points on UD-IQ2_XXS,
   about 25% slower.  `0.10` costs about 18% of writing speed at 192 GB of RAM on ds4 Q2 (34 instead of 41 tok/s) and
-  12-26% on 96 / 64 GB PCs; it has not been measured on UD-IQ2_XXS.  The startup line shows the bias in use.
+  12-26% on 96 / 64 GB PCs (0.93 measurements); it has not been measured on UD-IQ2_XXS.  The startup line shows the
+  bias in use.
+- **Exact routing for answers only (0.94, opt-in):** `set STRATA_ANSWER_ROUTE_BIAS=0` the same way keeps the shipped
+  bias while the model thinks and routes exactly in the answer after it (or give another bias, such as `0.10`).  It
+  is off by default: it cost 10-13% of writing speed in agent sessions, and its quality gain is not measured yet.
 - Route bias prefers experts that are already on the GPU, so fewer have to come from RAM: about 25% faster than exact
   routing at 192 GB, more on smaller PCs.  It follows the GPU's experts as they change during an answer
   (`STRATA_BIAS_REFRESH=1` in the launcher), which made it both faster and closer to DeepSeek's own model (at 0.3:
@@ -354,9 +375,10 @@ pick and saves your choice (`model-choice.txt`); the next start loads it.
   `exl3/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw` in `model-choice.txt`, or set `DS41_EXL3` to the folder.
 
 Measured here at the settings that ship (route bias 0.28), top-1 agreement with DeepSeek's own model (teacher-forced,
-every token), and writing speed through the server:
+every token), and writing speed through the server (measured with 0.93; 0.94 changes the drafter and turns pictures
+on, so the speeds may differ slightly):
 
-| | download | general | code + maths | agentic | writing, 192 / 128 / 96 / 64 GB RAM |
+| | download | general | code + maths | agentic | writing (0.93), 192 / 128 / 96 / 64 GB RAM |
 |---|---|---|---|---|---|
 | ds4 Q2 | 366 GB | 89.9% | 93.1% | 95.1% | 41 / 36 / 27 / 20 tok/s |
 | Unsloth UD-IQ1_S | 233 GB | 89.1% | 91.5% | 95.3% | 41 / 41 / 36 / 31 tok/s |
@@ -367,7 +389,7 @@ every token), and writing speed through the server:
 Two hosts of the full model agreed with each other on 98.3% and 98.9% of the same tokens.  Exact routing, what each file
 reaches with no route bias (slower):
 
-| | download | general | code + maths | writing, 192 / 128 GB RAM | notes |
+| | download | general | code + maths | writing (0.93), 192 / 128 GB RAM | notes |
 |---|---|---|---|---|---|
 | ds4 Q2 | 366 GB | 91.5% | 93.0% | 41 / 36 tok/s | DeepSeek's exact Engram tables |
 | GSQ IQ2_XS | 159 GB + the default | 90.0% | 92.9% | 38 / 26 tok/s | answered our task questions as well as the default |
@@ -398,8 +420,9 @@ bias are bit-identical to the default file's (GSQ-RCO only changes the routed ex
 
 - Windows 10 or 11, 64-bit.
 - An NVIDIA RTX card with 12 GB of VRAM or more, and driver 580 or newer.  24 GB (RTX 3090 / 4090, or a 32 GB 5090)
-  is the fast path; with less, fewer experts fit on the card.  Measured on the 3090 with the expert budget of a smaller
-  card (the default model, 192 GB RAM): 24 GB 41 tok/s, 23 GB (a monitor on the card) 39, 16 GB 31, 12 GB 17.  The
+  is the fast path; with less, fewer experts fit on the card.  Measured with 0.93 on the 3090 with the expert budget of
+  a smaller card (the default model, 192 GB RAM): 24 GB 41 tok/s, 23 GB (a monitor on the card) 39, 16 GB 31, 12 GB 17
+  (0.94 changes which drafter experts each card keeps, so these may differ slightly).  The
   launcher adapts by itself: under 20 GB it pins at most 48 GiB of RAM for the card; under 14 GB it pins none and runs
   without the drafter (a real 12 GB RTX 3060 ran out of memory with them and answers without).  Below 12 GB it
   probably does not fit (~9 GB is fixed: dense weights, KV, buffers).  RTX 20 (Titan RTX, Quadro RTX): the engine is
@@ -466,7 +489,9 @@ hand:
      [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (a few MB);
    - the speculative-decoding drafter (the biggest single speed-up), built from DeepSeek's own MTP heads in the same
      repository (three shards, 7.9 GB, removed afterwards) and shrunk to 4.2 GB. The drafter only proposes tokens;
-     the main model checks every one.
+     the main model checks every one.  From 0.94 it is shrunk with an importance matrix
+     (`tools\v41\serve\drafter-imatrix.bin`): the same size, +0.6% of its guesses accepted (greedy).  A 0.93
+     install keeps its drafter; `setup-ds41-models.bat drafter-imx` makes the new one (it downloads the 7.9 GB once).
 5. **Start** with `Start DeepSeek.bat`. Use the model name `/v1/models` shows (`deepseek-v4.1-flash-1017-ds4-q2` for
    ds4 Q2, `deepseek-v4.1-flash-1017-ud-iq2_xxs` for UD-IQ2_XXS; the server answers any name) with any
    OpenAI-compatible client.
