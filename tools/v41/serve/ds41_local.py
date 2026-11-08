@@ -48,7 +48,8 @@ import cpu_level  # noqa: E402  (same folder)
 ROOT =os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 ARENA_CAP_GIB = 140
 KEEP_ALL_RAM_GIB = 80                                             # below: the drafter keeps 64 experts per block
-DSPARK_KEEP_SMALL = "tools/v41/serve/dspark_expert_counts.txt:64"  # Start DeepSeek.bat's value for cards under 22 GB
+DSPARK_KEEP_SMALL = "tools/v41/serve/dspark_expert_counts_1017.txt:96,64,32"
+DSPARK_KEEP_BIG = "tools/v41/serve/dspark_expert_counts_1017.txt:112,80,48"   # the launcher's value on 22 GB+  # Start DeepSeek.bat's value for cards under 22 GB
 # engine settings for this model, carried in the config's "env" (the server starts the engine with them - this script's
 # own environment does not reach it)
 ENGINE_ENV = {}
@@ -96,7 +97,7 @@ def total_ram_gib():
 def drafter_keep(ram_gib, env):
     """STRATA_DSPARK_KEEP for the engine, or None (as the launcher left it): the 64 most-used experts per block below
     KEEP_ALL_RAM_GIB when the launcher asked for all 128 (the variable unset or empty) and the drafter runs."""
-    if ram_gib < KEEP_ALL_RAM_GIB and env.get("STRATA_SERVE_DSPARK") and not env.get("STRATA_DSPARK_KEEP", "").strip():
+    if ram_gib < KEEP_ALL_RAM_GIB and env.get("STRATA_SERVE_DSPARK") and env.get("STRATA_DSPARK_KEEP", "").strip() in ("", DSPARK_KEEP_BIG):
         return DSPARK_KEEP_SMALL
     return None
 
