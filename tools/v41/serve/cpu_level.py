@@ -13,8 +13,8 @@ AVX but not AVX2 (build-ds41-compat-avx\: Sandy / Ivy Bridge) and one for the ol
 CPU with SSE4.2: Intel 2008+; slower).  Each records the level it needs
 in cpu-level.txt; a build without one is taken as this PC's own (older builds) or as its folder's floor.  An AVX2 build
 on a CPU without AVX2 stops at its first AVX2 instruction (Windows: "illegal instruction", exit code 0xC000001D).
-A build from before 2026-10-27 cannot read the Engram tables from the model GGUF (the current setup's layout): it is
-skipped as out of date, so the first start offers the new one.  So is a build from before 0.92 where the project or
+A build older than these scripts (one without ENGINE_MARK, the usual case after an update) is skipped as out of
+date, so the first start offers the new one.  So is a build from before 0.92 where the project or
 model folder's path has a letter outside A-Z (a user name with an accent, Cyrillic, Chinese ...): it opens none of its
 files there."""
 import ctypes
@@ -138,9 +138,13 @@ def pick_build():
         if RANK[cpu] >= RANK[n]:
             return folder, None
     if not found and old:
-        why = ("it cannot open files in a folder whose path has letters outside A-Z, like this one's" if not plain_paths()
-               else "it cannot read the\nEngram tables from the model file")
-        return None, (f"the engine in {', '.join(old)} is from an older version of this project ({why}): it needs the new one.")
+        if not plain_paths():
+            return None, (f"the engine in {', '.join(old)} is from an older version of this project (it cannot open files "
+                          "in a folder whose path has letters outside A-Z, like this one's): it needs the new one.")
+        # 0.94 (S9): the usual case is an update (the scripts are new, the engine is the old version's); the reason given
+        # before ("it cannot read the Engram tables") was wrong for every engine since 2026-10-27
+        return None, (f"the engine in {', '.join(old)} is older than this version of the scripts (an update):\n"
+                      "the new engine replaces it.")
     if not found:
         return None, "No engine in this folder yet (normal on the first start):"
     return None, (f"this CPU supports {cpu.upper()} only, and the engine builds here need more: {', '.join(found)}.\n"

@@ -30,6 +30,8 @@ rem all of it in one block: cmd reads a .bat file while it runs it, and the git 
     echo This copy was not made with git, so it cannot update itself.  Download the newest ZIP:
     echo   https://github.com/musicurgy/delta-inference-engine/archive/refs/heads/main.zip
     echo and unpack it over this folder ^(models\ stays as it is^), then double-click "Start DeepSeek.bat".
+    echo Keep your ds41-paths.bat ^(it holds your model folder^): copy it aside before unpacking and back after,
+    echo or re-enter your model folder when the first start asks where the model files go.
   )
   pause
   exit /b 0

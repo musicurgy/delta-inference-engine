@@ -319,6 +319,20 @@ class Requirements(unittest.TestCase):
         self.assertEqual(setup.req_name('numpy==2.5.3; python_version >= "3.12"'), "numpy")
         self.assertEqual(setup.req_name("charset_normalizer==3"), "charset-normalizer")
 
+    def test_no_pin_below_its_advisory_fix(self):
+        # 0.94: certifi before 2026.10.18 trusts the emSign roots whose intermediate CA keys were compromised
+        # (GHSA-6q48-6c7w-9gw2); Pillow before 13.0.0 carries 12 advisories (GHSA-78g4-xqwv-q3g8...) - 13.0.0 needs
+        # Python 3.11, so the 3.10 line keeps 12.3.0 (the server opens pictures in five formats only)
+        fixed = {"certifi": "2026.10.18", "pillow": "13.0.0"}
+        seen = set()
+        for x in setup.requirement_lines():
+            name = setup.req_name(x)
+            if name in fixed and 'python_version < "3.11"' not in x:
+                seen.add(name)
+                pin = tuple(int(n) for n in x.split(";")[0].split("==")[1].split("."))
+                self.assertGreaterEqual(pin, tuple(int(n) for n in fixed[name].split(".")), x)
+        self.assertEqual(seen, set(fixed))
+
     def pip(self, stamp, packages, installed=()):
         ran = []
         with tempfile.TemporaryDirectory() as d:

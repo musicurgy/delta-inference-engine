@@ -213,11 +213,33 @@ def vision_config(kv):
     return cfg, int(kv.get(p + "image.token_id", 0))
 
 
+# 0.94: the formats DeepSeek's load_image may open (serve/server.py PICTURE_FORMATS: the server passes JPEG, PNG, BMP
+# and GIF through and turns the rest into PNG).  Its Image.open would otherwise try every format Pillow knows, so a
+# picture whose first bytes say BMP or JPEG but whose header does not parse fell through to the other decoders (JPEG
+# 2000, Spider, TGA...), several of which carry published advisories.
+PICTURE_FORMATS = ("JPEG", "PNG", "GIF", "BMP", "WEBP")
+
+
+class _PictureFormatsOnly:
+    """PIL.Image as DeepSeek's image_processor sees it: open() reads PICTURE_FORMATS only; the rest is PIL.Image's."""
+
+    def __init__(self, image):
+        self._image = image
+
+    def __getattr__(self, name):
+        return getattr(self._image, name)
+
+    def open(self, fp, mode="r", formats=None):
+        return self._image.open(fp, mode, formats=PICTURE_FORMATS)
+
+
 def _load_reference(reference_dir, device="cpu"):
     if os.path.abspath(reference_dir) not in map(os.path.abspath, sys.path):
         sys.path.insert(0, os.path.abspath(reference_dir))
     import image_processor
     import vision
+    if not isinstance(image_processor.Image, _PictureFormatsOnly):   # wrapped: DeepSeek's file stays unchanged
+        image_processor.Image = _PictureFormatsOnly(image_processor.Image)
     if device != "cpu" and not getattr(vision, "_ds41_device", None):
         # the reference ViT builds its 2-D RoPE tables with torch.arange on the CPU; on a GPU they must live beside the
         # weights (DeepSeek's file is left unchanged: its module-level helper is wrapped, keeping its lru_cache)

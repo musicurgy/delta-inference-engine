@@ -31,6 +31,16 @@ rem "setup-ds41-models.bat voice cpu|gpu": dictation and read-aloud on (step 6)
 if /i "%~1"=="voice" (
   if /i "%~2"=="gpu" (>"%~dp0voice-choice.txt" echo gpu) else (>"%~dp0voice-choice.txt" echo cpu)
 )
+rem the drafter: not used under 14 GB of VRAM (Start DeepSeek.bat runs without it there), so not set up there either
+rem (step 4) nor counted by the space check.  first-start.bat sets DS41_NO_DRAFTER the same way; Enable Voice.bat,
+rem Enable Pictures.bat and a run by hand come here without it.  A DS41_NO_DRAFTER=1 already set is kept.
+set "VRAM_MIB="
+for /f "tokens=1" %%m in ('nvidia-smi --query-gpu^=memory.total --format^=csv^,noheader^,nounits -i %DS41_GPU% 2^>nul') do if not defined VRAM_MIB set "VRAM_MIB=%%m"
+rem numeric copies that always exist (an empty %X% in an if-comparison aborts the script); a VRAM answer that is not
+rem a number ("[N/A]", "No devices were found") counts as unknown, not as 0 MiB
+echo %VRAM_MIB%| findstr /r "^[0-9][0-9]*$" >nul || set "VRAM_MIB="
+set /a VRAMN=VRAM_MIB+0 2>nul
+if defined VRAM_MIB if %VRAMN% LSS 14000 set "DS41_NO_DRAFTER=1"
 rem stop before a download fills the drive (the downloader only warns): what is still to do vs the free space
 "%PY%" tools\v41\setup_space.py "%M%" || exit /b 1
 set "DS=deepseek-ai/DeepSeek-V4.1-Flash-1017"
@@ -71,7 +81,7 @@ rem 4. The DSpark drafter (speculative decoding: the biggest single speed-up; th
 rem    so the output is the main model's own).  DeepSeek's MTP heads come from three small official shards (7.9 GB,
 rem    checked), are repacked into a sidecar GGUF, and its experts shrunk to IQ2_XXS (4.2 GB, ~5 min), which leaves more
 rem    VRAM for the main model.  The three shards are deleted afterwards.  Skipped where it is not used (under 14 GB of
-rem    VRAM first-start sets DS41_NO_DRAFTER).
+rem    VRAM DS41_NO_DRAFTER is set above).
 rem    0.94: the experts are shrunk with the drafter's own importance matrix (drafter-imatrix.bin, beside the engine's
 rem    v41_sidecar_requant.exe, or tools\v41\serve\ in a source checkout) into a NEW file, V41-1017-MTP-iq2xxs-imx.gguf
 rem    (+0.6% drafts accepted, +1.2% on prose thinking, same size).  An install from 0.93 has only the old uniform file,

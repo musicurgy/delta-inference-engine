@@ -72,7 +72,8 @@ Everything else in this folder is the engine's source, upstream's files and tool
 **Updating:** a git clone: `git pull` in this folder (or double-click `UPDATE.bat`, which does that). A ZIP copy:
 download the new ZIP and unpack it over this folder, or next to it with `models\` moved across. Then double-click
 `Start DeepSeek.bat`: if the new version needs a new engine or new Python packages, it gets them first. Your model
-files stay as they are.
+files stay as they are. With a ZIP, keep your `ds41-paths.bat` (it holds your model folder): copy it aside before
+unpacking and back after, or re-enter your model folder when the first start asks where the model files go.
 
 **Something wrong?** Double-click **`Start DeepSeek (debug).bat`** instead. It checks the PC and the install (a
 PASS / FAIL list), starts DeepSeek in a second window with everything it prints saved, and when you close that window
