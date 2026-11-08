@@ -97,7 +97,7 @@ def models_dir():
 def current():
     """the path model-choice.txt names (relative to the model folder, '/' separators), or None"""
     try:
-        with open(CHOICE, encoding="utf-8") as f:
+        with open(CHOICE, encoding="utf-8-sig") as f:
             name = f.readline().strip().strip('"')
     except OSError:
         return None
