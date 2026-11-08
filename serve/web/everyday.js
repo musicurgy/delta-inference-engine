@@ -286,9 +286,10 @@ const APPS = {
            text: (b, k, m) => `set ANTHROPIC_BASE_URL=${b}\nset ANTHROPIC_AUTH_TOKEN=${k}\nset ANTHROPIC_MODEL=${m}\nset CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000\nclaude`,
            note: "Without CLAUDE_CODE_MAX_CONTEXT_TOKENS, Claude Code assumes 200K tokens and compacts there."},
   opencode: {name: "OpenCode", how: "In opencode.jsonc (in your project, or ~/.config/opencode/):",
-             text: (b, k, m) => JSON.stringify({$schema: "https://opencode.ai/config.json", providers: {delta: {
-               name: "Delta (local)", package: "@opencode/ai/providers/openai-compatible",
-               settings: {baseURL: `${b}/v1`, ...(k !== "local" ? {apiKey: k} : {})},
+             // OpenCode 1.19's runtime reads only the "provider" (V1) form; "providers" is dropped (round 373, 11-08)
+             text: (b, k, m) => JSON.stringify({$schema: "https://opencode.ai/config.json", provider: {delta: {
+               npm: "@ai-sdk/openai-compatible", name: "Delta (local)",
+               options: {baseURL: `${b}/v1`, apiKey: k},
                models: {[m]: {name: "DeepSeek V4.1 Flash", limit: {context: 1000000, output: 32768}}}}}}, null, 2)},
   openai: {name: "Cline, Aider, Continue, Open WebUI, other OpenAI apps", how: "In the app's provider settings (OpenAI-compatible):",
            text: (b, k, m) => `Base URL:        ${b}/v1\nAPI key:         ${k}\nModel:           ${m}\nContext window:  1000000`},
