@@ -567,7 +567,8 @@ def part_text(part: dict) -> str:
                 return _note(name, str(e))
             doc = extract(data, name if "." in name else name + _ext_for(src.get("media_type")),
                           src.get("media_type") or mt)
-            doc.name = name
+            # a copy: extract() returns the cached Doc, shared by every request (and thread) with the same file
+            doc = Doc(name, doc.kind, doc.text, doc.pages, doc.note, doc.error)
         elif st == "text":
             doc = Doc(name, "text", str(src.get("data") or ""))
         elif st == "content":

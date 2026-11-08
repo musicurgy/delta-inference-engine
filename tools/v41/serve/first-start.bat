@@ -181,9 +181,10 @@ if defined VRAM_MIB if %VRAMN% LSS 14000 set "DS41_NO_DRAFTER=1"
 set "NEEDDRAFT="
 rem setup_space.py --drafter-plan (setup-ds41-models.bat's own rules): make = none yet; upgrade = 0.93's uniform drafter
 rem is there and 0.94's is made now (from the full-size drafter still here, or asked for: DS41_DRAFTER_IMX=1); opt-in /
-rem none = nothing to do here (the launcher says how to get 0.94's drafter)
+rem none = nothing to do here (the launcher says how to get 0.94's drafter).  The command is wrapped in one more pair of
+rem quotes: with more than two quotes cmd /c drops the first and the last, and the command could not run at all
 set "DPLAN=none"
-if not defined DS41_NO_DRAFTER for /f "usebackq" %%p in (`".venv\Scripts\python.exe" tools\v41\setup_space.py --drafter-plan "%M%"`) do set "DPLAN=%%p"
+if not defined DS41_NO_DRAFTER for /f "usebackq" %%p in (`"".venv\Scripts\python.exe" tools\v41\setup_space.py --drafter-plan "%M%""`) do set "DPLAN=%%p"
 if /i "%DPLAN%"=="make" set "NEEDDRAFT=1"
 if /i "%DPLAN%"=="make" echo   missing: the speculative-decoding drafter ^(downloads 7.9 GB, keeps 4.2 GB^)
 if /i "%DPLAN%"=="upgrade" set "NEEDDRAFT=1"

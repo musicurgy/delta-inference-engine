@@ -284,10 +284,12 @@ class Ds41Vision(_Vision):
         # minimum picture area (295,936 px = 184 tokens for a square)
         top = int(cfg.get("max_tokens") or 1024)
         self.DETAIL_TOKENS = {"low": DETAIL_LOW_TOKENS} if DETAIL_LOW_TOKENS < top else {}
+        self.start_failed = None     # why the resident encoder could not start: text goes on (_vision_down_ds41)
         if not lazy and not self.lazy_vision and not self.elastic:
             try:
                 self._start()
             except RuntimeError as e:   # a broken PyTorch (or file) must not stop the model: text works, pictures say why
+                self.start_failed = str(e)
                 print(f"[strata] pictures: the image encoder did not start ({e}); the model starts without pictures - "
                       f"each picture tries it again", flush=True)
 
@@ -299,7 +301,9 @@ class Ds41Vision(_Vision):
             try:
                 self.restart()
             except RuntimeError as e:
+                self.start_failed = str(e)
                 raise ValueError(f"pictures are not working: the image encoder did not start ({e})") from None
+            self.start_failed = None
         try:
             return super().encode(source, keep, detail)
         except RuntimeError as e:   # a lazy encoder starts inside the base encode(): its failure is the picture's 400
@@ -307,6 +311,32 @@ class Ds41Vision(_Vision):
 
 
 S.Vision = Ds41Vision
+_vision_down, _ensure_loaded = S.Service._vision_down, S.Service.ensure_loaded
+VISION_START_FAILED = "the vision encoder failed to start"     # Service.ensure_loaded's EngineDied for it
+
+
+def _vision_down_ds41(self):
+    """The server restarts a resident encoder that is down before every engine load and request, and its failure was
+    an EngineDied: every text request answered 503, and with --background-load (the launcher) the start itself ended
+    with code 1.  An encoder that could not start does not hold the model back: each picture tries it again."""
+    return _vision_down(self) and not getattr(self.vision, "start_failed", None)
+
+
+def _ensure_loaded_ds41(self):
+    try:
+        return _ensure_loaded(self)
+    except S.EngineDied as e:
+        v = self.vision
+        if v is None or not str(e).startswith(VISION_START_FAILED) or getattr(v, "start_failed", None):
+            raise
+        v.start_failed = str(e)
+        print(f"[strata] pictures: {e}; the model goes on without pictures - each picture tries the encoder again",
+              flush=True)
+    return _ensure_loaded(self)
+
+
+S.Service._vision_down = _vision_down_ds41
+S.Service.ensure_loaded = _ensure_loaded_ds41
 _start_lazy_vision = S.Service.start_lazy_vision
 
 

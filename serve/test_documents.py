@@ -339,6 +339,16 @@ class ApiParts(Quiet):
         b = openai_to_messages({"messages": [{"role": "user", "content": [part]}]})
         self.assertEqual(a, b)
 
+    def test_a_title_without_extension_does_not_rename_the_cached_document(self):
+        # an Anthropic block titled "sheet" is read as sheet.csv; renaming it to "sheet" changed the cached Doc that
+        # every later request for sheet.csv (any API, any thread) gets
+        from serve import documents
+        data = b"word,bird\npelican,yes\n"
+        part = {"type": "document", "title": "sheet", "source": {"type": "base64", "media_type": "text/csv",
+                                                                  "data": b64(data)}}
+        self.assertIn('<document name="sheet" type="CSV">', documents.part_text(part))
+        self.assertEqual(documents.extract(data, "sheet.csv", "text/csv").name, "sheet.csv")
+
     def test_bad_base64_is_a_note(self):
         messages, _, _ = openai_to_messages({"messages": [{"role": "user", "content": [
             {"type": "file", "file": {"filename": "x.pdf", "file_data": "data:application/pdf;base64,%%%"}}]}]})
