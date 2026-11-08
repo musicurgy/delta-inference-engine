@@ -105,7 +105,7 @@ rem no importance matrix (an engine from before 0.94, no source copy) and the un
 if not defined IMX if exist "%M%\V41-1017-MTP-iq2xxs.gguf" goto main
 if exist "%M%\V41-1017-MTP.gguf" goto requant
 rem 0.93's drafter is there, the full-size one is not: no download unless asked (drafter-imx / DS41_DRAFTER_IMX=1)
-if exist "%M%\V41-1017-MTP-iq2xxs.gguf" if not "%DS41_DRAFTER_IMX%"=="1" echo Drafter: 0.93's.  A slightly better one ^(+0.6%% drafts accepted^) is optional: setup-ds41-models.bat drafter-imx ^(downloads 7.9 GB once^).
+if exist "%M%\V41-1017-MTP-iq2xxs.gguf" if not "%DS41_DRAFTER_IMX%"=="1" echo Drafter: 0.93's.  A slightly better one is optional: setup-ds41-models.bat drafter-imx ^(downloads 7.9 GB once^).
 if exist "%M%\V41-1017-MTP-iq2xxs.gguf" if not "%DS41_DRAFTER_IMX%"=="1" goto main
 if exist "%M%\V41-1017-MTP-iq2xxs.gguf" echo Making the 0.94 drafter: the drafter's 7.9 GB of official shards are downloaded again ^(the old drafter keeps working until it is done^).
 "%PY%" tools\v41\serve\hf_get.py %DS% model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors --local-dir "%D%" || exit /b 1

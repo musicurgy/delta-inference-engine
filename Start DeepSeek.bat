@@ -58,7 +58,9 @@ set STRATA_SERVE_DSPARK=
 if exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" set "STRATA_SERVE_DSPARK=%DS41_MODELS%/V41-1017-MTP-iq2xxs.gguf"
 if exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs-imx.gguf" set "STRATA_SERVE_DSPARK=%DS41_MODELS%/V41-1017-MTP-iq2xxs-imx.gguf"
 rem 0.93's drafter in use and 0.94's could be made: say how (it is a 7.9 GB download for ~0.3% speed, so only on request)
-if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs-imx.gguf" if exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" if exist "%~dp0tools\v41\serve\drafter-imatrix.bin" echo Drafter: 0.93's.  A slightly better one ^(+0.6%% drafts accepted^) is optional: setup-ds41-models.bat drafter-imx ^(downloads 7.9 GB once^).
+set "IMXNOTE=downloads 7.9 GB once"
+if exist "%DS41_MODELS_W%\V41-1017-MTP.gguf" set "IMXNOTE=about 5 minutes, no download"
+if not exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs-imx.gguf" if exist "%DS41_MODELS_W%\V41-1017-MTP-iq2xxs.gguf" if exist "%~dp0tools\v41\serve\drafter-imatrix.bin" echo Drafter: 0.93's.  A slightly better one is optional: setup-ds41-models.bat drafter-imx ^(%IMXNOTE%^).
 rem the card's VRAM (README.md, "What you need"):
 rem   under 20 GB: at most 48 GiB of the RAM arena pinned - a 12 GB RTX 3060 ran out of memory at its first request with
 rem            ~91 GiB pinned; on a 16 GB budget the cap costs ~2% (31.1 vs 31.8 tok/s)
