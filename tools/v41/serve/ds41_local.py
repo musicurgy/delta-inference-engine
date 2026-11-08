@@ -59,7 +59,7 @@ BIG_ARENA_CAP_GIB, BIG_RAM_RESERVE_GIB = 158, 20.0   # files with bigger experts
 def page_settings():
     """delta-settings.json: the chat page's Setup card (setup_panel.py)"""
     try:
-        with open(os.path.join(ROOT, "delta-settings.json"), encoding="utf-8") as f:
+        with open(os.path.join(ROOT, "delta-settings.json"), encoding="utf-8-sig") as f:
             s = json.load(f)
         return s if isinstance(s, dict) else {}
     except (OSError, ValueError):
@@ -143,7 +143,7 @@ def expand(cfg):
     # path.  DS41_GGUF in the environment wins over it.
     if "DS41_GGUF" not in os.environ:
         try:
-            with open(os.path.join(ROOT, "model-choice.txt"), encoding="utf-8") as f:
+            with open(os.path.join(ROOT, "model-choice.txt"), encoding="utf-8-sig") as f:
                 pick = f.readline().strip().strip('"')
         except OSError:
             pick = ""
@@ -310,7 +310,7 @@ def expand(cfg):
         if not g.isdigit():
             sys.exit(f"ds41_local: DS41_GPU={g!r} is not a GPU number (nvidia-smi's index; ds41-paths.bat)")
         out["gpu"] = int(g)
-    # DS41_VRAM_MARGIN=GiB (Start DeepSeek.bat sets it for small cards): the VRAM kept free beside the expert cache
+    # DS41_VRAM_MARGIN=GiB (the user's, or set above for files with bigger experts): the VRAM kept free beside the expert cache
     margin = env_gib("DS41_VRAM_MARGIN", None)
     if margin is not None:
         if "--vram-margin" in a[:-1]:
@@ -393,7 +393,7 @@ def vision_choice():
     v = os.environ.get("DS41_VISION", "").strip().lower()
     if not v:
         try:
-            with open(os.path.join(ROOT, "vision-choice.txt"), encoding="utf-8") as f:
+            with open(os.path.join(ROOT, "vision-choice.txt"), encoding="utf-8-sig") as f:
                 v = f.readline().strip().lower()
         except OSError:
             v = ""
@@ -532,7 +532,7 @@ def voice_choice():
     v = os.environ.get("DS41_VOICE", "").strip().lower()
     if not v:
         try:
-            with open(os.path.join(ROOT, "voice-choice.txt"), encoding="utf-8") as f:
+            with open(os.path.join(ROOT, "voice-choice.txt"), encoding="utf-8-sig") as f:
                 v = f.readline().strip().lower()
         except OSError:
             v = ""
@@ -628,7 +628,7 @@ def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
     try:
-        with open(sys.argv[1], encoding="utf-8") as f:
+        with open(sys.argv[1], encoding="utf-8-sig") as f:
             raw = json.load(f)
     except (OSError, ValueError) as e:
         sys.exit(f"ds41_local: cannot read {sys.argv[1]}: {e}")

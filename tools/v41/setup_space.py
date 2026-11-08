@@ -93,7 +93,7 @@ def main():
     # nor does a model Choose Model.bat picked that is there (model-choice.txt: an Unsloth GGUF carries its own Engram)
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     try:
-        with open(os.path.join(root, "model-choice.txt"), encoding="utf-8") as f:
+        with open(os.path.join(root, "model-choice.txt"), encoding="utf-8-sig") as f:
             pick = f.readline().strip().strip('"')
     except OSError:
         pick = ""
@@ -107,7 +107,7 @@ def main():
             steps.append(("drafter (while it is built)", MTP_SHARDS + SIDECAR, DRAFTER))
     # pictures (on unless vision-choice.txt / DS41_VISION says off), before the main model as well
     try:
-        with open(os.path.join(root, "vision-choice.txt"), encoding="utf-8") as f:
+        with open(os.path.join(root, "vision-choice.txt"), encoding="utf-8-sig") as f:
             vis = f.readline().strip().lower()
     except OSError:
         vis = ""
@@ -116,7 +116,7 @@ def main():
         steps.append(("pictures (0.97 GB)", VISION, VISION))
     # voice (off unless voice-choice.txt / DS41_VOICE says cpu or gpu: Enable Voice.bat)
     try:
-        with open(os.path.join(root, "voice-choice.txt"), encoding="utf-8") as f:
+        with open(os.path.join(root, "voice-choice.txt"), encoding="utf-8-sig") as f:
             voc = f.readline().strip().lower()
     except OSError:
         voc = ""

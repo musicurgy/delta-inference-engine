@@ -201,6 +201,30 @@ class StrataProxy(unittest.TestCase):
         self.assertIn("no tts server", out["error"]["message"])
 
 
+class ChoiceFilesWithBom(unittest.TestCase):
+    """The launcher's choice files re-saved by an editor as "UTF-8 with BOM": "﻿off" was not a choice (pictures
+    and voice went to their warnings, model-choice.txt's model was "not in the model folder")."""
+
+    def test_bom_is_ignored(self):
+        import os
+        import sys
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        here = str(Path(__file__).resolve().parents[1] / "tools" / "v41" / "serve")
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import ds41_local as L
+        import pick_model as P
+        with tempfile.TemporaryDirectory() as d:
+            for name, text in (("vision-choice.txt", "off"), ("voice-choice.txt", "cpu"), ("model-choice.txt", "x.gguf")):
+                Path(d, name).write_bytes(b"\xef\xbb\xbf" + text.encode() + b"\r\n")
+            env = {k: v for k, v in os.environ.items() if k not in ("DS41_VISION", "DS41_VOICE")}
+            with mock.patch.object(L, "ROOT", d), mock.patch.object(P, "CHOICE", os.path.join(d, "model-choice.txt")), \
+                    mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual((L.vision_choice(), L.voice_choice(), P.current()), ("off", "cpu", "x.gguf"))
+
+
 class LauncherVoiceSection(unittest.TestCase):
     """tools/v41/serve/ds41_local.py: voice-choice.txt / DS41_VOICE -> the server's "voice" section."""
 

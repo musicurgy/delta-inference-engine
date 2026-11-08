@@ -341,8 +341,8 @@ _start_lazy_vision = S.Service.start_lazy_vision
 
 
 def _start_lazy_vision_ds41(self, reserve_mib, idle_s):
-    # ds41_generate has no VRAM command: lazy mode's make-room step (an encoder on the engine's own card) would wait
-    # 120 s for an answer and then take the engine for dead.  The engine says it is not elastic; the encoder only
+    # ds41_generate has no VRAM command (it answers ERR unsupported command): lazy mode's make-room step would send
+    # it and read the engine's output lines for the answer - outside a request's turn it can take an answer's lines.  The engine says it is not elastic; the encoder only
     # starts and stops (on the engine's card it then needs the room --vram-margin leaves).
     self.engine.info["vram_elastic"] = False
     _start_lazy_vision(self, reserve_mib, idle_s)

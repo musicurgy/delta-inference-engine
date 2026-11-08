@@ -35,6 +35,22 @@ export STRATA_SERVE_DSPARK_EVICT="${STRATA_SERVE_DSPARK_EVICT:-4096}"
 # Bounded replay: layers 21-39 run on a prompt's last 128 tokens only (agent sessions -4.6 to -6.6 %, quality inside
 # run-to-run noise on short and long turns, rounds 350 / 352 / 353).  =0 = off.
 export STRATA_ENC_BOUND="${STRATA_ENC_BOUND:-128}"
+# the serving switches Start DeepSeek.bat runs with (all exact: conversation cache, rollback, snapshots, the kept
+# expert cache, sampled drafts; its comments give the rounds).  serve/test_launcher_knobs.py keeps them equal to the
+# launcher's and lists what differs on purpose: the GSQ model and its Q2_K MTP sidecar (drafter depth / confidence,
+# 64 kept experts), the 12288 prompt batch measured with prestage 1.5, Linux pages, and the kernel / prefetch switches
+# not measured on this setup.
+export STRATA_SERVE_ROLLBACK="${STRATA_SERVE_ROLLBACK:-8}"
+export STRATA_SERVE_BATCH_MIN="${STRATA_SERVE_BATCH_MIN:-64}"
+export STRATA_PASS_CAP_MIN="${STRATA_PASS_CAP_MIN:-4096}"
+export STRATA_SERVE_REWIND1="${STRATA_SERVE_REWIND1:-1}"
+export STRATA_SERVE_CACHE_SLOTS="${STRATA_SERVE_CACHE_SLOTS:-8}"
+export STRATA_SERVE_SNAP_STACK="${STRATA_SERVE_SNAP_STACK:-4}"
+export STRATA_SERVE_KEEP_CACHE="${STRATA_SERVE_KEEP_CACHE:-1}"
+export STRATA_SERVE_KEEP_LRU="${STRATA_SERVE_KEEP_LRU:-1}"
+export STRATA_SERVE_KEEP_MAX="${STRATA_SERVE_KEEP_MAX:-12000}"
+export STRATA_DSPARK_SAMPLE="${STRATA_DSPARK_SAMPLE:-1}"
+export STRATA_DSPARK_SAMPLE_T="${STRATA_DSPARK_SAMPLE_T:-0.5}"
 # Dense half (attention + shared expert + head, the file's Q8_0) re-quantized to Q6_K at load (ggml, file untouched):
 # 7.59 -> 5.86 GB, +1.6 GiB of VRAM expert slots -> decode +11 % after a 6.5K prompt, +15-35 % after 16.8K, edits
 # +9 %; prefill on long prompts -9 % (Q6_K MMQ).  Quality on the 100 API fixtures (S6, same bf16 path): KL vs FP8

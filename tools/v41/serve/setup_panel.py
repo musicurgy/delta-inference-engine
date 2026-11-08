@@ -28,7 +28,7 @@ RESTART_EXIT = 75                                              # serve_ds41.py's
 
 def load_settings() -> dict:
     try:
-        with open(SETTINGS, encoding="utf-8") as f:
+        with open(SETTINGS, encoding="utf-8-sig") as f:
             s = json.load(f)
         return s if isinstance(s, dict) else {}
     except (OSError, ValueError):
@@ -222,7 +222,7 @@ def change_firewall(add=True) -> bool:
 
 def _local_config() -> dict:
     try:
-        with open(LOCAL_CONFIG, encoding="utf-8") as f:
+        with open(LOCAL_CONFIG, encoding="utf-8-sig") as f:
             c = json.load(f)
         return c if isinstance(c, dict) else {}
     except (OSError, ValueError):
@@ -347,6 +347,9 @@ def rollback() -> bool:
     s = load_settings()
     p = s.pop("pending", None)
     if p is None:
+        return False
+    if not isinstance(p, dict):     # a hand-edited delta-settings.json: nothing to put back, but it starts
+        save_settings(s)
         return False
     if p.get("model"):
         with open(P.CHOICE, "w", encoding="utf-8") as f:
