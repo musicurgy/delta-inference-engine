@@ -18,6 +18,12 @@ Where the encoder runs (`vision-choice.txt` or `DS41_VISION`; `tools/v41/serve/d
 | `main` (old spelling `gpu`) | the engine's card | ~1.5 GiB of the expert cache |
 | `off` | text only | |
 
+On one graphics card pictures are read on the CPU, so the model keeps all its graphics memory; with a second card they
+are read there.  On PCs with less than about 170 GB of RAM the picture reader starts with the first picture (about 7 s
+once, longer while the model is writing) and stops after 10 idle minutes (`VISION_LAZY_BELOW_GIB` and
+`VISION_LAZY_IDLE_S` in ds41_local.py).  `DS41_VISION_LAZY=1` starts it with the first picture whatever the RAM;
+`DS41_VISION_LAZY=0` keeps it running from the start.  The CPU encoder holds 3.93 GiB committed (2.37 GiB working set).
+
 On a card the encoder runs in bf16 alone on it (`cuda_device` in the config's `vision` section ->
 `CUDA_VISIBLE_DEVICES`).  On the multi-GPU helper's card the helper holds 2 GiB fewer experts
 (`VISION_GPU_GIB`).  A card choice without the CUDA build falls back to the CPU with one line; the next start offers the
