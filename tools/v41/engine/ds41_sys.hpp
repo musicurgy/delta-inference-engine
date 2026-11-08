@@ -73,6 +73,16 @@ inline std::wstring widen(const char* utf8) {
 
 inline HANDLE handle_of(int fd) { return (HANDLE) _get_osfhandle(fd); }
 
+/// The calling thread's event for overlapped transfers, closed when the thread exits.  (A plain thread_local HANDLE
+/// leaked one event per thread, and the expert tier starts reader threads per prompt wave and per decode step.)
+struct ThreadEvent {
+    HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ThreadEvent() = default;
+    ThreadEvent(const ThreadEvent &) = delete;
+    ThreadEvent & operator=(const ThreadEvent &) = delete;
+    ~ThreadEvent() { if (h) CloseHandle(h); }
+};
+
 inline int open(const char* path, int flags, int /*mode*/ = 0) {
     const int acc = flags & (_O_WRONLY | _O_RDWR);
     const DWORD access = acc == _O_WRONLY ? GENERIC_WRITE : acc == _O_RDWR ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
@@ -103,7 +113,8 @@ inline int close(int fd) { return _close(fd); }
 inline ssize_t xfer(int fd, void* buf, size_t n, int64_t off, bool write) {
     HANDLE h = handle_of(fd);
     if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
-    thread_local HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    thread_local ThreadEvent tev;
+    const HANDLE ev = tev.h;
     size_t done = 0;
     while (done < n) {
         const DWORD want = (DWORD) ((n - done) > (size_t) (1u << 30) ? (1u << 30) : (n - done));

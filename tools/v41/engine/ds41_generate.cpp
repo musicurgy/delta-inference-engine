@@ -1643,8 +1643,10 @@ int main(int argc, char ** argv) {
     };
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
+        // STRATA_ENC_BOUND: the floor of the state this read continues stays (the serve loop sets -1 for a request that
+        // continues nothing, and restores a saved state's floor with it); only a batch with a skipped part sets a new one.
+        // (Until the 0.94 fix the floor was reset here, so a request that read no batch kept another conversation's.)
         bool floor_set = false;
-        if (enc_bound > 0) dense.set_window_floor(-1);
         for (int c0 = 0; c0 < n; ) {
             if (stop_prefill()) return false;
             if (PB > 1 && n - c0 >= 2) {
@@ -2352,6 +2354,9 @@ int main(int argc, char ** argv) {
                 hist.clear();
                 snap_len = -1;
             }
+            // STRATA_ENC_BOUND: a request that continues nothing starts without a window floor (a resumed state brought its
+            // own back through restore() / load_conv() / unpark(); a live resume keeps the live one)
+            if (enc_bound > 0 && reused == 0) dense.set_window_floor(-1);
             if (snap_stack_k > 0) {   // entries past the resume point are overwritten from it on; another conversation: none
                 if (unparked || reused <= 0) snap_stack.clear();
                 else snap_stack.erase(std::remove_if(snap_stack.begin(), snap_stack.end(),

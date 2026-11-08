@@ -261,6 +261,9 @@ struct Ds41Dense::Impl {
     ggml_tensor * i_wmask = nullptr;      // F32 [SWA, NC]
     ggml_tensor * i_wmask_hi = nullptr;   // STRATA_ENC_BOUND only: the mask of the layers past the last kv source
     int64_t win_floor = -1;               // ... whose windows stop at this position (set_window_floor)
+    // The floor belongs to the state it describes (0.94 fix): the snapshot keeps the floor it was taken with, and so do
+    // the park and every SavedConv; restore() / unpark() / load_conv() bring it back with the rows.
+    int64_t snap_floor = -1, parked_floor = -1;
     int last_kv = -1;                     // the last kv source layer
     ggml_tensor * i_wslot = nullptr;      // I32 [min(NC, RAW)]  ring slots of the pass's last rows
     ggml_tensor * i_nvis[3] = {};         // F32 [NC]   visible compressed rows per query (ratio 1 / 2)
@@ -1565,6 +1568,7 @@ void Ds41Dense::set_vision(const float * rows, const int64_t * pos, int n_rows) 
     im.vis_rows = rows;
     im.vis_pos = pos;
     im.n_vis = n_rows;
+    im.eng_next_tids.clear();   // no Engram read-ahead for a request with pictures (engram_ready / engram_next)
 }
 
 void Ds41Dense::clear_vision() {
@@ -1983,8 +1987,10 @@ static bool engram_ready(Ds41Dense::Impl & im, int slot = -1) {
         if (!im.eng_up[e]) dset(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
     im.eng_up[0] = im.eng_up[1] = false;
     // STRATA_ENGRAM_AHEAD: eng_rows is free again (dset is synchronous): the next chunk's reads go into it now.  Its tokens are
-    // recorded first (positions past this pass: start() took this pass's hashes already, and the next pass sets them again)
-    if (engram_ahead_on() && !im.eng_next_tids.empty() && !im.vision && !im.eng_ahead) {
+    // recorded first (positions past this pass: start() took this pass's hashes already, and the next pass sets them again).
+    // Text only: a request with pictures (n_vis > 0) needs its image positions dead, which only upload_inputs knows; a
+    // text request on a --vision engine is plain text (the 0.94 fix: this tested the engine's --vision flag).
+    if (engram_ahead_on() && !im.eng_next_tids.empty() && im.n_vis == 0 && !im.eng_ahead) {
         const int nn = (int) im.eng_next_tids.size();
         for (int t = 0; t < nn; ++t) im.engram.set_token(im.eng_next_pos0 + t, im.eng_next_tids[(size_t) t]);
         im.eng_ahead = im.engram.start(im.eng_next_pos0, nn, im.eng_rows, im.err);
@@ -2003,7 +2009,7 @@ static bool engram_ahead_take(Ds41Dense::Impl & im, int64_t pos0, int n, bool & 
     if (!im.eng_ahead) return true;
     std::shared_ptr<Ds41Engram::Batch> b = std::move(im.eng_ahead);
     im.eng_ahead.reset();
-    if (pos0 == im.eng_ahead_pos0 && n == im.eng_ahead_n) {
+    if (pos0 == im.eng_ahead_pos0 && n == im.eng_ahead_n && im.n_vis == 0) {   // (a pass with pictures reads its own)
         im.eng_batch = std::move(b);
         im.eng_up[0] = im.eng_up[1] = false;
         adopted = true;
@@ -2013,13 +2019,14 @@ static bool engram_ahead_take(Ds41Dense::Impl & im, int64_t pos0, int n, bool & 
 }
 
 // STRATA_ENC_BOUND: the window mask of the layers past the last kv source.  A row at or past the floor sees nothing
-// before it: those rows never ran these layers, so their ring slots hold older positions.  A row before the floor
-// (the scorer runs them, nothing reads them) keeps its own row, so its attention is never empty.
+// before it: those rows never ran these layers, so their ring slots hold older positions.  A row before the floor has
+// the plain window (0.94 fix: it used to see only itself, so a floor left over from another conversation cut layers
+// 21-39 off from every earlier token of a later short request; the scorer's rows before its floor are read by nothing).
 static void upload_wmask_hi(Ds41Dense::Impl & im, int n, int pos0) {
-    const int64_t SWA = im.SWA;
+    const int64_t SWA = im.SWA, F = im.win_floor;
     std::vector<float> wm((size_t) (SWA * n));
     for (int t = 0; t < n; ++t) {
-        const int64_t p = (int64_t) pos0 + t, lo = std::min(im.win_floor, p);
+        const int64_t p = (int64_t) pos0 + t, lo = (F >= 0 && p >= F) ? F : 0;
         for (int64_t j = 0; j < SWA; ++j) {
             const int64_t q = p - SWA + 1 + j;
             wm[(size_t) (t * SWA + j)] = (q < 0 || q < lo) ? NEG_INF : 0.0f;
@@ -2160,8 +2167,9 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
 void Ds41Dense::engram_next(const int * tids, int n, int pos0) {
     Impl & im = *p_;
     im.eng_next_tids.clear();
-    // only a prompt-sized chunk (> 64 rows: a smaller pass may read its rows synchronously into eng_rows) of text
-    if (!engram_ahead_on() || !im.engram.enabled() || im.vision || !tids || n <= 64 || pos0 < 0 || (int64_t) pos0 + n > im.cfg.ctx_max) return;
+    // only a prompt-sized chunk (> 64 rows: a smaller pass may read its rows synchronously into eng_rows) of a request
+    // without pictures (n_vis: this request's image rows, set_vision / clear_vision)
+    if (!engram_ahead_on() || !im.engram.enabled() || im.n_vis > 0 || !tids || n <= 64 || pos0 < 0 || (int64_t) pos0 + n > im.cfg.ctx_max) return;
     im.eng_next_tids.assign(tids, tids + n);
     im.eng_next_pos0 = pos0;
 }
@@ -2834,6 +2842,7 @@ bool Ds41Dense::snapshot(int pos) {
     }
     dsync_be(im.backend);
     im.snap_pos = pos;
+    im.snap_floor = im.win_floor;
     return true;
 }
 
@@ -2845,6 +2854,7 @@ bool Ds41Dense::restore() {
         if (L.st_kv) { dcopy(L.st_kv_snap, L.st_kv); dcopy(L.st_sc_snap, L.st_sc); }
     }
     dsync_be(im.backend);
+    im.win_floor = im.snap_floor;   // the next upload_inputs builds the mask from it
     return true;
 }
 
@@ -2879,12 +2889,14 @@ bool Ds41Dense::park(int64_t positions) {
     dsync_be(im.backend);
     collect_conv_rows(im, positions, im.parked);
     im.parked_pos = im.snap_pos;
+    im.parked_floor = im.snap_floor;
     return true;
 }
 
 struct Ds41Dense::SavedConv {
     std::vector<Impl::ParkedRows> rows;
     int snap_pos = -1;
+    int64_t snap_floor = -1;   // STRATA_ENC_BOUND: the window floor the snapshot was taken with
     size_t bytes = 0;
 };
 
@@ -2895,6 +2907,7 @@ std::shared_ptr<Ds41Dense::SavedConv> Ds41Dense::save_conv(int64_t positions) {
     auto s = std::make_shared<SavedConv>();
     collect_conv_rows(im, positions, s->rows);
     s->snap_pos = im.snap_pos;
+    s->snap_floor = im.snap_floor;
     for (const auto & r : s->rows) s->bytes += r.b.size();
     return s;
 }
@@ -2906,6 +2919,9 @@ bool Ds41Dense::load_conv(const SavedConv & s) {
     for (const auto & r : s.rows) dset(r.t, r.b.data(), r.off, r.b.size());
     dsync_be(im.backend);
     im.snap_pos = s.snap_pos;
+    // its rows are the live ones now: the floor comes with them (restore() sets the same again)
+    im.snap_floor = s.snap_floor;
+    im.win_floor = s.snap_floor;
     return true;
 }
 
@@ -2925,6 +2941,8 @@ bool Ds41Dense::unpark() {
     for (auto & r : im.parked) dset(r.t, r.b.data(), r.off, r.b.size());
     dsync_be(im.backend);
     im.snap_pos = im.parked_pos;
+    im.snap_floor = im.parked_floor;   // as load_conv: the parked rows are live again, their floor with them
+    im.win_floor = im.parked_floor;
     drop_park();
     return true;
 }
@@ -2933,6 +2951,7 @@ void Ds41Dense::drop_park() {
     p_->parked.clear();
     p_->parked.shrink_to_fit();
     p_->parked_pos = -1;
+    p_->parked_floor = -1;
 }
 
 bool Ds41Dense::parked() const { return p_->parked_pos >= 0; }
