@@ -364,6 +364,41 @@ class Ds41Detail(unittest.TestCase):
         self.assertIn("pictures are not working", err[1])
         self.assertEqual((calls, elastic), ([], False))
 
+    def test_resident_encoder_that_cannot_start_does_not_stop_text(self):
+        """A resident encoder (192 GB PCs, or pictures on a card) whose start fails - a PyTorch that does not import -
+        was restarted by every engine load and request, and its failure was an EngineDied: text answered 503, and the
+        launcher's background load ended the server.  Now the engine loads, text goes on, a picture is the 400."""
+        code = (
+            "import sys, io, json, types; sys.path.insert(0, sys.argv[1]); import serve_ds41 as D\n"
+            "from PIL import Image\n"
+            "def broken(): raise RuntimeError('ERR ImportError: DLL load failed while importing _C')\n"
+            "orig = D.Ds41Vision._start\n"
+            "D.Ds41Vision._start = lambda self: broken()\n"
+            "v = D.Ds41Vision({'exe': 'x', 'mmproj': 'm', 'model': 'g'})\n"
+            "first = v.start_failed\n"
+            "v.start_failed = None                                   # as a background load sees it (lazy=True)\n"
+            "eng = types.SimpleNamespace(up=False, unloaded=True, restarts=0)\n"
+            "def restart(): eng.up = True; eng.restarts += 1\n"
+            "eng.restart, eng.alive = restart, lambda: eng.up\n"
+            "svc = types.SimpleNamespace(vision=v, engine=eng, before_load=None, min_free_vram_mib=0,\n"
+            "                            restore_after_load=None, vram_reserve=None)\n"
+            "svc.loaded = lambda: eng.alive()\n"
+            "svc._vision_down = lambda: D.S.Service._vision_down(svc)\n"
+            "D.S.Service.ensure_loaded(svc)                          # the engine loads, pictures stay off\n"
+            "again = D.S.Service._vision_down(svc)                   # later requests do not try the encoder again\n"
+            "b = io.BytesIO(); Image.new('RGB', (40, 30), (9, 9, 9)).save(b, 'PNG')\n"
+            "try:\n"
+            "    v.encode(b.getvalue()); err = None\n"
+            "except Exception as e:\n"
+            "    err = type(e).__name__\n"
+            "print(json.dumps([bool(first), eng.restarts, again, err])); D.Ds41Vision._start = orig; v.shutdown()\n")
+        r = subprocess.run([sys.executable, "-c", code, str(V41_SERVE)], capture_output=True, text=True, cwd=ROOT,
+                           timeout=120)
+        if r.returncode and "No module named" in r.stderr:
+            self.skipTest(r.stderr.strip().splitlines()[-1])
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        self.assertEqual(json.loads(r.stdout.strip().splitlines()[-1]), [True, 1, False, "ValueError"])
+
 
 class LazyReserve(unittest.TestCase):
     """server.lazy_vision_reserve: the engine's cache makes room only for an encoder on the engine's own card."""
