@@ -11,7 +11,10 @@ tqdm==4.70.1
 requests==2.34.2
 cmake==4.4.3
 ninja==1.13.2
-pillow==12.3.0
+# pictures: 13.0.0 fixes 12 advisories in 12.3.0 (GHSA-78g4-xqwv-q3g8 and others); it needs Python 3.11, so 3.10
+# keeps 12.3.0 (the server opens pictures only as JPEG, PNG, GIF, BMP or WebP either way)
+pillow==13.0.0; python_version >= "3.11"
+pillow==12.3.0; python_version < "3.11"
 psutil==7.2.2
 # the DeepSeek drafter's setup step (tools/v41/v41_sidecar.py): the version of the pinned llama.cpp's gguf-py
 # (3cf03257) - a prebuilt-engine install has no third_party/llama.cpp to take it from

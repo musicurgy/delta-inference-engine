@@ -12,8 +12,8 @@ Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-con
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
 data, http(s) URLs or local file paths) go through `strata-vision` (the model's mmproj file) and reach the engine as
-embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
-converted to PNG first with Pillow.
+embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP (agents like omp send it) is converted to PNG first with
+Pillow.  Other formats are refused (0.94: PICTURE_FORMATS).
 Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
@@ -2319,6 +2319,10 @@ class StrataEngine:
 
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
+# 0.94: the only formats Pillow may open for a client's picture (what the chat page, phones and the APIs send).
+# Pillow otherwise tries every format it knows - JPEG 2000, TIFF, MSP, Spider... - and several of those decoders carry
+# published memory-safety advisories (GHSA-78g4-xqwv-q3g8: a libopenjp2 heap overflow reachable from open().load()).
+PICTURE_FORMATS = ("JPEG", "PNG", "GIF", "BMP", "WEBP")
 
 
 def public_url(url: str, resolve=socket.getaddrinfo) -> None:
@@ -2596,7 +2600,7 @@ class Vision:
         try:
             import io
             from PIL import Image
-            with Image.open(io.BytesIO(data)) as im:
+            with Image.open(io.BytesIO(data), formats=("JPEG",)) as im:   # only ever asked for a JPEG
                 return im.getexif().get(0x0112, 1) not in (None, 0, 1)
         except Exception:  # noqa: BLE001 - any failure leaves the image as it was sent
             return False
@@ -2604,19 +2608,25 @@ class Vision:
     @staticmethod
     def normalize(data: bytes) -> bytes:
         """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG.
-        A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow)."""
+        A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow).  Only PICTURE_FORMATS are
+        opened: any other format (JPEG 2000, TIFF...) is a ValueError (a 400) before a decoder sees its bytes."""
         jpeg = data[:3] == b"\xff\xd8\xff"
         if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):
             return data
         try:
             import io
-            from PIL import Image
+            from PIL import Image, UnidentifiedImageError
         except ImportError:
             raise ValueError("this image format needs Pillow (python -m pip install pillow); JPEG, PNG, BMP and "
                              "GIF work without it") from None
         try:
-            im = Image.open(io.BytesIO(data))
+            im = Image.open(io.BytesIO(data), formats=PICTURE_FORMATS)
+        except UnidentifiedImageError:                    # another format, or not a picture at all
+            raise ValueError("the picture could not be read: send a JPEG, PNG, GIF, WebP or BMP") from None
+        except Exception as e:
+            raise ValueError(f"the image could not be read ({e})") from None
+        try:
             im.load()
             from PIL import ImageOps
             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied (#1229)
