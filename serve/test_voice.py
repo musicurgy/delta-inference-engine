@@ -100,6 +100,17 @@ class VoiceServerOptions(unittest.TestCase):
         quiet = VoiceServer("asr", {"cmd": "x"})
         self.assertEqual((quiet.env, quiet.show_log), ({}, False))
 
+    def test_the_child_ends_with_the_server(self):
+        # Windows: closing the window or the Setup card's os._exit left the speech child running on its port; the next
+        # start's health check reached the orphan, which refused the new token
+        from unittest import mock
+        v = VoiceServer("asr", {"cmd": "py", "port": 1, "start_timeout_s": 0.01})
+        with mock.patch("subprocess.Popen") as popen, mock.patch("serve.voice.contain") as contain:
+            popen.return_value.poll.return_value = None
+            with self.assertRaises(RuntimeError):
+                v.ensure()
+        contain.assert_called_once_with(popen.return_value)
+
 
 class LazyVoiceMakeRoom(unittest.TestCase):
     """start_lazy_voice's make-room step sends the engine's VRAM command, which reads the engine's output lines: it may

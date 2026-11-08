@@ -27,6 +27,8 @@ import time
 import urllib.error
 import urllib.request
 
+from serve.winjob import contain   # (no serve.server import: winjob imports nothing of the server's)
+
 # A short probe: a healthy local audio server answers /health at once; if it does not, it is not up yet.
 HEALTH_TIMEOUT_S = 2.0
 # How long a single forwarded request may take (a long clip on a busy card is still bounded).
@@ -87,6 +89,9 @@ class VoiceServer:
             except OSError as e:
                 self.proc = None
                 raise RuntimeError(f"the {self.kind} server could not start: {e}") from None
+            # ends with the server however it ends (Windows: closing the window, the Setup card's restart - os._exit):
+            # an orphan kept its port and answered the next start's health check, then refused its token
+            contain(self.proc)
             self.stopped = False
             # the start counts as use: until the caller's touch() after ensure(), last_used was 0 (or the last
             # idle stop), so an idle-loop tick landing during a slow cold start stopped the child under the
