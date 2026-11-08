@@ -5,6 +5,7 @@ Enable Pictures.bat (which call it without first-start.bat) no longer download a
 Start DeepSeek.bat never uses there, and the space check before the downloads does not count it.
 S9 (0.94): an engine older than the scripts (the usual case after an update) is replaced with a message that says so,
 not "it cannot read the Engram tables" (false for every engine since 2026-10-27, 0.93's included).
+S10 (0.94): a ZIP copy's UPDATE.bat says to keep ds41-paths.bat (it holds the model folder), and its block still runs.
 
     python tools/v41/serve/test_setup_scripts.py
 """
@@ -125,6 +126,28 @@ class OldEngine(unittest.TestCase):
 
     def test_no_engine_yet(self):
         self.assertEqual(cpu_level.pick_build(), (None, "No engine in this folder yet (normal on the first start):"))
+
+
+class ZipUpdate(unittest.TestCase):
+    """README.md's Updating paragraph, and UPDATE.bat in a copy without .git (a ZIP): cmd.exe gets through its one
+    ( ... ) block (an unescaped parenthesis in an echo there ends the block) and says to keep ds41-paths.bat."""
+
+    def test_the_readme(self):
+        text = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
+        self.assertIn("With a ZIP, keep your `ds41-paths.bat` (it holds your model folder): copy it aside before "
+                      "unpacking and back after, or re-enter your model folder when the first start asks", text)
+
+    @unittest.skipUnless(os.name == "nt", "runs cmd.exe")
+    def test_a_zip_copy_runs_through(self):
+        with tempfile.TemporaryDirectory() as d:
+            bat = Path(d, "UPDATE.bat")
+            bat.write_bytes((ROOT / "UPDATE.bat").read_bytes())
+            r = subprocess.run(["cmd", "/d", "/c", str(bat)], cwd=d, stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("This copy was not made with git", r.stdout)
+        self.assertIn("Keep your ds41-paths.bat (it holds your model folder)", r.stdout)
+        self.assertIn("when the first start asks where the model files go.", r.stdout)
 
 
 if __name__ == "__main__":
