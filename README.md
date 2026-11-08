@@ -221,11 +221,11 @@ compact your conversation early.
   ```jsonc
   {
     "$schema": "https://opencode.ai/config.json",
-    "providers": {
+    "provider": {
       "delta": {
+        "npm": "@ai-sdk/openai-compatible",
         "name": "Delta (local)",
-        "package": "@opencode/ai/providers/openai-compatible",
-        "settings": { "baseURL": "http://127.0.0.1:8080/v1" },
+        "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "local" },
         "models": {
           "deepseek-v4.1-flash-1017": {
             "name": "DeepSeek V4.1 Flash",
