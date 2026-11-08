@@ -166,14 +166,34 @@ def start_lazy_voice(service, servers: dict, idle_s: float) -> None:
         reserve = v.reserve_mib
 
         def make_room(reserve=reserve, name=name):
-            if not elastic or not service.loaded():
+            # reserve 0 (a child on the CPU or on another card, as ds41_local.py writes it): nothing to make room for.
+            # The VRAM command reads the engine's output lines, so it needs the turn (StrataEngine.vram: "the caller
+            # holds the service's FIFO"); the audio path holds none, and the command read - and dropped - the lines
+            # of an answer being written.  A request that runs: no room is made, the child starts anyway.
+            if reserve <= 0 or not elastic or not service.loaded():
+                return
+            ctl = getattr(service.engine, "ctl", None) if getattr(service.engine, "batch", 0) else None
+            if not service.fifo.acquire(blocking=False):
+                print(f"[strata] lazy voice ({name}): a request is running; starting without shrinking the cache",
+                      flush=True)
                 return
             try:
-                out = service.engine.vram(reserve)
-                print(f"[strata] lazy voice ({name}): expert cache shrunk ({out.get('expert_slots')} slots, "
-                      f"{out.get('vram_free_mib')} MiB free)", flush=True)
-            except Exception as e:
-                print(f"[strata] lazy voice ({name}): could not shrink the cache ({e}); starting anyway", flush=True)
+                if ctl is not None and not ctl.acquire(blocking=False):
+                    print(f"[strata] lazy voice ({name}): a request is running; starting without shrinking the cache",
+                          flush=True)
+                    return
+                try:
+                    out = service.engine.vram(reserve)
+                    print(f"[strata] lazy voice ({name}): expert cache shrunk ({out.get('expert_slots')} slots, "
+                          f"{out.get('vram_free_mib')} MiB free)", flush=True)
+                except Exception as e:
+                    print(f"[strata] lazy voice ({name}): could not shrink the cache ({e}); starting anyway",
+                          flush=True)
+                finally:
+                    if ctl is not None:
+                        ctl.release()
+            finally:
+                service.fifo.release()
         v.on_start = make_room
 
     wanted = ", ".join(sorted(servers))
@@ -193,11 +213,14 @@ def start_lazy_voice(service, servers: dict, idle_s: float) -> None:
                         if not v.alive() or time.time() - v.last_used < idle_s:
                             continue
                         v.stop()
-                        elastic = hasattr(service.engine, "vram") and \
+                        # reserve 0: the cache was never shrunk for it, nothing to grow back (an engine without the
+                        # VRAM command - ds41_generate - answered ERR here after every idle stop)
+                        elastic = v.reserve_mib > 0 and hasattr(service.engine, "vram") and \
                             bool((getattr(service.engine, "info", {}) or {}).get("vram_elastic", True))
                         out = service.engine.vram(service.vram_reserve) if elastic and service.loaded() else {}
-                        print(f"[strata] lazy voice: {name} server stopped after {idle_s:.0f} s idle; "
-                              f"expert cache grown back ({out.get('expert_slots')} slots)", flush=True)
+                        print(f"[strata] lazy voice: {name} server stopped after {idle_s:.0f} s idle"
+                              + (f"; expert cache grown back ({out.get('expert_slots')} slots)" if out else ""),
+                              flush=True)
                     finally:
                         service.fifo.release()
                 except Exception as e:                          # the thread keeps running

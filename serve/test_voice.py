@@ -101,6 +101,45 @@ class VoiceServerOptions(unittest.TestCase):
         self.assertEqual((quiet.env, quiet.show_log), ({}, False))
 
 
+class LazyVoiceMakeRoom(unittest.TestCase):
+    """start_lazy_voice's make-room step sends the engine's VRAM command, which reads the engine's output lines: it may
+    only run when it holds the turn (the audio path holds none), and not at all for a child that needs no VRAM of the
+    engine's card (lazy_reserve_mib 0: the DS41 launcher's CPU / second-card voice)."""
+
+    def service(self):
+        from unittest import mock
+        svc = mock.Mock()
+        svc.fifo = threading.Lock()
+        svc.loaded.return_value = True
+        svc.engine.info = {}
+        svc.engine.batch = 0
+        svc.engine.vram.return_value = {"expert_slots": 1}
+        return svc
+
+    def wire(self, svc, reserve):
+        from unittest import mock
+        from serve.voice import start_lazy_voice
+        v = VoiceServer("asr", {"cmd": "x", "lazy_reserve_mib": reserve})
+        with mock.patch("threading.Thread"):                 # no idle loop in the test
+            start_lazy_voice(svc, {"asr": v}, 600)
+        return v
+
+    def test_reserve_zero_sends_no_vram_command(self):
+        svc = self.service()
+        self.wire(svc, 0).on_start()
+        svc.engine.vram.assert_not_called()
+
+    def test_not_while_a_request_holds_the_turn(self):
+        svc = self.service()
+        v = self.wire(svc, 1800)
+        with svc.fifo:                                       # a request is generating
+            v.on_start()
+        svc.engine.vram.assert_not_called()
+        v.on_start()                                         # idle: the cache makes room, and the turn is given back
+        svc.engine.vram.assert_called_once_with(1800)
+        self.assertFalse(svc.fifo.locked())
+
+
 class StrataProxy(unittest.TestCase):
     """The chat page's microphone: JSON to /v1/audio/transcriptions through Strata to the speech child; /health says
     which voice servers there are."""
