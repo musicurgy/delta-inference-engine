@@ -49,8 +49,10 @@ rem ---- 2. the Python environment (.venv): the server, the downloader, cmake an
 rem (.venv\requirements.installed: the requirements.txt it was last set up from - an update that changes the file brings
 rem the packages up to date, e.g. 0.92's gguf for the drafter's setup step)
 if exist ".venv\Scripts\python.exe" if exist ".venv\Scripts\hf.exe" fc /b requirements.txt ".venv\requirements.installed" >nul 2>&1 && goto build
+set "PKGUPDATE="
 if exist ".venv\Scripts\python.exe" (
   echo Updating the Python environment's packages ^(.venv^) ...
+  set "PKGUPDATE=1"
   goto havepy
 )
 echo Setting up the Python environment ^(.venv: ~0.3 GB of packages, a minute or two^) ...
@@ -85,11 +87,18 @@ if not exist ".venv\Scripts\python.exe" (
   %PYEXE% -m venv .venv || exit /b 1
 )
 ".venv\Scripts\python.exe" -m pip install -q --disable-pip-version-check -r requirements.txt tokenizers==0.23.3 huggingface_hub==2.2.0
+if errorlevel 1 if defined PKGUPDATE goto pkgwarn
 if errorlevel 1 (
   echo The package install failed ^(above^). Check the internet connection and start again.
   exit /b 1
 )
 copy /y requirements.txt ".venv\requirements.installed" >nul
+goto build
+rem an update whose package step failed (offline, a version not available for this Python): warn and start with the
+rem packages already there - they worked before the update.  requirements.installed stays old, so the next start retries
+:pkgwarn
+echo WARNING: the package update failed ^(above^).  Starting with the packages already installed; some may be out of
+echo   date ^(e.g. Pillow or certifi security fixes^).  The next start tries again ^(an internet connection is needed^).
 
 rem ---- 3. the engine: a build this CPU can run (cpu_level.py: this PC's own, the portable AVX2 one, the older-CPU one)
 :build
