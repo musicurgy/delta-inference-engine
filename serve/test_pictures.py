@@ -337,7 +337,7 @@ class Ds41Detail(unittest.TestCase):
 
     def test_lazy_on_this_engine(self):
         """A lazy encoder that cannot start is the picture's 400 (not an internal error), and lazy mode never sends
-        ds41_generate a VRAM command (it has none: the request would wait 120 s and take the engine for dead)."""
+        ds41_generate a VRAM command (it has none, and the command reads the engine's output lines)."""
         code = (
             "import sys, io, json, threading, types; sys.path.insert(0, sys.argv[1]); import serve_ds41 as D\n"
             "from PIL import Image\n"

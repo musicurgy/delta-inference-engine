@@ -310,7 +310,7 @@ def expand(cfg):
         if not g.isdigit():
             sys.exit(f"ds41_local: DS41_GPU={g!r} is not a GPU number (nvidia-smi's index; ds41-paths.bat)")
         out["gpu"] = int(g)
-    # DS41_VRAM_MARGIN=GiB (Start DeepSeek.bat sets it for small cards): the VRAM kept free beside the expert cache
+    # DS41_VRAM_MARGIN=GiB (the user's, or set above for files with bigger experts): the VRAM kept free beside the expert cache
     margin = env_gib("DS41_VRAM_MARGIN", None)
     if margin is not None:
         if "--vram-margin" in a[:-1]:
