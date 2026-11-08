@@ -92,8 +92,8 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
   until your next message.
 - **Chat history** (search, pins, export), **use it from your phone** (a QR code), and downloads you can leave alone.
 - **Better with coding agents:** Claude Code's small background requests are fast and never hold up your real ones;
-  pressing Esc no longer makes the next message re-read the whole conversation; chats with pictures no longer re-read
-  everything each turn; an agent that repeats the same tool call 4 times gets a short note to try something else.
+  pressing Esc no longer makes the next message re-read the whole conversation; chats with pictures can reuse earlier
+  turns when the app sends the pictures back unchanged; an agent that repeats the same tool call 4 times gets a short note to try something else.
 - **A bit faster:** writing (SPEED CARD: 0.94 writing tok/s on UD-IQ2_XXS at 192 GB, default sampling and greedy,
   against 0.93's 40 / 41).  Prompts are read about 10% faster (about 5% of a whole agent session): the model's later
   layers read only the last 128 tokens of a prompt, as DeepSeek's own design does.  New installs get a slightly better
