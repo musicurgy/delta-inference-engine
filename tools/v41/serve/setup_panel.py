@@ -348,6 +348,9 @@ def rollback() -> bool:
     p = s.pop("pending", None)
     if p is None:
         return False
+    if not isinstance(p, dict):     # a hand-edited delta-settings.json: nothing to put back, but it starts
+        save_settings(s)
+        return False
     if p.get("model"):
         with open(P.CHOICE, "w", encoding="utf-8") as f:
             f.write(p["model"] + "\n")

@@ -103,6 +103,8 @@ SP.apply({"model": "custom/split-00001-of-00003.gguf"})
 SP.started()
 check("a start that worked keeps the choice", not SP.rollback() and "split" in Path(P.CHOICE).read_text())
 check("the mode survives", SP.load_settings().get("mode") == "exact")
+SP.save_settings({**SP.load_settings(), "pending": "old.gguf"})      # hand-edited: not an object
+check("a malformed pending is dropped, not a traceback", not SP.rollback() and "pending" not in SP.load_settings())
 
 # the first start's picker, as a user answers it
 env = {**os.environ, "DS41_MODELS": os.path.join(tmp, "m2"), "DS41_RAM_GB": "115"}
