@@ -160,6 +160,16 @@ class FakeTts:
         return np.zeros(2400, dtype=np.float32), 24000
 
 
+class PortTaken(unittest.TestCase):
+    def test_a_taken_port_is_an_error_not_a_shared_port(self):
+        # Windows: a speech server from an earlier start (socketserver sets SO_REUSEADDR) and a new one both bound
+        # 5110, and requests went to either one
+        earlier = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler("asr", FakeAsr(), lambda m: None))
+        self.addCleanup(earlier.server_close)
+        with self.assertRaises(OSError):
+            S.SpeechServer(earlier.server_address, S.make_handler("asr", FakeAsr(), lambda m: None)).server_close()
+
+
 class OverHttp(unittest.TestCase):
     def serve(self, kind, model, token=""):
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(kind, model, lambda m: None, token))

@@ -436,6 +436,13 @@ TOKEN_ENV = "STRATA_VOICE_TOKEN"          # serve/voice.py starts this server wi
 TOKEN_HEADER = "X-Strata-Voice-Token"     # and sends it with every request it forwards
 
 
+class SpeechServer(ThreadingHTTPServer):
+    # Windows: SO_REUSEADDR (socketserver's default) lets this server bind 5110 / 5210 while another program - or a
+    # speech server left from an earlier start - already listens there, and requests then land on either one.
+    # Without it the start fails (Strata says the server exited during startup), as serve/server.py's Server does.
+    allow_reuse_address = os.name != "nt"
+
+
 def make_handler(kind: str, model, log, token: str = ""):
     """0.94 (cross-site requests): any web page could POST to 127.0.0.1:5110 / 5210 - a text/plain or multipart body
     needs no CORS preflight - and keep the efficiency cores busy.  So a request that carries an Origin (browsers send
@@ -590,7 +597,7 @@ def main(argv=None) -> int:
     except Exception as e:   # noqa: BLE001
         log(f"could not load the model from {a.model}: {e}")
         return 1
-    httpd = ThreadingHTTPServer((a.host, a.port), make_handler(a.kind, model, log, os.environ.get(TOKEN_ENV, "")))
+    httpd = SpeechServer((a.host, a.port), make_handler(a.kind, model, log, os.environ.get(TOKEN_ENV, "")))
     log(f"ready on port {a.port} ({os.path.basename(os.path.normpath(a.model))}, {where}; "
         f"loaded in {time.monotonic() - t0:.1f} s)")
     try:
