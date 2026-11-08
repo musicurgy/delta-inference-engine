@@ -107,8 +107,10 @@ public:
     /// `enc_replay` tokens are all that matters).  Writes no host ids/wts/fn, so batch_ids()/batch_wts()/batch_fn()
     /// are left untouched at these columns.
     bool attn_router_span_kv(int il, int col0, int n);
-    /// STRATA_ENC_BOUND: layers past the last kv source read nothing before position `floor` (-1 = no limit).  Kept for
-    /// later passes; n > 0 also rewrites the current batch's n columns, which start at position pos0.
+    /// STRATA_ENC_BOUND: rows at or past position `floor` read nothing before it in the layers past the last kv source
+    /// (-1 = no limit; rows before the floor keep the plain window).  Kept for later passes and saved with the state:
+    /// snapshot() / park() / save_conv() record it, restore() / unpark() / load_conv() bring it back.  n > 0 also
+    /// rewrites the current batch's n columns, which start at position pos0.
     void set_window_floor(int64_t floor, int n = 0, int pos0 = 0);
     /// The batch's host buffers filled by attn_router_span: ids / wts are n_used * B (token-major), fn is n_embd * B.
     const int32_t * batch_ids() const;
