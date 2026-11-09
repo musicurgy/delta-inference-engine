@@ -97,8 +97,7 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
 - **A bit faster:** writing at the default sampling is about 5% faster on UD-IQ2_XXS at 192 GB (41.3 vs 39.2 tok/s;
   greedy 41.7 vs 40.8, both versions measured the same evening; 42.9 / 42.2 with a second GPU).  Long prompts are
   read faster: a fresh 60K-token prompt at 811 vs 747 tok/s, 30K at 860 vs 758, 7K at 551 vs 423 (the same evening);
-  in agent sessions that is about 10% of the prompt time and about 5% of a whole session; short chat prompts read as
-  before.  The model's later layers read only the last 128 tokens of a prompt, as DeepSeek's own design does.  New installs get a slightly better
+  short chat prompts read as before.  The model's later layers read only the last 128 tokens of a prompt, as DeepSeek's own design does.  New installs get a slightly better
   drafter (0.6% more of its guesses accepted, greedy).
 - **Safer:** the server will not open itself to your network without an API key.  When it listens on your network, it
   no longer reads pictures by a file path on this PC (`"image_local_files": true` allows it).
@@ -146,7 +145,7 @@ DeepSeek's own model:
 |---|---|---|---|---|---|
 | **Unsloth UD-IQ2_XXS** (the default from 128 GB up) | 91.1% | 41 | 34 | 29 | 21 |
 | ds4 Q2 | 89.9% | 41 | 36 | 27 | 20 |
-| **Unsloth UD-IQ1_S** | 89.1% | 41 | 41 | **36** | **31** |
+| **Unsloth UD-IQ1_S** | 89.1% | 41 | 40 | **36** | **31** |
 | Unsloth UD-Q2_K_XL | 92.5% | 31 | 27 | 23 | 15 |
 | Unsloth UD-IQ3_XXS | 92.7% | 28 | 23 | 18 | 12 |
 | GSQ IQ1_M (exact routing) | 85.5% | 42 | 37.5 | **34** | **28** |
@@ -386,7 +385,7 @@ on, so the speeds may differ slightly):
 | | download | general | code + maths | agentic | writing (0.93), 192 / 128 / 96 / 64 GB RAM |
 |---|---|---|---|---|---|
 | ds4 Q2 | 366 GB | 89.9% | 93.1% | 95.1% | 41 / 36 / 27 / 20 tok/s |
-| Unsloth UD-IQ1_S | 233 GB | 89.1% | 91.5% | 95.3% | 41 / 41 / 36 / 31 tok/s |
+| Unsloth UD-IQ1_S | 233 GB | 89.1% | 91.5% | 95.3% | 41 / 40 / 36 / 31 tok/s |
 | **Unsloth UD-IQ2_XXS** (the default from 128 GB up) | 301 GB | **91.1%** | **94.5%** | **95.9%** | 41 / 34 / 29 / 21 tok/s |
 | **Unsloth UD-Q2_K_XL** (the quality mode) | 335 GB | **92.5%** | **95.3%** | **97.0%** | 31 / 27 / 23 / 15 tok/s |
 | Unsloth UD-IQ3_XXS | 395 GB + the default | **92.7%** | **95.9%** | **97.4%** | 28 / 23 / 18 / 12 tok/s |
