@@ -94,10 +94,11 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
 - **Better with coding agents:** Claude Code's small background requests are fast and never hold up your real ones;
   pressing Esc no longer makes the next message re-read the whole conversation; chats with pictures can reuse earlier
   turns when the app sends the pictures back unchanged; an agent that repeats the same tool call 4 times gets a short note to try something else.
-- **A bit faster:** writing at the default sampling is about 5% faster on UD-IQ2_XXS at 192 GB (40.0 vs 37.9 tok/s;
-  greedy 40.7 vs 40.0, both versions measured the same evening).  Prompts are read about 10% faster (about 5% of a whole agent session): the model's later
+- **A bit faster:** writing at the default sampling is about 5% faster on UD-IQ2_XXS at 192 GB (41.3 vs 39.2 tok/s;
+  greedy 41.7 vs 40.8, both versions measured the same evening; 42.9 / 42.2 with a second GPU).  In agent sessions,
+  prompts are read about 10% faster (about 5% of a whole session; short chat prompts read as before): the model's later
   layers read only the last 128 tokens of a prompt, as DeepSeek's own design does.  New installs get a slightly better
-  drafter (+0.6% of its guesses accepted, greedy).
+  drafter (0.6% more of its guesses accepted, greedy).
 - **Safer:** the server will not open itself to your network without an API key.  When it listens on your network, it
   no longer reads pictures by a file path on this PC (`"image_local_files": true` allows it).
 
@@ -108,20 +109,20 @@ RAM supported, the second-GPU helper, release zips built by GitHub) and the full
 ## Speed
 
 These numbers are from an RTX 3090 with an NVMe SSD, through the server.  In this README a speed was measured with
-0.93 (or earlier) unless it says 0.94.  0.94 changes the drafter and turns pictures on, so the 0.93 figures may
-differ slightly.
+0.93 (or earlier) unless it says 0.94.  0.94 changes the drafter, bounds the prompt replay and turns pictures on, so
+the 0.93 figures may differ slightly.
 
 | UD-IQ2_XXS (the default from 128 GB up) | 192 GB RAM, 0.94 | 192 GB RAM, 0.93 | 128 GB RAM, 0.93 |
 |---|---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **40.7 tok/s** | 40.0 tok/s (41.1 on its release card) | 34 tok/s |
-| Writing, the default sampling (temperature 1, top-p 0.95) | **40.0 tok/s** | 37.9 tok/s (39.7 on its release card) | - |
+| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **41.7 tok/s** | 40.8 tok/s (41.1 on its release card) | 34 tok/s |
+| Writing, the default sampling (temperature 1, top-p 0.95) | **41.3 tok/s** | 39.2 tok/s (39.7 on its release card) | - |
 | Reading a long prompt (~64K tokens) | not measured again | up to 740 tok/s | up to 600 tok/s |
 
 The two 192 GB writing rows were measured the same evening on the same PC, one version after the other, with the
-graphics card cooled down before each run.  Speeds on one PC vary by a few percent from day to day, which is why 0.93's
+graphics card cooled down before each run.  Speeds on one PC vary by about 1% from day to day, which is why 0.93's
 own release card is a little higher than its run here.  The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  Greedy means temperature 0 in the
 request; the default sampling is what a client gets when it sends no temperature.  Sampling accepts fewer of the
-drafter's guesses, so it writes a little slower (0.93: ds4 Q2 40.7 -> 40.3 tok/s, UD-IQ2_XXS 41.1 -> 39.7; 0.94: UD-IQ2_XXS 40.7 -> 40.0).  0.93 narrowed
+drafter's guesses, so it writes a little slower (0.93: ds4 Q2 40.7 -> 40.3 tok/s, UD-IQ2_XXS 41.1 -> 39.7; 0.94: UD-IQ2_XXS 41.7 -> 41.3).  0.93 narrowed
 that gap from ~12%: the drafter's guesses are now
 sampled instead of taken as its top pick (`STRATA_DSPARK_SAMPLE` in `Start DeepSeek.bat`); the answers'
 distribution is unchanged.
@@ -169,7 +170,8 @@ maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the pr
 
 The Setup tab in the chat page has a Multi-GPU switch: a helper on a second card of 8 GB or more holds experts the
 main card has no room for.  The main card needs 20 GB or more for this switch; the engine itself runs from 12 GB.  With
-an RTX 3060 12 GB in an x4 slot beside the 3090 it adds about 7% writing speed (0.93).  The second card must be an RTX 20
+an RTX 3060 12 GB in an x4 slot beside the 3090 it adds a few percent: 0.94 on UD-IQ2_XXS writes 42.9 tok/s greedy
+and 42.2 at the default sampling, against 41.7 / 41.3 on the 3090 alone (the same evening).  The second card must be an RTX 20
 or newer; of two equal cards, the one on the wider PCIe link is used.  If the helper stops or cannot start, the model
 still starts and runs on one card (the server window says so).  It does not split the model across cards, so it
 does not scale: for two or more big cards use [Project Maya](https://github.com/mw00/project-maya), which runs
@@ -492,7 +494,7 @@ hand:
    - the speculative-decoding drafter (the biggest single speed-up), built from DeepSeek's own MTP heads in the same
      repository (three shards, 7.9 GB, removed afterwards) and shrunk to 4.2 GB. The drafter only proposes tokens;
      the main model checks every one.  From 0.94 it is shrunk with an importance matrix
-     (`tools\v41\serve\drafter-imatrix.bin`): the same size, +0.6% of its guesses accepted (greedy).  A 0.93
+     (`tools\v41\serve\drafter-imatrix.bin`): the same size, 0.6% more of its guesses accepted (greedy).  A 0.93
      install keeps its drafter; `setup-ds41-models.bat drafter-imx` makes the new one (it downloads the 7.9 GB once).
 5. **Start** with `Start DeepSeek.bat`. Use the model name `/v1/models` shows (`deepseek-v4.1-flash-1017-ds4-q2` for
    ds4 Q2, `deepseek-v4.1-flash-1017-ud-iq2_xxs` for UD-IQ2_XXS; the server answers any name) with any
