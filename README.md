@@ -75,6 +75,11 @@ download the new ZIP and unpack it over this folder, or next to it with `models\
 files stay as they are. With a ZIP, keep your `ds41-paths.bat` (it holds your model folder): copy it aside before
 unpacking and back after, or re-enter your model folder when the first start asks where the model files go.
 
+**Updating from 0.93 to 0.94:** the first start downloads the 0.94 engine (SHA-256 checked) and updates the Python
+packages, then offers pictures (the picture reader, 0.97 GB, plus PyTorch; `Disable Pictures.bat` skips them). Your
+model stays. Optional: `setup-ds41-models.bat drafter-imx` makes 0.94's slightly better drafter. Voice is a separate
+opt-in: `Enable Voice.bat`.
+
 **Something wrong?** Double-click **`Start DeepSeek (debug).bat`** instead. It checks the PC and the install (a
 PASS / FAIL list), starts DeepSeek in a second window with everything it prints saved, and when you close that window
 it packs it all into `logs\debug-<time>.zip`. Attach that zip to an issue with a line on what went wrong. It holds no
@@ -88,17 +93,17 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
   while the model is writing) and stops after 10 idle minutes.
 - **Documents:** attach PDF, Word, Excel, PowerPoint and text files to a chat.
 - **Voice (optional, `Enable Voice.bat`):** talk instead of typing, have answers read aloud, or use a hands-free talk mode.
+  (On a phone over your home network, browsers allow the microphone only on HTTPS; everything else works there.)
 - **The page opens at once** and shows the model loading. **Pause** frees the memory and the graphics card (for a game)
   until your next message.
 - **Chat history** (search, pins, export), **use it from your phone** (a QR code), and downloads you can leave alone.
 - **Better with coding agents:** Claude Code's small background requests are fast and never hold up your real ones;
   pressing Esc no longer makes the next message re-read the whole conversation; chats with pictures can reuse earlier
   turns when the app sends the pictures back unchanged; an agent that repeats the same tool call 4 times gets a short note to try something else.
-- **A bit faster:** writing at the default sampling is about 5% faster on UD-IQ2_XXS at 192 GB (41.3 vs 39.2 tok/s;
-  greedy 41.7 vs 40.8, both versions measured the same evening; 42.9 / 42.2 with a second GPU).  Long prompts are
-  read faster: a fresh 60K-token prompt at 811 vs 747 tok/s, 30K at 860 vs 758, 7K at 551 vs 423 (the same evening);
-  short chat prompts read as before.  The model's later layers read only the last 128 tokens of a prompt, as DeepSeek's own design does.  New installs get a slightly better
-  drafter (0.6% more of its guesses accepted, greedy).
+- **Faster:** 41.7 tok/s on one RTX 3090 (42.9 with a second GPU), and about 5% faster at the default sampling than
+  0.93 (41.3 vs 39.2 tok/s, measured the same evening; see "Speed").  Long prompts read 9-30% faster (a fresh 60K-token
+  prompt at 811 tok/s): the model's later layers read only the last 128 tokens of a prompt, as DeepSeek's own design
+  does.  New installs get a slightly better drafter.
 - **Safer:** the server will not open itself to your network without an API key.  When it listens on your network, it
   no longer reads pictures by a file path on this PC (`"image_local_files": true` allows it).
 
