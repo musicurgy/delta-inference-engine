@@ -95,9 +95,10 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
   pressing Esc no longer makes the next message re-read the whole conversation; chats with pictures can reuse earlier
   turns when the app sends the pictures back unchanged; an agent that repeats the same tool call 4 times gets a short note to try something else.
 - **A bit faster:** writing at the default sampling is about 5% faster on UD-IQ2_XXS at 192 GB (41.3 vs 39.2 tok/s;
-  greedy 41.7 vs 40.8, both versions measured the same evening; 42.9 / 42.2 with a second GPU).  In agent sessions,
-  prompts are read about 10% faster (about 5% of a whole session; short chat prompts read as before): the model's later
-  layers read only the last 128 tokens of a prompt, as DeepSeek's own design does.  New installs get a slightly better
+  greedy 41.7 vs 40.8, both versions measured the same evening; 42.9 / 42.2 with a second GPU).  Long prompts are
+  read faster: a fresh 60K-token prompt at 811 vs 747 tok/s, 30K at 860 vs 758, 7K at 551 vs 423 (the same evening);
+  in agent sessions that is about 10% of the prompt time and about 5% of a whole session; short chat prompts read as
+  before.  The model's later layers read only the last 128 tokens of a prompt, as DeepSeek's own design does.  New installs get a slightly better
   drafter (0.6% more of its guesses accepted, greedy).
 - **Safer:** the server will not open itself to your network without an API key.  When it listens on your network, it
   no longer reads pictures by a file path on this PC (`"image_local_files": true` allows it).
@@ -116,7 +117,7 @@ the 0.93 figures may differ slightly.
 |---|---|---|---|
 | Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **41.7 tok/s** | 40.8 tok/s (41.1 on its release card) | 34 tok/s |
 | Writing, the default sampling (temperature 1, top-p 0.95) | **41.3 tok/s** | 39.2 tok/s (39.7 on its release card) | - |
-| Reading a long prompt (~64K tokens) | not measured again | up to 740 tok/s | up to 600 tok/s |
+| Reading a long prompt (~60K tokens, fresh) | **811 tok/s** (860 at ~30K) | 747 tok/s the same evening (up to 740 on its release card) | up to 600 tok/s |
 
 The two 192 GB writing rows were measured the same evening on the same PC, one version after the other, with the
 graphics card cooled down before each run.  Speeds on one PC vary by about 1% from day to day, which is why 0.93's
