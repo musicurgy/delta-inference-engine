@@ -22,7 +22,7 @@ echo Model folder: %M%
 rem "setup-ds41-models.bat pictures [on|cpu|gpu:N|main]": the pictures choice (step 5; "on" without one), saved
 rem before the space check counts them
 if /i "%~1"=="pictures" (
-  if "%~2"=="" (>"%~dp0vision-choice.txt" echo on) else (>"%~dp0vision-choice.txt" echo %~2)
+  if "%~2"=="" (>"%~dp0vision-choice.txt" echo(on) else (>"%~dp0vision-choice.txt" echo(%~2)
 )
 rem "setup-ds41-models.bat drafter-imx": an install that has 0.93's drafter downloads the drafter's shards again (7.9 GB)
 rem to make 0.94's slightly better one (step 4); without it that is done only when the full-size drafter is still here

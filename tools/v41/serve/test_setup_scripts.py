@@ -150,5 +150,37 @@ class ZipUpdate(unittest.TestCase):
         self.assertIn("when the first start asks where the model files go.", r.stdout)
 
 
+class PicturesChoice(unittest.TestCase):
+    """vision-choice.txt as Disable Pictures.bat and "setup-ds41-models.bat pictures [x]" write it.  `>file echo off`
+    is cmd's ECHO OFF command and leaves an empty file, which ds41_local reads as the default "on" (11-08 review);
+    `echo(off` writes the word."""
+
+    @unittest.skipUnless(os.name == "nt", "runs cmd.exe")
+    def test_disable_pictures_writes_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            bat = Path(d, "Disable Pictures.bat")
+            bat.write_bytes((ROOT / "Disable Pictures.bat").read_bytes())
+            r = subprocess.run(["cmd", "/d", "/c", str(bat)], cwd=d, stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(Path(d, "vision-choice.txt").read_text(encoding="ascii").strip(), "off")
+
+    @unittest.skipUnless(os.name == "nt", "runs cmd.exe")
+    def test_the_setup_pictures_argument(self):
+        text = lines(SETUP)
+        i = index(text, r'^if /i "%~1"=="pictures" \($')
+        with tempfile.TemporaryDirectory() as d:
+            harness = Path(d, "pictures.bat")
+            harness.write_text("\r\n".join(["@echo off", *text[i:i + 3], "echo done", ""]), encoding="ascii")
+            for arg, want in (("", "on"), ("off", "off"), ("on", "on"), ("cpu", "cpu"), ("gpu:1", "gpu:1")):
+                with self.subTest(arg=arg):
+                    Path(d, "vision-choice.txt").unlink(missing_ok=True)
+                    r = subprocess.run(["cmd", "/d", "/c", str(harness), "pictures", *([arg] if arg else [])], cwd=d,
+                                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertEqual(r.stdout.strip(), "done", r.stdout)   # echo stays off
+                    self.assertEqual(Path(d, "vision-choice.txt").read_text(encoding="ascii").strip(), want)
+
+
 if __name__ == "__main__":
     unittest.main()
