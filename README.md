@@ -94,8 +94,8 @@ prompts or answers, and your Windows user name is replaced by `<user>`.
 - **Better with coding agents:** Claude Code's small background requests are fast and never hold up your real ones;
   pressing Esc no longer makes the next message re-read the whole conversation; chats with pictures can reuse earlier
   turns when the app sends the pictures back unchanged; an agent that repeats the same tool call 4 times gets a short note to try something else.
-- **A bit faster:** writing (SPEED CARD: 0.94 writing tok/s on UD-IQ2_XXS at 192 GB, default sampling and greedy,
-  against 0.93's 40 / 41).  Prompts are read about 10% faster (about 5% of a whole agent session): the model's later
+- **A bit faster:** writing at the default sampling is about 5% faster on UD-IQ2_XXS at 192 GB (40.0 vs 37.9 tok/s;
+  greedy 40.7 vs 40.0, both versions measured the same evening).  Prompts are read about 10% faster (about 5% of a whole agent session): the model's later
   layers read only the last 128 tokens of a prompt, as DeepSeek's own design does.  New installs get a slightly better
   drafter (+0.6% of its guesses accepted, greedy).
 - **Safer:** the server will not open itself to your network without an API key.  When it listens on your network, it
@@ -113,13 +113,15 @@ differ slightly.
 
 | UD-IQ2_XXS (the default from 128 GB up) | 192 GB RAM, 0.94 | 192 GB RAM, 0.93 | 128 GB RAM, 0.93 |
 |---|---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **(SPEED CARD: 0.94 greedy tok/s)** | 41 tok/s | 34 tok/s |
-| Writing, the default sampling (temperature 1, top-p 0.95) | **(SPEED CARD: 0.94 default-sampling tok/s)** | 40 tok/s | - |
-| Reading a long prompt (~64K tokens) | **(SPEED CARD: 0.94 ~64K-token prompt read, tok/s; or drop this cell)** | up to 740 tok/s | up to 600 tok/s |
+| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **40.7 tok/s** | 40.0 tok/s (41.1 on its release card) | 34 tok/s |
+| Writing, the default sampling (temperature 1, top-p 0.95) | **40.0 tok/s** | 37.9 tok/s (39.7 on its release card) | - |
+| Reading a long prompt (~64K tokens) | not measured again | up to 740 tok/s | up to 600 tok/s |
 
-The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  Greedy means temperature 0 in the
+The two 192 GB writing rows were measured the same evening on the same PC, one version after the other, with the
+graphics card cooled down before each run.  Speeds on one PC vary by a few percent from day to day, which is why 0.93's
+own release card is a little higher than its run here.  The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  Greedy means temperature 0 in the
 request; the default sampling is what a client gets when it sends no temperature.  Sampling accepts fewer of the
-drafter's guesses, so it writes a little slower (0.93: ds4 Q2 40.7 -> 40.3 tok/s, UD-IQ2_XXS 41.1 -> 39.7).  0.93 narrowed
+drafter's guesses, so it writes a little slower (0.93: ds4 Q2 40.7 -> 40.3 tok/s, UD-IQ2_XXS 41.1 -> 39.7; 0.94: UD-IQ2_XXS 40.7 -> 40.0).  0.93 narrowed
 that gap from ~12%: the drafter's guesses are now
 sampled instead of taken as its top pick (`STRATA_DSPARK_SAMPLE` in `Start DeepSeek.bat`); the answers'
 distribution is unchanged.
