@@ -59,6 +59,9 @@ struct Ds41DenseConfig {
     bool    elastic_cols = false;
     bool    win_floor = false;         ///< STRATA_ENC_BOUND: allocate the second window mask (set_window_floor)
     bool    vision = false;            ///< opt-in image embeddings, VL routing and Engram masking
+    /// STRATA_SNAP_TAIL (serve; 0 = off): window rows kept per snapshot past the ring's spare 16, so a request that
+    /// shares a prefix ending up to this far before a snapshot resumes there (snap_tail_resume) instead of re-reading.
+    int     snap_tail = 0;
 };
 
 class Ds41Dense {
@@ -71,6 +74,9 @@ public:
 
     bool init(const std::string & gguf, const Ds41DenseConfig & cfg, std::string & err);
     const strata::v41::Ds41Geometry & geom() const;
+    /// The window ring's spare slots (RAW - SWA = 16): a live rewind to rs is exact only if rs >= (highest position
+    /// written into the live rings) - ring_spare() (D11 ring fix B, AUDITS_AND_PORTS.md "Audit ring-tags").
+    int64_t ring_spare() const;
     /// Vision was enabled at init and the model carries the per-layer VL routing biases.
     bool vision() const;
     /// This request's image span rows: `rows` is n_rows * n_embd floats, `pos` the n_rows absolute prompt positions
@@ -116,6 +122,11 @@ public:
     const int32_t * batch_ids() const;
     const float * batch_wts() const;
     const float * batch_fn() const;
+    /// The MoE-input rows on the card (o_fn, [n_embd, columns]; null on the CPU backend) - a wide prompt batch's tier
+    /// call reads them there (Ds41MoeTier::run_chunk_xdev, STRATA_WIDE_PROMPT).
+    const float * batch_fn_dev() const;
+    /// Whether attn_router_span copies fn to the host (batch_fn); default on.  Off: batch_fn() keeps stale rows.
+    void set_batch_fn_host(bool on);
     int batch_size() const;
     /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,
     /// comb_f).  `routed_host` is n_embd * B (token-major); call once per layer, before the sub-batches' finishes.
@@ -123,8 +134,15 @@ public:
     /// The routed-sum input tensor's device memory (columns of n_embd floats; null on the CPU backend): the tier can
     /// write a layer-major batch's routed sums straight into it (run_chunk_dev) instead of upload_routed's host trip.
     float * routed_dev();
+    /// STRATA_BM_PREFILL_READAHEAD (the tier's prompt read-ahead; a GUESS, the routing is never taken from it): layer
+    /// next_il's router applied to layer il's routed-expert input (the batch's o_fn columns [col0, col0 + n), written by
+    /// attn_router_span(il)), rescaled from il's ffn_norm to next_il's; ids gets each column's top k experts by the
+    /// selection score (n * k, token-major).  Call after layer il's spans, before its tier.  False = no guess.
+    bool guess_route(int il, int next_il, int col0, int n, int k, int32_t * ids);
     /// The dense stream waits (on the card, no host sync) for a CUDA event recorded elsewhere (cudaEvent_t as void*).
     bool wait_event(void * cuda_event);
+    /// Records a CUDA event (cudaEvent_t as void*) on the dense stream - measurement only (STRATA_DMA_TRACE).
+    bool record_event(void * cuda_event);
     bool finish_span(int il, int col0, int n);
     /// STRATA_DENSE_PROF=1: print + reset the batch dense split (build / alloc / compute / Engram / readback) - diagnostic
     void prof_report(const char * tag);
@@ -194,6 +212,37 @@ public:
     /// layer's attention (attn_router_launch), so the prefetch the prediction drives overlaps it.
     bool predict_multi_launch(int il);
     bool predict_multi_wait(int * top_ids);
+    /// STRATA_X3B=1 (opt-in): attn_router_collect split in two - issue (the readbacks, an event
+    /// behind them, the late shared expert: the same stream order as collect) and wait (that event, NOT a stream sync,
+    /// so work queued behind it does not hold the host).  Between them x3b_prelaunch(il) queues finish(il) +
+    /// predict_multi_launch(il + 1) + attn_router_launch(il + 1) behind a device-side gate that x3b_release opens once
+    /// the tier's routed sum for il has landed.  The same graphs in the same stream order; only the host launches move.
+    bool x3b_on() const;
+    bool attn_router_collect_issue(int il);
+    bool attn_router_collect_wait(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev = nullptr);
+    /// 1: gated and launched (the caller then skips finish(il) and layer il + 1's two launches, and opens the gate with
+    /// x3b_release); 0: declined, nothing queued (a graph not warm yet, an Engram layer next, ...); -1: error (last_error).
+    /// spec_il >= 0: layer il + 1's iteration starts with the D3 spec prediction predict_multi(spec_il) (STRATA_D3_SPEC,
+    /// file tier) - it is queued too, in its place after finish(il); 2 = launched with it (the caller collects its rows
+    /// with x3b_spec_wait instead of calling predict_multi(spec_il))
+    int x3b_prelaunch(int il, int spec_il = -1);
+    bool x3b_spec_wait(int * top_ids);   ///< the pre-launched spec prediction's rows (waits for its readback only)
+    /// open layer il's gate behind the tier's sum event (null: the tier already synced its sum on the host); false if il
+    /// is not the armed layer (the invariant: one arm, one release, same layer)
+    bool x3b_release(void * sum_event, int il);
+    void x3b_abort();   ///< error paths: open an armed gate at once (the pass is failing anyway)
+    bool x3b_check();   ///< false (last_error) if a gate timed out (watchdog / spin) or a host sync hit an armed gate
+    bool x3b_armed() const;   ///< a gate is armed and not yet released (the caller's end-of-layer invariant)
+    /// the decode thread's host phase while a gate is armed (strata::v41::X3B_PH_*: 2 router readback wait, 3 tier
+    /// call, 4 release call, 5 past the release) - the watchdog and a timeout's description name it
+    void x3b_note(int il, int phase);
+    /// STRATA_X3B_STATS=1 (X3B on or off; measurement only): GPU idle gap from layer il's routed sum to the dense
+    /// stream's next start, and host ms launching (pre-launched vs while the card waits); one "x3b:" line every
+    /// STRATA_X3_STATS_EVERY passes
+    bool x3b_stats_on() const;
+    void x3b_mark_sum(int il, void * sum_event);   ///< the sum landed (a timing event behind it)
+    void x3b_mark_go(int il);                       ///< the dense stream's next start (recorded just before its next launch)
+    void x3b_stats_pass(int rows, int layers_pre, double host_pre_ms, double host_blocked_ms);   ///< after the head
     /// finish_predict + the routing predictions of the `ahead` layers after next_il, from the same state, in the same
     /// graph: ahead_ids[a * 16 ..] = layer next_il + 1 + a's top 16 (-1 past the last layer).  For speculative
     /// file-tier reads; a hint only.
@@ -201,6 +250,24 @@ public:
                               int * ahead_ids);
     /// Logits of rows row0..row0+nrows-1 of the pass after the last layer's finish: nrows * n_vocab floats.
     bool logits(int row0, int nrows, float * out);
+    /// STRATA_PINNED_STAGE (default on): a pinned host buffer of at least n floats for logits(), owned by this object
+    /// and allocated at init (16 rows); nullptr = none that size (use a pageable buffer).  One buffer: the next call's
+    /// logits overwrite the last.
+    float * logits_host(size_t n);
+    /// Attention-sink watch (STRATA_SINK_TRACE=1 or STRATA_SINK_REJECT=<threshold> > 0; off = no extra work anywhere):
+    /// every logits() call also reads back column STRATA_SINK_COL (default 2455) of the four hc residual streams of
+    /// its rows (the state after the last layer's hc_post, before the head's hc_pre / output_norm - spark-ds41f's tap),
+    /// up to kSinkRows rows: one 4-byte async copy per (row, stream) into pinned memory, then one stream sync.
+    /// With STRATA_SINK_TRACE the same column is also read at the entry of layer STRATA_SINK_LAYER + 1 (default 20:
+    /// the state after block 20) on the single-pass paths (attn_router / attn_router_launch), with no added sync.
+    static constexpr int kSinkRows = 32;
+    bool sink_watch() const;
+    int sink_layer() const;              ///< the tap layer of the trace (STRATA_SINK_LAYER, default 20)
+    int sink_rows() const;               ///< rows the last logits() call captured (0 = watch off / none)
+    long sink_seq() const;               ///< logits() calls captured so far (tells a fresh capture from a stale one)
+    /// max over the hc streams of |x[col]| for row r of the last logits() call; mid = at the tap layer (-1 = not
+    /// captured in this pass); a NaN reads as 0 (spark-ds41f's nan_to_num)
+    float sink_value(int r, bool mid) const;
     /// Conversation reuse: every cache is position-indexed except the window ring and the ratio-2 compressor state
     /// ring, so a snapshot is those rings (~11 MB) + its position; restore() rewinds to it (decoding continues at
     /// snapshot_pos()).  Positions past a rewind point are overwritten when decoded again (rows past a query's
@@ -230,6 +297,31 @@ public:
     std::shared_ptr<SavedConv> save_conv(int64_t positions);
     bool load_conv(const SavedConv & s);
     static size_t saved_bytes(const SavedConv & s);
+    /// STRATA_SNAP_TAIL (Ds41DenseConfig::snap_tail > 0): every snapshot also keeps, in host memory, the window rows of
+    /// up to RAW + snap_tail positions below it (a tail ring written beside the window ring), shared by its park /
+    /// SavedConv.  A resume at an EVEN position rs below the snapshot is then exact when those rows cover
+    /// [rs - SWA + 1, rs): restore() first, then snap_tail_resume(rs) writes them into the window ring and the request
+    /// re-feeds from rs (every other cache is position-indexed; an even rs starts a fresh ratio-2 compressor group).
+    /// *_tail_from(): the lowest such rs (-1 = none).  tail_rows(): the tail ring's rows (0 = off).
+    struct SnapTail;
+    int64_t tail_rows() const;
+    int64_t snap_tail_from() const;
+    int64_t parked_tail_from() const;
+    int64_t saved_tail_from(const SavedConv & s) const;
+    int64_t snap_tail_kept() const;   ///< positions the current snapshot's tail covers (0 = none)
+    /// The layers past the last kv source hold exact rows only where a read ran them (enc-skip): the caller resumes
+    /// at a point that re-runs what a full read would (ds41_generate.cpp tail_point).
+    bool snap_tail_resume(int64_t rs);
+    /// STRATA_SHARED_PREFIX (serve): a restore point at the end of a prompt's leading system + tools block that
+    /// other conversations starting with the same tokens resume from.  arm_prefix_capture(pos) (pos > 0; -1 disarms and
+    /// drops the capture) makes the read copy every layer's rings to host memory at the end of the layer-major span that
+    /// ends at position pos (a sub-batch boundary); after the read, take_prefix_capture(pos) returns a SavedConv of that
+    /// position - those rings + rows [0, pos] of the position-indexed caches, which the read leaves in place - for
+    /// load_conv() + restore().  null (and disarmed either way) when pos is odd or a needed layer was not captured (no span
+    /// ended at pos): every layer up to the last kv source, and with need_all (no enc-skip) every layer.  The state has
+    /// no window floor and no tail: the resuming request sets the floor a full read of ITS prompt uses (tail_point).
+    void arm_prefix_capture(int64_t pos);
+    std::shared_ptr<SavedConv> take_prefix_capture(int64_t pos, bool need_all);
     /// Engram's token history for positions pos0..pos0+n-1: a restored conversation's n-grams look back over positions
     /// that another conversation may have written since (begin() only records the tokens a pass feeds).
     void set_history(const int * ids, int64_t n, int64_t pos0 = 0);
@@ -239,9 +331,19 @@ public:
     /// after finish_span (the serve DSpark seed reads its main_hidden there instead of re-running the tail as passes).
     bool read_state_cols(int c0, int n, std::vector<float> & x);
     /// Resize the state columns to max(S, min(nc, prompt_batch)) between passes (drops every cached graph); columns()
-    /// is the current count.  A no-op when unchanged.
-    bool set_columns(int nc);
+    /// is the current count.  A no-op when unchanged.  hap_in_state (STRATA_WIDE_PROMPT, a wide prompt batch's
+    /// columns only): the FFN's hc state (hap) is a view of x_state instead of its own tensor (-64 KiB a column,
+    /// exact); a change of it alone reallocates the columns too.  Every other caller keeps the default (hap its own).
+    bool set_columns(int nc, bool hap_in_state = false);
+    /// Whether the current columns keep hap in x_state (set_columns' hap_in_state; after init: fixed columns with
+    /// STRATA_WIDE_PROMPT set, else false).
+    bool hap_in_state() const;
     int columns() const;
+    /// The device bytes set_columns(nc, hap_in_state) would allocate for the state columns (nc raised to at least the
+    /// sub-batch S; NOT capped at the prompt batch, so a caller can take differences between widths): the sum of the
+    /// column tensors' sizes, counted from the geometry, nothing allocated.  The wide prompt
+    /// budget (STRATA_PROMPT_SWEEP_FIT, ds41_generate.cpp) sizes the batch width from it.
+    size_t state_bytes(int nc, bool hap_in_state) const;
     /// Gate tap: an index source layer's top-k rows of the current pass (n * K ints, token-major; K = min(cap, top-k))
     /// and their visibility mask; empty for other layers.
     bool read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K);

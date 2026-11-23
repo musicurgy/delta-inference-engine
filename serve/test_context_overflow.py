@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import CTX_SLACK, ByteTokenizer, MockEngine, Service, serve
+from serve.server import CTX_SLACK, DEFAULT_MAX_TOKENS, ByteTokenizer, MockEngine, Service, serve
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 131072
@@ -85,6 +85,28 @@ class ContextOverflow(unittest.TestCase):
                         else:
                             self.assertEqual(set(error), {"type", "message"})
 
+    def test_messages_lead_with_anthropic_s_wording_so_claude_code_compacts(self):
+        # Claude Code decides from the words: "prompt is too long" compacts, "input length and `max_tokens` exceed
+        # context limit" shortens max_tokens; an unknown 400 stopped the session.  Our sentence stays after it.
+        for stream in (False, True):
+            for prompt, budget, lead in (
+                    (150722, 16, f"prompt is too long: 150722 tokens > {CTX - CTX_SLACK - 1} maximum; "),
+                    (150722, None, f"prompt is too long: 150722 tokens > {CTX - CTX_SLACK - 1} maximum; "),
+                    (1024, CTX, f"input length and `max_tokens` exceed context limit: 1024 + {CTX} > "
+                                f"{CTX - CTX_SLACK}; ")):
+                with self.subTest(stream=stream, prompt=prompt, budget=budget):
+                    status, _, body = self.post("/v1/messages", "max_tokens", prompt, budget, stream)
+                    self.assertEqual(status, 400, body)
+                    self.assertEqual(body["type"], "error")
+                    self.assertEqual(body["error"]["type"], "invalid_request_error")
+                    message = body["error"]["message"]
+                    self.assertTrue(message.startswith(lead), message)
+                    self.assertIn("request exceeds the context window", message)
+        for path, key in (("/v1/chat/completions", "max_tokens"), ("/v1/responses", "max_output_tokens")):
+            with self.subTest(path=path):               # the other APIs keep OpenAI's wording first
+                status, _, body = self.post(path, key, 150722, 16)
+                self.assertTrue(body["error"]["message"].startswith("request exceeds the context window"), body)
+
     def test_one_token_of_room_still_answers_but_zero_is_rejected(self):
         for path, key in APIS:
             for fit in (False, True):
@@ -110,7 +132,28 @@ class ContextOverflow(unittest.TestCase):
                     else:
                         prepared, _, maximum = self.svc.prepare([], None, {}, budget)
                         self.assertEqual(prepared, ids)
-                        self.assertEqual(maximum, 1 if budget == 1 else room)
+                        unset = budget is None or budget <= 0     # 11-15: no max_tokens -> the 60K default
+                        self.assertEqual(maximum, 1 if budget == 1 else
+                                         min(room, self.svc.default_max_tokens) if unset else room)
+
+    def test_default_max_tokens_caps_only_unset_requests(self):
+        # 11-15: no max_tokens (None, 0, -1) -> at most default_max_tokens; an explicit one is kept; 0 = the rest
+        ids = [ord("x")] * 1024
+        room = CTX - CTX_SLACK - len(ids)
+        self.assertEqual(DEFAULT_MAX_TOKENS, 61440)
+        saved = self.svc.default_max_tokens
+        try:
+            with mock.patch.object(self.svc, "encode_prompt", return_value=ids):
+                self.svc.default_max_tokens = 100
+                for budget in (None, 0, -1):
+                    self.assertEqual(self.svc.prepare([], None, {}, budget)[2], 100)
+                self.assertEqual(self.svc.prepare([], None, {}, 500)[2], 500)
+                self.svc.default_max_tokens = room + 50     # more than the room: the room
+                self.assertEqual(self.svc.prepare([], None, {}, None)[2], room)
+                self.svc.default_max_tokens = 0             # off: the rest of the context
+                self.assertEqual(self.svc.prepare([], None, {}, None)[2], room)
+        finally:
+            self.svc.default_max_tokens = saved
 
 
 if __name__ == "__main__":

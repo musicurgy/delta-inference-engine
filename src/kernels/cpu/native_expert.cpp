@@ -11,6 +11,7 @@
 #include "strata/kernels/cpu/nvfp4_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/ptq1_0.hpp"
+#include "strata/kernels/cpu/q8_1_cpu.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -144,6 +145,7 @@ bool q8k_avx1(int type) {
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     if (f.gu_act == kExl3ActType) { exl3_native_quant(x, f.n_embd, dst); return; }   // Delta: EXL3 takes F32
+    if (cpu_q8_1_act(f.gu_act)) { q8_1_quant_row(x, dst, f.n_embd); return; }      // STRATA_CPU_Q8_1: the card's q8_1
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     if (q8k_avx1(f.gu_act)) { q8k_quant_avx1(x, dst, f.n_embd); return; }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
@@ -151,6 +153,7 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     if (f.d_act == kExl3ActType) { exl3_native_quant(h, f.n_ff, dst); return; }   // Delta: EXL3 takes F32
+    if (cpu_q8_1_act(f.d_act)) { q8_1_quant_row(h, dst, f.n_ff); return; }        // STRATA_CPU_Q8_1: the card's q8_1
     if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
     if (q8k_avx1(f.d_act)) { q8k_quant_avx1(h, dst, f.n_ff); return; }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
@@ -178,6 +181,34 @@ int native_gu_mt_min(int gu_type) {
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
     if (is_exl3_type(f.gu_type)) { exl3_native_gu_rows(f, blob, act, nt, ff, r0, r1); return; }   // Delta: EXL3
+    if (cpu_q8_1_act(f.gu_act)) {   // STRATA_CPU_Q8_1: q8_1 activations (q8_1_cpu.hpp), then the SwiGLU below's expression
+        const int n = (int) f.n_embd;
+        const bool mx = f.up_type >= 0 && f.up_type != f.gu_type;
+        thread_local std::vector<float> gb, ub;
+        const size_t FFN = (size_t) f.n_ff;
+        if (gb.size() < (size_t) nt * FFN) { gb.resize((size_t) nt * FFN); ub.resize((size_t) nt * FFN); }
+        float* gq[MAXT];
+        float* uq[MAXT];
+        for (int t = 0; t < nt; ++t) { gq[t] = gb.data() + (size_t) t * FFN; uq[t] = ub.data() + (size_t) t * FFN; }
+        q8_1_rows(f.gu_type, blob, f.gu_row, n, act, nt, gq, r0, r1);
+        q8_1_rows(mx ? f.up_type : f.gu_type, blob + f.up_off, mx ? f.up_row : f.gu_row, n, act, nt, uq, r0, r1);
+        float sg = 1.f, su = 1.f;
+        if (f.tail_off) {
+            float tail[4];
+            std::memcpy(tail, blob + f.tail_off, sizeof tail);
+            sg = tail[0];
+            su = tail[1];
+        }
+        const float lim = f.swiglu_limit;
+        for (int t = 0; t < nt; ++t)
+            for (int r = r0; r < r1; ++r) {
+                float g = gq[t][r] * sg, u = uq[t][r] * su;
+                g = std::min(g, lim);
+                u = std::min(std::max(u, -lim), lim);
+                ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            }
+        return;
+    }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
@@ -298,6 +329,16 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
     if (is_exl3_type(f.d_type)) { exl3_native_down_rows(f, blob, hq, nt, out, r0, r1); return; }   // Delta: EXL3
+    if (cpu_q8_1_act(f.d_act)) {   // STRATA_CPU_Q8_1: q8_1 hidden (native_quant_h), the card's per-block rules
+        q8_1_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        if (f.tail_off) {
+            float sd = 1.f;
+            std::memcpy(&sd, blob + f.tail_off + 2 * sizeof(float), sizeof sd);
+            for (int t = 0; t < nt; ++t)
+                for (int r = r0; r < r1; ++r) out[t][r] *= sd;
+        }
+        return;
+    }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;

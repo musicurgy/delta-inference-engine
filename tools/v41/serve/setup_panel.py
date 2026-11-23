@@ -21,7 +21,58 @@ import pick_model as P  # noqa: E402
 
 ROOT = P.ROOT
 SETTINGS = os.path.join(ROOT, "delta-settings.json")
-MODES = {"fast": "0.28", "balanced": "0.10", "exact": "0"}     # the route bias of each choice on the page
+MODES = {"fast": "0.28", "balanced": "0.10", "exact": "0"}     # the route bias of each choice on the page ("balanced" = Quality)
+# Measured on the 0.95 release engine, RTX 3090, real RAM: general-text top-1 agreement with DeepSeek's own model and
+# greedy writing tok/s, at 192 / 128 / 96 / 64 GB.  None = not measured.  Exact routing agrees the same at any RAM size.
+MEASURED = {
+    "UD-IQ2_XXS": {"fast": [(91.1, 43.7), (90.5, 43.7), (89.5, 41.6), (87.8, 36.2)],
+                   "balanced": [(92.5, 36.5), (91.9, 37.0), (91.6, 35.4), (90.1, 28.9)],
+                   "exact": [(93.1, 32.5), (93.1, 26.0), (93.1, 20.0), (93.1, 11.5)]},
+    "UD-IQ1_M": {"fast": [(89.4, 48.1), (None, 46.6), (89.6, 46.2), (87.7, 41.5)],
+                 "balanced": [None, None, (90.0, 40.2), (89.9, 35.2)],
+                 "exact": [(91.2, None), (91.2, None), (91.2, 26.1), (91.2, 15.8)]},
+    "UD-IQ1_S": {"fast": [(89.1, 49.8), (None, 48.9), (87.9, 48.5), (86.6, 45.0)],
+                 "balanced": [None, None, (89.6, 43.9), (88.8, 40.3)],
+                 "exact": [(90.0, None), (90.0, None), (90.0, 32.5), (90.0, 20.0)]},
+    "UD-IQ3_XXS": {"fast": [(93.0, 27.1), (92.1, 25.8), (None, 23.2), (None, 18.7)],
+                   "balanced": [(95.0, 22.8), (93.4, 22.9), None, None],
+                   "exact": [(95.5, 17.4), (95.5, 12.9), None, None]},
+}
+
+
+def _quant(model_id: str):
+    up = os.path.basename(str(model_id or "")).upper()
+    return next((q for q in MEASURED if q in up), None)
+
+
+def mode_notes(model_id, ram) -> dict:
+    """{mode: "89.9% agreement, 35 tok/s"} for this model at this PC's RAM, as measured ("" where it was not)"""
+    q = _quant(model_id)
+    out = {}
+    for mode in MODES:
+        cell = None
+        if q and ram is not None:
+            cell = MEASURED[q][mode][0 if ram >= 170 else 1 if ram >= 110 else 2 if ram >= 80 else 3]
+        parts = []
+        if cell and cell[0] is not None:
+            parts.append(f"{cell[0]:.1f}% agreement")
+        if cell and cell[1] is not None:
+            parts.append(f"{cell[1]:.0f} tok/s")
+        out[mode] = ", ".join(parts)
+    return out
+
+
+def default_mode(model_id, ram) -> str:
+    """the switch's position when the user never set it: Quality for a 1-bit file under LOW_RAM_GB, else Fast
+    (ds41_local.route_bias_choice does the same at start)"""
+    q = _quant(model_id)
+    return "balanced" if ram is not None and ram < P.LOW_RAM_GB and q in ("UD-IQ1_M", "UD-IQ1_S") else "fast"
+
+
+def chosen_mode(s: dict):
+    """the user's own choice on the switch, or None (then default_mode applies)"""
+    m = s.get("mode")
+    return m if m in ("balanced", "exact") or (m == "fast" and s.get("mode_chosen")) else None
 CUSTOM = "custom"                                              # the folder inside the model folder
 RESTART_EXIT = 75                                              # serve_ds41.py's exit code: Start DeepSeek.bat starts it again
 
@@ -103,10 +154,8 @@ def _speed(tps: str, ram) -> str:
 def recommended(ram) -> str:
     """the name pick_model recommends for this RAM"""
     if ram is not None and ram < P.LOW_RAM_GB:
-        return P.LOW_RAM_PICK
-    if ram is not None and ram >= P.HIGH_RAM_GB:
-        return P.HIGH_RAM_PICK
-    return "default"
+        return P.LOW_RAM_PICK   # UD-IQ1_M, at route bias 0.10 there (ds41_local.LOW_RAM_BIAS)
+    return P.PICK
 
 
 def catalog(m=None) -> dict:
@@ -114,7 +163,7 @@ def catalog(m=None) -> dict:
     m = m or P.models_dir()
     ram = P.ram_gb()
     rec = recommended(ram)
-    base = P.Q2 if os.path.exists(os.path.join(m, P.Q2)) else P.SLIM if os.path.exists(os.path.join(m, P.SLIM)) else None
+    base = P.Q2 if P.Q2 and os.path.exists(os.path.join(m, P.Q2)) else P.SLIM if P.SLIM and os.path.exists(os.path.join(m, P.SLIM)) else None
     cur = P.current()
     now = cur if cur and os.path.exists(cur if os.path.isabs(cur) else os.path.join(m, cur)) else base
     rows = []
@@ -122,7 +171,8 @@ def catalog(m=None) -> dict:
     def add(id_, name, gb, tps, agr, installed, is_rec=False, needs_default=False):
         rows.append({"id": id_, "name": name, "gb": gb, "speed": _speed(tps, ram), "agreement": agr, "installed": installed,
                      "current": bool(id_) and id_ == now, "recommended": is_rec,
-                     "blocked": "needs the default model installed" if needs_default and not base else ""})
+                     "modes": mode_notes(id_ or name, ram), "default_mode": default_mode(id_ or name, ram),
+                     "blocked": "needs the ds4 Q2 GGUF installed" if needs_default and not base else ""})
 
     add(base or "", P.DEFAULT[0], P.DEFAULT[1], P.DEFAULT[2], P.DEFAULT[3], bool(base), rec == "default")
     for q, (gb, tps, agr, eng) in P.UNSLOTH_Q.items():
@@ -141,11 +191,12 @@ def catalog(m=None) -> dict:
         if c["ok"]:
             rows.append({"id": c["id"], "name": c["name"] + " (your own)", "gb": None, "speed": "", "agreement": "", "installed": True,
                          "current": c["id"] == now, "recommended": False,
-                         "blocked": "needs the default model installed" if c["needs_default"] and not base else ""})
+                         "modes": {k: "" for k in MODES}, "default_mode": default_mode(c["id"], ram),
+                         "blocked": "needs the ds4 Q2 GGUF installed" if c["needs_default"] and not base else ""})
     s = load_settings()
     gpus = list_gpus()
     return {"ram_gb": ram, "models": rows, "refused": [c for c in custom if not c["ok"]], "custom_folder": os.path.join(m, CUSTOM),
-            "mode": s.get("mode") if s.get("mode") in MODES else "fast", "gpus": gpus, "multi_gpu": bool(s.get("multi_gpu")),
+            "mode": chosen_mode(s), "gpus": gpus, "multi_gpu": bool(s.get("multi_gpu")),
             "helper_gpu": helper_gpu(gpus), "bias_override": "DS41_ROUTE_BIAS" in os.environ, "health": pc_health(),
             "phone": phone_state(s), "auto_pause_mib": int(s.get("auto_pause_mib") or 0)}
 
@@ -317,6 +368,7 @@ def apply(req: dict) -> dict:
             f.write(model + "\n")
     if mode is not None:
         s["mode"] = mode
+        s["mode_chosen"] = True      # from now on Fast means Fast, also where this PC's default is Quality
     if "multi_gpu" in req:
         s["multi_gpu"] = bool(req["multi_gpu"])
     if "phone" in req:

@@ -48,6 +48,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <limits>
@@ -70,7 +72,10 @@ struct Ds41MoeGeom {
     int64_t n_ff = 2048;        ///< n_ff of one routed expert
     int64_t n_layers = 43;      ///< layers that route
     int64_t n_experts = 256;    ///< experts per layer
-    int64_t top_k = 6;          ///< experts routed per token
+    int64_t top_k = 6;          ///< experts routed per token (STRATA_EXPERTS_USED's k when set)
+    /// the model's own experts per token (the GGUF's expert_used_count; 0 = top_k): the stride of a recorded routing
+    /// profile (ds4routes.bin), which STRATA_EXPERTS_USED does not change
+    int64_t model_top_k = 0;
     int gu_type = 16;           ///< GGML_TYPE_IQ2_XXS (gate and up)
     int d_type = 10;            ///< GGML_TYPE_Q2_K (down)
     /// `deepseek4.swiglu_clamp_exp` (10.0 on every layer of the 0731 GGUF; one value - the tier has one format):
@@ -264,9 +269,23 @@ public:
     /// Writes the mirror: `order` coldest first, until `budget` bytes.  Returns false with `err` on failure.
     bool build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget,
                       std::string& err) const;
+    /// STRATA_FILE_TIER_UNMAP (ds41_unmap.hpp): closes every shard's buffered handle - read() and read_part's fallback then
+    /// read through the O_DIRECT twins and a pooled bounce (the same bytes; an unbuffered read that still fails takes a
+    /// one-off buffered handle) - and touches each shard unbuffered (ds41_unbuffered_touch).  Call once the arena is
+    /// filled, while no reader runs.  False (why says it) when a shard has no O_DIRECT twin or reads are buffered
+    /// (STRATA_BLOB_DIRECT=0 / STRATA_DECODE_DIRECT=0); nothing changes then.
+    bool drop_buffered(std::string& why);
+    /// ds41_unbuffered_touch over the shards again (after a later load mapped them: each Ds41DSpark init).  No-op
+    /// unless drop_buffered succeeded.
+    void touch_unbuffered() const;
+    bool unbuffered() const { return unbuffered_; }
 
 private:
     struct Span { uint64_t off = 0, bytes = 0; };
+    bool unbuffered_ = false;             ///< drop_buffered done: sfd_ closed (-1), every read goes O_DIRECT
+    std::vector<std::string> spath_;      ///< each shard's file, in tag order (sfd_ / sdfd_'s)
+    /// [off, off + n) (a tagged offset) through the buffered fd, or - after drop_buffered - a one-off buffered handle
+    void pread_any(uint64_t off, uint8_t* dst, uint64_t n) const;
     void spans(int64_t l, int64_t e, Span s[3]) const;
     /// One 4096-aligned `pread` of [off, off+n) through the O_DIRECT twin fd, sliced out of `scratch`.  False when
     /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
@@ -319,6 +338,31 @@ std::vector<std::pair<int32_t, int32_t>> ds41_read_ranked(const std::string& pat
 void ds41_cuda_schedule_from_env(int device = -1);
 /// --gpus: a CUDA device's name and free / total memory (makes its context).  False without CUDA or a bad index.
 bool ds41_cuda_device_info(int device, std::string& name, size_t& free_bytes, size_t& total_bytes);
+/// STRATA_VRAM_QUANT_MIB=N (default 128; 0 = the raw reading, the behaviour up to 0.94): every free-VRAM reading that
+/// decides an expert-slot count, a prompt-batch width or a staging size is rounded DOWN to N MiB before it is used.
+/// Measured (14 launches of the real launcher, same model, settings and seeded requests): the text came in exactly
+/// two variants, predicted by the warmup batch's "cache kept ... (509 | 510 tail slots out)" - cudaMemGetInfo moves by a
+/// few MB from launch to launch, one VRAM slot more or less moves an expert between the GPU and the CPU / PCIe paths
+/// (a different float summation order) and so the text.  Rounding down only ever uses less VRAM than the raw reading
+/// (the margins keep their meaning); the cost is under N MiB per decision (128 MiB = ~10 slots of ~12 MiB).  A reading
+/// that sits on a bin edge can still flip between launches (odds ~ jitter / N).  The first reading of each `site` is
+/// logged, raw and rounded.
+size_t ds41_vram_quant_mib();
+/// The reading `site` uses (above).  Measurement aids, all off by default (no env = the rounded live reading, as before):
+///   STRATA_VRAM_TRACE=1        every call logs "vram trace: #seq site call k: raw .. MiB -> rounded .. MiB -> used .. MiB
+///                              (live | replay | clamp)", and the caller's ds41_vram_decision line what it decided from it.
+///   STRATA_VRAM_RECORD=<file>  appends "site<TAB>k<TAB>raw<TAB>used" (bytes) per call, flushed at once (a crash keeps it).
+///   STRATA_VRAM_REPLAY=<file>  the k-th call of a site uses the k-th reading a RECORD run logged for that site, so two runs
+///                              (A/B arms: an exact switch moving the engine's own VRAM by a few MiB, or plain launch
+///                              jitter across a 128 MiB bin edge) size the cache, its keep-cache tail and the prompt batch
+///                              identically - the same expert placement.  OOM guard: a recorded reading above this run's
+///                              raw one by more than STRATA_VRAM_REPLAY_SLACK_MIB (default 64; every site's own margin is
+///                              >= 768 MiB) is not used - the live rounded reading is ("vram replay: CLAMP ..." each time:
+///                              that run's placement may differ, void it).  A site with no k-th record uses live readings
+///                              from there on (said once).  Lower recorded readings are used as they are (less VRAM: safe).
+size_t ds41_vram_quant(size_t free_bytes, const char* site);
+/// STRATA_VRAM_TRACE=1: "vram trace: #seq site -> <decision>" for `site`'s latest ds41_vram_quant reading.  No-op otherwise.
+void ds41_vram_decision(const char* site, const char* fmt, ...);
 /// Between requests: a GPU fault leaves the context failing every later call, so end the engine (exit 3) and the server
 /// starts a fresh one for the next request.  Returns when the GPU is fine.
 void ds41_end_if_gpu_fault();
@@ -442,6 +486,47 @@ struct Ds41MoeStats {
     int64_t lookups() const { return hits + cpu + pcie + skipped + remote; }
 };
 
+/// STRATA_DMA_TRACE=1 (measurement only, default off): the batched tier calls' (gpu_run_n_ex: every DSpark / verify /
+/// decode pass) expert-DMA picture, summed since the last Ds41MoeTier::dma_trace_take().  Distinct experts per call.
+/// The GPU waits come from timing-event pairs: the ms the tier stream sat at a cudaStreamWaitEvent before the copies it
+/// waited for were home (prefetch: ev_pf; demand: the s_dn waves and tail).  Counts and timing only - no work changes.
+struct Ds41DmaTrace {
+    int64_t calls = 0;               ///< tier calls (one per routed layer per pass)
+    int64_t hits = 0;                ///< VRAM hits, prefetch-served ones included
+    int64_t pcie = 0;                ///< arena misses DMA'd (PCIE class)
+    int64_t file = 0;                ///< file-tier misses read and DMA'd (FILEG)
+    int64_t cpu = 0;                 ///< misses the CPU pool computed
+    int64_t pf_issued = 0;           ///< prefetch DMAs started (prefetch_multi + prefetch_next)
+    int64_t pf_used = 0;             ///< ... whose expert the call then routed (served from the prefetch slot)
+    double demand_bytes = 0;         ///< H2D bytes of the demand copies (PCIE + FILEG; LRU straight-to-slot included)
+    double pf_bytes = 0;             ///< H2D bytes of the prefetch copies
+    double wait_pf_ms = 0;           ///< GPU: tier stream stalled on the prefetch DMA
+    double wait_dn_ms = 0;           ///< GPU: tier stream stalled on the demand DMAs
+    double issue_ms = 0;             ///< host: call entry -> the demand copies flushed to the card
+    double call_ms = 0;              ///< host: wall of the tier calls
+    int64_t waits = 0;               ///< event pairs measured
+    int64_t waits_lost = 0;          ///< ... dropped (the pair pool was full)
+    int64_t early = 0;               ///< calls that took STRATA_D3_DMA_EARLY's planned path
+    double router_gap_ms = 0;        ///< GPU clock: the router's graph done (dma_trace_router_event, recorded by the
+                                     ///< caller on the dense stream) -> the tier call's first submission (x / meta H2D):
+                                     ///< the readback + host wake + rank / classify / plan round trip
+    int64_t router_gaps = 0;         ///< ... pairs measured
+};
+/// STRATA_DMA_TRACE=1 (read once).
+bool ds41_dma_trace_on();
+
+/// Process-wide counts of the silent fallbacks - an O_DIRECT expert read refused or short (then
+/// the buffered read or the mapping), a buffered pread short (then the mapping), a staging buffer pinned mid-request
+/// refused (then pageable memory).  Each keeps the bytes the same and only costs speed; a non-zero count names a sick
+/// drive, a refused O_DIRECT or a full pinned budget.
+struct Ds41ReadFallbacks {
+    int64_t direct_to_buffered = 0;
+    int64_t pread_to_mmap = 0;
+    int64_t pinned_to_pageable = 0;
+    int64_t total() const { return direct_to_buffered + pread_to_mmap + pinned_to_pageable; }
+};
+Ds41ReadFallbacks ds41_read_fallbacks();
+
 /// The tier's private state, defined in ds4_moe.cpp.  It carries the CUDA members in a CUDA build and none in a
 /// CPU-only one, which is what keeps this header - and every binary linking it - free of a CUDA dependency.
 struct Ds41MoeImpl;
@@ -469,6 +554,12 @@ public:
     /// the arena is ORDERED and building it twice would read the file twice.  Seed before the first `run`, or the
     /// tier runs the file tier for every expert (correct, slower).
     bool init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41MoeConfig& cfg, std::string& err);
+
+    /// STRATA_EXPERTS_USED_DECODE: the experts per token the NEXT calls route (the ids / weights stride every run*
+    /// call reads), clamped to 1..the geometry's top_k at init (every buffer is sized for that).  ds41_generate sets
+    /// it to the decode k before a decode / verify pass and back to top_k before a prompt.  Never called = top_k.
+    void set_active_top_k(int64_t k);
+    int64_t active_top_k() const;
 
     /// Builds the host arena, in `ranked` order, up to the configured budget.  Called by the seed functions with
     /// the routing profile, or with every (layer, expert) in index order by a caller that has none; public so a
@@ -509,6 +600,16 @@ public:
     /// copies (so it never delays them): the first `max_slots` candidates go into a second staging that becomes `layer`'s
     /// when it begins (prefetch_multi / run_multi_to_dev); prefetch_multi(layer) then appends to it.  A hint only.
     void prefetch_next(int64_t layer, const int32_t* ids, int n, int max_slots);
+    /// STRATA_IDLE_PREFETCH=1 (ds41_moe.cpp struct IdlePf): chunked prefetch, issued by a feeder thread
+    /// only while no demand copy is pending.  idle_pf_on: it opened (VRAM banks, feeder).  idle_pf_ahead: the
+    /// look-ahead its plans target (STRATA_IDLE_PF_AHEAD, 0 when off).  idle_pass(true / false) arms it for one verify
+    /// pass / drops the pass's plans (and prints the "idlepf:" line every STRATA_IDLE_PF_EVERY passes).  idle_plan:
+    /// `ids` = the ranked prediction for `layer` (later layer: the D3 spec prediction; the layer itself:
+    /// prefetch_multi calls it).  run_multi_to_dev serves the layer's complete prefetches as prefetch slots.  A hint.
+    bool idle_pf_on() const;
+    int idle_pf_ahead() const;
+    void idle_pass(bool begin);
+    void idle_plan(int64_t layer, const int32_t* ids, int n);
     /// STRATA_D3_L3WARM: after prefetch_multi(layer), the first `k` of `ids` that are neither VRAM-resident nor in a
     /// prefetch slot but in the RAM arena are read into the CPU's last-level cache by background threads while the
     /// layer's attention runs, so the tier's pool finds them there.  Stopped by the tier before its pool runs.  A hint.
@@ -539,6 +640,21 @@ public:
     void close();
 
     const Ds41MoeStats& stats() const;
+    /// STRATA_DMA_TRACE: the counters since the last take (then zeroed).  False when the trace is off.
+    bool dma_trace_take(Ds41DmaTrace& out);
+    /// STRATA_DMA_TRACE: a timing cudaEvent_t (as void*) for the caller to record on the dense stream right after the
+    /// layer's attention + router graph; the next gpu_run_n_ex pairs it with its first submission (router_gap_ms).
+    /// Null when the trace is off or there is no GPU tier.
+    void* dma_trace_router_event();
+    /// STRATA_GPU_TIER_STATS=1 (measurement only - no work, order
+    /// or result changes): the shadow of a device-side tier decision.  Call it for each layer at the point a device
+    /// plan kernel would be queued behind the layer's router (before its attention + router graph is launched);
+    /// `eligible` = the caller allows the device path for this layer (one tier call, top_k experts per row, this
+    /// card).  It snapshots each expert's VRAM slot address (what the plan kernel would read); the layer's
+    /// run_multi_to_dev call then counts whether the plan would have taken the whole call and whether that matches the
+    /// host's own classification, slot address for slot address.  One "gputier:" line every 1280 calls.
+    void gpu_tier_snap(int64_t layer, bool eligible);
+    static bool gpu_tier_stats_on();
     void reset_stats();
     void add_stats(const Ds41MoeStats& s);
 
@@ -555,13 +671,19 @@ public:
     bool resident(int64_t layer, int64_t expert) const;
     /// Whether `expert` of `layer` is in the host arena (false in CPU-only mode and for the file tier).
     bool in_arena(int64_t layer, int64_t expert) const;
+    /// STRATA_EXPERTS_DROP_MISS: whether the next run / run_to_dev / run_multi / run_multi_to_dev call of `layer` would
+    /// serve `expert` from VRAM - its VRAM cache slot, this layer's prefetch staging (prefetch / prefetch_multi), or the
+    /// early staging prefetch_next sent ahead for this layer (`multi`: run_multi / run_multi_to_dev take it over first;
+    /// run / run_to_dev do not) - the same lookup the call classifies its experts with (slot_of, then pf_e).  False in
+    /// CPU-only mode.
+    bool vram_hit_now(int64_t layer, int64_t expert, bool multi = true) const;
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
     /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
     bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
     /// run_multi writing the nt * n_embd sums to device memory `out_dev` instead of the host (D3: the verify pass's
     /// per-token routed rows, one call per layer).  nt*top_k token-major ids/w, x nt*n_embd.  GPU tier only.
     bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev);
-    /// The kernel replay bench (round 231).  STRATA_TIER_RECORD=<file> [STRATA_TIER_RECORD_MAX=N calls, default 2000]
+    /// The kernel replay bench.  STRATA_TIER_RECORD=<file> [STRATA_TIER_RECORD_MAX=N calls, default 2000]
     /// makes run_multi_to_dev append each call's {layer, nt, ids, w, x, out} (out read back after the call: the
     /// recording run is slower, its text unchanged).  `tier_replay` runs such a file through this tier `reps` times:
     /// the last rep compares every output with the recorded one (bitwise and max |diff|) and reports ms per call and
@@ -571,7 +693,7 @@ public:
     /// class, VRAM-resident, in arena), then one record per run_multi_to_dev call (the verify path): its distinct
     /// experts with the first pass row routing each and the class the call served it as.  `trace_mark` appends a
     /// caller record (the pass's acceptance).  Replayed by tools/v41/sim/route_sim.py.
-    /// Round 231 (the offline placement simulator, tools/v41/sim/place_sim.py): `trace_snapshot` writes an 'S'
+    /// The offline placement simulator (tools/v41/sim/place_sim.py): `trace_snapshot` writes an 'S'
     /// record shaped like the header (the server re-seeds per request); `trace_rec` a generic {tag, n, n ints}
     /// record - 'V' per pass (the pass's timing and tier counters, ds41_generate's pass_v) and 'R' per predicted
     /// layer (the ranked prediction the prefetch / read-ahead would act on).  `tracing`: a trace is open.
@@ -589,6 +711,48 @@ public:
     /// run_chunk writing the n * n_embd sums to device memory `out_dev` (same device, e.g. the dense half's chunk
     /// tensor) instead of the host.  GPU tier only.
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// STRATA_WIDE_PROMPT: run_chunk_dev with the n input rows on the card too (`x_dev`, the dense half's MoE-input
+    /// rows): no c_x / c_out / pinned landing pad, and the MMVQ activations + scratch only if a launch needs them.
+    /// `x_host` (may be null) is read only by the STRATA_CHUNK_CPU pool; null keeps the pool out of the call.
+    bool run_chunk_xdev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x_host,
+                        const float* x_dev, void* out_dev);
+    /// run_chunk_xdev can run: an initialized GPU tier (not --cpu-only).
+    bool chunk_xdev_ok() const;
+    /// Every format class of the model runs its prompt calls on MMQ (so a wide call with no VRAM-resident expert
+    /// never allocates the MMVQ scratch, ~0.16 MiB a column).
+    bool chunk_all_mmq() const;
+    /// The wide prompt budget (STRATA_PROMPT_SWEEP_FIT, ds41_generate.cpp), counted from the sizes gpu_run_chunk allocates
+    /// (nothing is allocated; 0 without a GPU tier):
+    ///   chunk_wide_bytes(n)  a wide call's per-token device buffers for n tokens (c_parts n*K rows, c_dst / c_tokv /
+    ///                        c_w);
+    ///   chunk_mmq_bytes(n)   the MMQ scratch a wide call of n tokens holds (m_gu / m_h / m_xg / m_xu / m_xd at
+    ///                        max(16384, (n + 1) / 2) rows: 16384 is its floor, a run of more rows grows it);
+    ///   chunk_stage_bytes()  the two streaming halves at their requested size (MIMO_CHUNK_STAGE_MIB, + 1 MiB each)
+    ///                        and their small tables - the size a wave runs at when the VRAM is there.
+    size_t chunk_wide_bytes(int n) const;
+    size_t chunk_mmq_bytes(int n) const;
+    size_t chunk_stage_bytes() const;
+    ///   chunk_keep_bytes(n)  the free VRAM a wide call of n tokens must leave for the buffers it allocates only when
+    ///                        there is room (STRATA_PROMPT_SWEEP_PRESTAGE): the PTQ1_0 transcode copies (STRATA_MMQ_TC_GIB
+    ///                        over a 2 GiB keep) and the layer prestage region (STRATA_PRESTAGE_GIB over
+    ///                        STRATA_PRESTAGE_KEEP_GIB); 0 when neither applies.
+    size_t chunk_keep_bytes(int n) const;
+    /// Try to cudaMalloc every size in `sizes` (in order, each its own allocation) on the tier's card and free them
+    /// all again: whether a batch whose buffers have these sizes would fit right now.  false names the first that
+    /// did not in `err`.  No-op true without a GPU tier.
+    bool vram_probe(const std::vector<size_t>& sizes, std::string& err) const;
+    /// A prompt call of n tokens may send experts to the CPU pool (STRATA_CHUNK_CPU / _PAGEABLE, n <= _MAXN): it then
+    /// needs the input rows on the host.
+    bool chunk_cpu_wants(int n) const;
+    /// STRATA_BM_PREFILL_READAHEAD=1 (default off; exact): a GUESS of `layer`'s routing for the next run_chunk of it
+    /// (`ids` n * k, e.g. Ds41Dense::guess_route on the previous layer's input).  Its most-picked FILE-TIER experts start
+    /// reading into a pinned slab now, so they read while the current layer computes; run_chunk(layer) then DMAs the
+    /// routed ones from the slab, drops the unread guesses it does not route and reads the misses as before.  A no-op
+    /// when the switch is off, below STRATA_BM_PREFILL_READAHEAD_MIN rows, or in a CPU tier.
+    void prefill_readahead(int64_t layer, const int32_t* ids, int n, int k);
+    /// Whether prefill_readahead is switched on (STRATA_BM_PREFILL_READAHEAD) and the minimum rows it acts on.
+    static bool prefill_readahead_on();
+    static int prefill_readahead_min_rows();
     /// The arena alone from a routing profile (the order `seed_from_routes` would give it, incl. arena_skip_resident),
     /// WITHOUT opening the VRAM cache - so prompt chunks can run first and `release_chunk` can give their buffers back
     /// before the cache takes the VRAM.  A later `seed_from_routes` keeps this arena and only seeds the cache.
@@ -603,6 +767,9 @@ public:
     /// every decode pass only with STRATA_ARENA_REBAL_DECODE=1 (s6: reads during decode cost it 5-19 %).  The prompt's
     /// logits do not depend on it (routing is exact).
     void rebalance_begin_prompt();
+    /// STRATA_PASS_SPLIT_FIXED=1: the caller marks its short-prompt passes (feed_steps) - those
+    /// run_multi / run_multi_to_dev calls then split the experts GPU / CPU by routing only (gpu_run_n_ex).
+    void set_prompt_pass(bool on);
     void rebalance_plan();
     void rebalance_tick(bool request_end = false);
     /// Gives the layer-prestage region back (VRAM for the dense half when its pass buffer would not fit); prestage

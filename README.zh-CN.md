@@ -1,4 +1,6 @@
-> **注意：**此翻译描述的是旧版本。0.94 版请以英文 [README.md](README.md) 为准。
+> **注意：**此翻译描述的是旧版本。0.95 版请以英文 [README.md](README.md) 为准。
+>
+> 0.95 的数据（DeepSeek V4.1：按内存大小的速度与一致率，所有电脑默认使用 UD-IQ2_XXS）见英文 [README.md](README.md) 的“Speed by RAM size (0.95)”一节；此处的表格是旧版本的。
 
 <h1 align="center">Strata</h1>
 

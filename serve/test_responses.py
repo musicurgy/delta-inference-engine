@@ -84,10 +84,13 @@ class Parsing(unittest.TestCase):
         self.assertEqual(e.exception.param, "input[0].encrypted_content")
 
     def test_bad_arguments_from_a_cut_off_call_do_not_refuse_the_conversation(self):
-        msgs = input_messages({"input": [{"role": "user", "content": "q"},
-                                         {"type": "function_call", "call_id": "c", "name": "f", "arguments": "{\"a"},
-                                         {"type": "function_call_output", "call_id": "c", "output": "x"}]})
-        self.assertEqual(msgs[1]["tool_calls"][0]["function"]["arguments"], {"arguments": "{\"a"})
+        # 0.95 (cut_arguments): a call cut inside its first key has no arguments; text that is not a cut object keeps
+        # the old form
+        for raw, want in (("{\"a", {}), ("{cut", {"arguments": "{cut"})):
+            msgs = input_messages({"input": [{"role": "user", "content": "q"},
+                                             {"type": "function_call", "call_id": "c", "name": "f", "arguments": raw},
+                                             {"type": "function_call_output", "call_id": "c", "output": "x"}]})
+            self.assertEqual(msgs[1]["tool_calls"][0]["function"]["arguments"], want)
 
     def test_unsupported_items_are_named(self):
         for items, param in (([{"type": "item_reference", "id": "msg_1"}], "input[0]"),

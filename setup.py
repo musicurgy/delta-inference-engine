@@ -46,6 +46,9 @@ import json
 import math
 import os
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")   # no usage reports to Hugging Face (downloads only)
+import sys
+if os.name == "nt":   # 0.95 (Niko1221/Strata 6f6099fe6): Python 3.12+'s _wmi can crash the process (0xC0000005) when
+    sys.modules.setdefault("_wmi", None)   # WMI refuses the account; platform then answers from the registry, as before
 import platform
 import re
 import shutil

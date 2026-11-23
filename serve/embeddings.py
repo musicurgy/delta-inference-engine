@@ -103,19 +103,15 @@ class Sidecar:
                   flush=True)
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | (BELOW_NORMAL if os.name == "nt" and
                                                                    self.device is None else 0)
+            from serve.winjob import start_contained   # ends with Strata, as the engine does
             try:
-                self.proc = subprocess.Popen(  # noqa: S603 - the command comes from the config
+                self.proc = start_contained(  # noqa: S603 - the command comes from the config
                     args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=self._log or subprocess.DEVNULL,
                     env=self.env(), creationflags=flags,
                     preexec_fn=(lambda: os.nice(5)) if os.name != "nt" and self.device is None else None)
             except OSError as e:
                 self.proc = None
                 raise RuntimeError(f"the {self.kind} server could not start: {e}") from None
-            try:
-                from serve.winjob import contain       # ends with Strata, as the engine does
-                contain(self.proc)
-            except Exception:  # noqa: BLE001 - best effort
-                pass
             self.last_used = time.time()
             deadline = time.time() + self.start_timeout_s
             while time.time() < deadline:

@@ -848,43 +848,93 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
-        // UNION (xolotl): the fork's per-expert `fmt` (DS4.1 mixed tiers) AND GLM's LoRA a.h accumulation, which
-        // must run on the float SwiGLU row BEFORE it is quantized.  fd is the per-expert format when set, else the batch's.
-        for (int e = 0; e < nb; ++e) {
-            const NativeFmt& fd = mjobs_[e].fmt ? *mjobs_[e].fmt : f;
-            for (int t = 0; t < mjobs_[e].nt; ++t) {
-                if (mjobs_[e].lora_a) {   // the LoRA's a . h on the float SwiGLU row, before it is quantized
-                    const float* hh = split_multi_[(size_t) e].ff[t];
-                    const float* la = mjobs_[e].lora_a;
-                    float s = 0.f;
-                    for (int64_t i = 0; i < fd.n_ff; ++i) s += la[i] * hh[i];
-                    mjobs_[e].lora_s[t] = s;
-                }
-                if (q2_native_kernels(fd.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], (int) fd.n_ff, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(fd, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
-            }
-        }
-        const auto c = std::chrono::steady_clock::now();
-        mper_ = f.n_embd;
-        mrows_ = (int64_t) nb * f.n_embd;
-        mtasks_ = phase_tasks(mrows_);
-        run_phase(6, mtasks_);
-        for (int e = 0; e < nb; ++e)   // the LoRA's down delta, after the down product wrote `out`
-            if (mjobs_[e].lora_a && mjobs_[e].lora_b)
-                for (int t = 0; t < mjobs_[e].nt; ++t) {
-                    float* o = mjobs_[e].out[t];
-                    const float s = mjobs_[e].lora_s[t];
-                    const float* lb = mjobs_[e].lora_b;
-                    if (o) for (int64_t j = 0; j < f.n_embd; ++j) o[j] += s * lb[j];
-                }
-        const auto d = std::chrono::steady_clock::now();
-        ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
-        ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
-        ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+        split_multi_native_tail(f, nb, a, b);
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void ExpertPool::split_multi_native_tail(const NativeFmt& f, int nb, std::chrono::steady_clock::time_point a,
+                                         std::chrono::steady_clock::time_point b) {
+    // UNION (xolotl): the fork's per-expert `fmt` (DS4.1 mixed tiers) AND GLM's LoRA a.h accumulation, which
+    // must run on the float SwiGLU row BEFORE it is quantized.  fd is the per-expert format when set, else the batch's.
+    for (int e = 0; e < nb; ++e) {
+        const NativeFmt& fd = mjobs_[e].fmt ? *mjobs_[e].fmt : f;
+        for (int t = 0; t < mjobs_[e].nt; ++t) {
+            if (mjobs_[e].lora_a) {   // the LoRA's a . h on the float SwiGLU row, before it is quantized
+                const float* hh = split_multi_[(size_t) e].ff[t];
+                const float* la = mjobs_[e].lora_a;
+                float s = 0.f;
+                for (int64_t i = 0; i < fd.n_ff; ++i) s += la[i] * hh[i];
+                mjobs_[e].lora_s[t] = s;
+            }
+            if (q2_native_kernels(fd.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], (int) fd.n_ff, split_multi_[(size_t) e].a2[t]);
+            else native_quant_h(fd, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        }
+    }
+    const auto c = std::chrono::steady_clock::now();
+    mper_ = f.n_embd;
+    mrows_ = (int64_t) nb * f.n_embd;
+    mtasks_ = phase_tasks(mrows_);
+    run_phase(6, mtasks_);
+    for (int e = 0; e < nb; ++e)   // the LoRA's down delta, after the down product wrote `out`
+        if (mjobs_[e].lora_a && mjobs_[e].lora_b)
+            for (int t = 0; t < mjobs_[e].nt; ++t) {
+                float* o = mjobs_[e].out[t];
+                const float s = mjobs_[e].lora_s[t];
+                const float* lb = mjobs_[e].lora_b;
+                if (o) for (int64_t j = 0; j < f.n_embd; ++j) o[j] += s * lb[j];
+            }
+    const auto d = std::chrono::steady_clock::now();
+    ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
+    ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
+    ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+}
+
+void ExpertPool::start_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
+    pend_n_ = 0;
+    if (n <= 0) return;
+    bool whole = n > kMaxSplitMulti;   // run_split_multi_native's batches / per-job fallback: no split start
+    for (int e = 1; e < n && !whole; ++e)
+        if (jobs[e].fmt && (jobs[e].fmt->n_embd != f.n_embd || jobs[e].fmt->n_ff != f.n_ff)) whole = true;
+    if (whole) {
+        run_split_multi_native(f, jobs, n);
+        return;
+    }
+    pend_t0_ = std::chrono::steady_clock::now();
+    // run_split_multi_native's first batch and the first half of its run_phase(5): the same state, then the publish
+    mjobs_ = jobs;
+    nfmt_ = &f;
+    mper_ = f.n_ff;
+    mrows_ = (int64_t) n * f.n_ff;
+    mtasks_ = phase_tasks(mrows_);
+    wait_parked("before a phase");
+    mode_ = 5;
+    njobs_ = mtasks_;
+    pend_epoch_ = begin_batch(mtasks_);
+    hstate_.store(kIdle, std::memory_order_relaxed);   // the caller is away (launching) until finish
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    pend_f_ = &f;
+    pend_n_ = n;
+}
+
+void ExpertPool::finish_split_multi_native() {
+    if (pend_n_ <= 0) return;
+    const NativeFmt& f = *pend_f_;
+    const int nb = pend_n_;
+    pend_n_ = 0;
+    // the rest of run_phase(5): the caller joins, then every task is done and every worker parked
+    if (host_works_) drain(-1, host_scratch_, pend_epoch_);
+    wait_done(mtasks_);
+    wait_parked("after a phase");
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    const auto b = std::chrono::steady_clock::now();
+    split_multi_native_tail(f, nb, pend_t0_, b);   // gate/up ms here include the caller's launches (it overlapped them)
+    multi_bytes += (int64_t) nb * (int64_t) f.bytes;
+    mode_ = 0;
+    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pend_t0_).count();
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {

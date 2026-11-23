@@ -32,7 +32,7 @@ At the settings that ship (route bias 0.28):
 
 | Build | General | Code + maths | Agentic |
 |---|---|---|---|
-| UD-IQ2_XXS (default from 128 GB up) | 91.1% | 94.5% | 95.9% |
+| UD-IQ2_XXS (the default) | 91.1% | 94.5% | 95.9% |
 | ds4 Q2 | 89.9% | 93.1% | 95.1% |
 | UD-Q2_K_XL | 92.5% | 95.3% | 97.0% |
 | UD-IQ3_XXS | 92.7% | 95.9% | 97.4% |
@@ -46,14 +46,18 @@ Exact routing (no route bias, slower):
 | GSQ IQ2_XS | 90.0% | 92.9% |
 | GSQ IQ2_XXS | 87.8% | 89.5% |
 | GSQ IQ1_M | 85.5% | - |
+| UD-IQ1_S | 90.0% | - |
 | UD-IQ1_S (older files) | 89.3% | 91.1% |
-| UD-IQ2_XXS | 92.5% | 95.9% |
+| UD-IQ1_M | 91.2% | - |
+| UD-IQ2_XXS | 93.1% | 95.9% |
 | UD-Q2_K_XL | 95.0% | 96.8% |
 | UD-IQ3_XXS | 95.5% | 97.6% |
 | EXL3 2.9 bpw | 95.1% | 97.2% |
 | EXL3 2.5 bpw | 94.4% | 95.6% |
 
 ## Speed
+
+0.95's speeds by RAM size (UD-IQ2_XXS, UD-IQ1_S, UD-IQ1_M, UD-IQ3_XXS at 192 / 128 / 96 / 64 GB, on the release build) are in README.md, "Speed by RAM size (0.95)".  The table below is 0.93's, kept as history.
 
 Decode speed on one RTX 3090. The measurement is `bench_server`: 6 chats of up to 1,500 tokens each, with thinking on, through the release's own server.
 - The 128, 96 and 64 GB columns are the same PC with the spare RAM locked away (so neither Windows' file cache nor the pagefile could use it).

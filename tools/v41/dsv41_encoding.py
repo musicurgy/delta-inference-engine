@@ -707,7 +707,7 @@ def render_message(
                 tool_calls=tc_content,
             )
     else:
-        raise NotImplementedError(f"Unknown role: {role}")
+        raise ValueError(f"Unknown role: {role}")   # 0.95: a 400, as vLLM #66848 - not a dropped connection
 
     # Append transition tokens based on what follows
     if index + 1 < len(messages) and messages[index + 1].get("role") not in ["assistant", "latest_reminder"]:

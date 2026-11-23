@@ -331,7 +331,7 @@ class Tokenizer:
             out.extend(self._encode_plain(text[pos:]))
         return out
 
-    # The prefix memo (0.94, brainstorm_1107 idea 1 / BACKLOG #41): an agent resends its whole conversation every turn,
+    # The prefix memo (0.94): an agent resends its whole conversation every turn,
     # and the pre-tokenizer's regexes ran over all of it each time - ~1.4 ms per 1K tokens on a 5800X, 140 ms a turn at
     # 100K tokens, before the engine saw the request.  The last PREFIX_MEMO long texts keep their ids and the places
     # where a literal (special token) match ended; a text that starts the same takes the ids up to the last such place

@@ -1,4 +1,6 @@
-> **Hinweis:** Diese Übersetzung beschreibt eine ältere Version. Für Version 0.94 gilt die englische [README.md](README.md).
+> **Hinweis:** Diese Übersetzung beschreibt eine ältere Version. Für Version 0.95 gilt die englische [README.md](README.md).
+>
+> Die Zahlen von 0.95 (DeepSeek V4.1: Geschwindigkeit und Übereinstimmung je RAM-Größe, UD-IQ2_XXS als Standard auf jedem PC) stehen in der englischen [README.md](README.md), Abschnitt "Speed by RAM size (0.95)"; die Tabellen hier sind älter.
 
 <h1 align="center">Strata</h1>
 

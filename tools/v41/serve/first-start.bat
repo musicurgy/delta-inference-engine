@@ -57,7 +57,7 @@ if exist ".venv\Scripts\python.exe" (
 )
 echo Setting up the Python environment ^(.venv: ~0.3 GB of packages, a minute or two^) ...
 set "PYEXE="
-rem 0.94 (BACKLOG #67): the versions every pinned package was tested on come first; 3.14 still works (PR #2)
+rem 0.94: the versions every pinned package was tested on come first; 3.14 still works (PR #2)
 for %%v in (3.13 3.12 3.11 3.14 3.10) do if not defined PYEXE (
   py -%%v -c "import sys" >nul 2>&1 && set "PYEXE=py -%%v"
 )
@@ -159,6 +159,12 @@ if not defined DS41_MODELS (
 )
 set "M=%DS41_MODELS:/=\%"
 set "NEED="
+rem the checkpoint's file names (data\ds41\checkpoints.json; 1017's if the table cannot be read; empty = none)
+set "CK_Q2=DeepSeek-V4.1-Flash-1017-Q2.gguf"
+set "CK_VISION=DeepSeek-V4.1-Flash-1017-Vision.gguf"
+set "CK_VISION_REPO=nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF"
+set "CK_TOKENIZER=tokenizer"
+for /f "usebackq tokens=1,* delims==" %%a in (`".venv\Scripts\python.exe" tools\v41\ckpt.py bat`) do set "%%a=%%b"
 rem the main model: the ds4 Q2 GGUF, checked (.ok) - or a model Choose Model.bat picked (model-choice.txt: a GSQ or
 rem Unsloth file that is there), or an install from before 2026-10-27 (slim copy + Engram shards)
 set "OLD="
@@ -169,12 +175,18 @@ if defined PICK set "PICK=%PICK:/=\%"
 if defined PICK if exist "%M%\%PICK%" set "OLD=1"
 if defined PICK if exist "%PICK%" set "OLD=1"
 set "NEEDMAIN="
-if not defined OLD if not exist "%M%\DeepSeek-V4.1-Flash-1017-Q2.gguf.ok" (
+rem (a checkpoint without a ds4 Q2 GGUF: the model menu below picks one)
+if not defined CK_Q2 if not defined OLD (
   set "NEED=1"
   set "NEEDMAIN=1"
-  echo   missing: the main model, DeepSeek-V4.1-Flash-1017-Q2.gguf ^(366 GB, with its Engram tables^)
+  echo   missing: the main model
 )
-if not exist "%M%\tokenizer\vocab.json" (
+if defined CK_Q2 if not defined OLD if not exist "%M%\%CK_Q2%.ok" (
+  set "NEED=1"
+  set "NEEDMAIN=1"
+  echo   missing: the main model, %CK_Q2% ^(366 GB, with its Engram tables^)
+)
+if not exist "%M%\%CK_TOKENIZER%\vocab.json" (
   set "NEED=1"
   echo   missing: the tokenizer ^(DeepSeek's small files, a few MB^)
 )
@@ -209,8 +221,10 @@ for /f "usebackq tokens=1,2" %%a in (`".venv\Scripts\python.exe" tools\v41\serve
 )
 set "NEEDVIS="
 if /i not "%VPLAN%"=="off" set "NEEDVIS=1"
-if defined NEEDVIS if exist "%M%\DeepSeek-V4.1-Flash-1017-Vision.gguf.ok" if /i "%VTORCH%"=="cuda" set "NEEDVIS="
-if defined NEEDVIS if exist "%M%\DeepSeek-V4.1-Flash-1017-Vision.gguf.ok" if /i "%VTORCH%"=="cpu" if /i not "%VPLAN%"=="cuda" set "NEEDVIS="
+rem (a checkpoint without a vision file yet: nothing to set up, the model starts text only)
+if not defined CK_VISION_REPO set "NEEDVIS="
+if defined NEEDVIS if exist "%M%\%CK_VISION%.ok" if /i "%VTORCH%"=="cuda" set "NEEDVIS="
+if defined NEEDVIS if exist "%M%\%CK_VISION%.ok" if /i "%VTORCH%"=="cpu" if /i not "%VPLAN%"=="cuda" set "NEEDVIS="
 if defined NEEDVIS if /i "%VPLAN%"=="cuda" echo   missing: pictures on the second card ^(the vision encoder, 0.97 GB, unless it is there, and PyTorch's CUDA build, 2.0 GB; without it pictures are read on the CPU^)
 if defined NEEDVIS if /i not "%VPLAN%"=="cuda" echo   missing: pictures ^(the vision encoder, 0.97 GB, and PyTorch, 124 MB^)
 if defined NEEDVIS echo            ^(Disable Pictures.bat turns pictures off: then this is not asked again^)
@@ -230,7 +244,8 @@ set "RAM_GB="
 for /f "usebackq" %%r in (`".venv\Scripts\python.exe" tools\v41\serve\cpu_level.py --ram-gb`) do set "RAM_GB=%%r"
 set /a RAMN=RAM_GB+0 2>nul
 if defined RAM_GB if %RAMN% LSS 120 echo   Note: this PC has %RAM_GB% GB of RAM; 64 GB is the minimum, 128 GB or more is recommended ^(README.md, "What you need"^).
-if defined RAM_GB if %RAMN% LSS 120 if %RAMN% GEQ 56 echo         Under 128 GB it runs, but the experts that do not fit are read from the SSD on every token: measured on an RTX 3090 UD-IQ1_S writes ~36 tok/s at 96 GB and ~31 at 64 GB, the default ~27 and ~20.
+if defined RAM_GB if %RAMN% LSS 110 if %RAMN% GEQ 56 echo         Under 128 GB it runs, and the experts that do not fit are read from the SSD as needed: measured on an RTX 3090 the recommended UD-IQ1_M writes ~40 tok/s at 96 GB and ~35 at 64 GB.
+if defined RAM_GB if %RAMN% LSS 120 if %RAMN% GEQ 110 echo         Under 128 GB it runs, and the experts that do not fit are read from the SSD as needed: the recommended UD-IQ2_XXS writes about as fast as at 128 GB ^(~44 tok/s on an RTX 3090^).
 if defined RAM_GB if %RAMN% LSS 56 echo         With this little it will probably not start at all.
 rem no model yet: the user picks one - the one for this PC is marked, any other is fine, or none and their own
 if not defined NEEDMAIN goto picked

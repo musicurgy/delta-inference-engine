@@ -1,0 +1,118 @@
+{
+  "_comment": [
+    "One row per DeepSeek checkpoint this engine supports.  Read by tools/v41/ckpt.py, which every entry point uses:",
+    "the launcher (Start DeepSeek.bat, ds41_local.py), the model menu (pick_model.py), setup (setup-ds41-models.bat,",
+    "first-start.bat, setup_space.py) and the converters (v41_sidecar.py, extract_engram.py).  A new checkpoint is one",
+    "new row; DS41_CHECKPOINT=<id> selects a row, otherwise 'default'.",
+    "fingerprint: the first 16 hex digits of sha256 over the lines 'model-NNNNN-of-NNNNN.safetensors <sha256>\\n' of",
+    "every weight shard, sorted by name (ckpt.py fingerprint --repo R --revision REV computes it from Hugging Face's",
+    "published hashes).  It names the weights, not the repository commit: a later README or template commit keeps it.",
+    "derived: the files built from this checkpoint's weights.  Each one made by setup or a converter gets a stamp",
+    "beside it (<file>.ckpt.json: checkpoint id + fingerprint); ds41_local.py warns when a derived file in use was",
+    "built from another checkpoint than the model it runs with.  'match' / 'meta_match': how a file without a stamp",
+    "is recognised (regular expressions on its file name / on the GGUF's general.* strings), tried row by row in order.",
+    "A row's patterns name its own files only: never a bare 'DeepSeek-V4.1-Flash-' (a dated checkpoint's files start",
+    "with it too) - the base's names continue with a letter, a dated checkpoint's with its digits.  A new row's names",
+    "must not match an existing row's patterns, whatever its place in 'order' (tools/v41/test_ckpt.py checks a",
+    "made-up 1201 row against every row here)."
+  ],
+  "schema": 1,
+  "default": "1017",
+  "order": ["1017", "v41"],
+  "checkpoints": {
+    "1017": {
+      "label": "DeepSeek V4.1 Flash 1017",
+      "arch": "deepseek41",
+      "status": "available",
+      "fingerprint": "54bfaa8385e86d02",
+      "deepseek": {
+        "repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "revision": "08c8657f02291e11b6f6b63e0e16014f8e748518",
+        "weights_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+        "shards": 48,
+        "shard_pattern": "model-{n:05d}-of-{total:05d}.safetensors",
+        "index": "model.safetensors.index.json",
+        "index_git_blob": "54c85064dd92c8550471302e9ae59bedbbf96ca4",
+        "small_files": ["model.safetensors.index.json", "config.json", "tokenizer.json", "tokenizer_config.json"],
+        "small_dir": "deepseek",
+        "tokenizer_sha256": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+        "mtp_prefix": "mtp.",
+        "mtp_shards_hint": ["model-00044-of-00048.safetensors", "model-00045-of-00048.safetensors",
+                            "model-00046-of-00048.safetensors"],
+        "engram_shards_hint": ["model-00047-of-00048.safetensors", "model-00048-of-00048.safetensors"]
+      },
+      "models": {
+        "ds4_q2": {"repo": "nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF", "file": "DeepSeek-V4.1-Flash-1017-Q2.gguf",
+                   "slim": "ds4-q2-slim.gguf", "gib_on_disk": 366},
+        "unsloth": {"repo": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF", "revision": "60ad3651",
+                    "revision_of": {"UD-IQ1_S": "8a6ec9cf", "UD-IQ1_M": "8a6ec9cf", "UD-Q2_K_XL": "8a6ec9cf"}},
+        "gsq": {"repo": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF"},
+        "exl3": {"DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw": "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw"}
+      },
+      "derived": {
+        "drafter_source": "V41-1017-MTP.gguf",
+        "drafter_uniform": "V41-1017-MTP-iq2xxs.gguf",
+        "drafter": "V41-1017-MTP-iq2xxs-imx.gguf",
+        "drafter_imatrix": "tools/v41/serve/drafter-imatrix.bin",
+        "rank": "data/ds41/rank-1017-share.bin",
+        "keep": "tools/v41/serve/dspark_expert_counts_1017.txt",
+        "vision": "DeepSeek-V4.1-Flash-1017-Vision.gguf",
+        "vision_repo": "nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF",
+        "engram_hot": "engram-hot-2g.bin",
+        "engram_dir": "engram",
+        "tokenizer_dir": "tokenizer"
+      },
+      "model_id_prefix": "deepseek-v4.1-flash-1017",
+      "route_bias": 0.28,
+      "match": ["(?<![0-9])1017(?![0-9])", "^ds4-q2-slim\\.gguf$", "^ds41-gsq-[a-z0-9_]+\\.gguf$", "^engram-hot-2g\\.bin$",
+                "^drafter-imatrix\\.bin$"],
+      "meta_match": ["DeepSeek-V4\\.1-Flash-1017(?![0-9])"]
+    },
+    "v41": {
+      "label": "DeepSeek V4.1 Flash base 0910",
+      "arch": "deepseek41",
+      "status": "reference",
+      "_note": "Not on the model menu: no derived files ship for it.  Its config.json, tokenizer.json and shard index are the same git blobs as 1017's (Hugging Face API, 2026-11-13); every weight shard differs.",
+      "fingerprint": "5d069a8a464c5921",
+      "deepseek": {
+        "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "revision": "314113f8a7dadb388215396ba5fbee2c610a04d6",
+        "shards": 48,
+        "shard_pattern": "model-{n:05d}-of-{total:05d}.safetensors",
+        "index": "model.safetensors.index.json",
+        "index_git_blob": "54c85064dd92c8550471302e9ae59bedbbf96ca4",
+        "small_files": ["model.safetensors.index.json", "config.json", "tokenizer.json", "tokenizer_config.json"],
+        "small_dir": "deepseek-v41",
+        "tokenizer_sha256": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+        "mtp_prefix": "mtp.",
+        "mtp_shards_hint": ["model-00044-of-00048.safetensors", "model-00045-of-00048.safetensors",
+                            "model-00046-of-00048.safetensors"],
+        "engram_shards_hint": ["model-00047-of-00048.safetensors", "model-00048-of-00048.safetensors"]
+      },
+      "models": {
+        "ds4_q2": null,
+        "unsloth": null,
+        "gsq": null,
+        "exl3": {}
+      },
+      "derived": {
+        "drafter_source": "V41-MTP.gguf",
+        "drafter_uniform": "V41-MTP-iq2xxs.gguf",
+        "drafter": "V41-MTP-iq2xxs-imx.gguf",
+        "drafter_imatrix": null,
+        "rank": null,
+        "keep": "tools/v41/serve/dspark_expert_counts.txt",
+        "vision": "DeepSeek-V4.1-Flash-Vision.gguf",
+        "vision_repo": null,
+        "engram_hot": "engram-hot-2g-v41.bin",
+        "engram_dir": "engram-v41",
+        "tokenizer_dir": "tokenizer"
+      },
+      "model_id_prefix": "deepseek-v4.1-flash",
+      "route_bias": 0.28,
+      "match": ["^V41-GSQ\\.gguf$", "^V41-MTP(-Vision)?(\\.Q2_K|-iq2xxs(-imx)?)?\\.gguf$", "^rank-sept\\.bin$",
+                "^dspark_expert_counts\\.txt$", "^engram-hot-2g-v41\\.bin$", "^DeepSeek-V4\\.1-Flash-(?![0-9])"],
+      "meta_match": ["DeepSeek-V4\\.1-Flash(?!-?[0-9])"]
+    }
+  }
+}

@@ -536,14 +536,17 @@ $("cfg-save").addEventListener("click", async () => {
 // ------------------------------------------------------------------ Setup (GET / POST /setup)
 // The launcher's choices in plain words: the model, speed or quality, the second card.  Apply restarts the server.
 const MODE_NOTE = {fast: "The fastest. A little less close to DeepSeek's own model.",
-  balanced: "Closer to DeepSeek's own model, about 15% slower.", exact: "The closest, about 25% slower."};
-let setupState = null, setupMode = "fast", setupGpu = false;
+  balanced: "Closer to DeepSeek's own model, a little slower.", exact: "The closest, the slowest."};
+let setupState = null, setupMode = "fast", setupModeSet = false, setupGpu = false;
 function setupPaint() {
-  for (const b of $("setup-mode").querySelectorAll("button")) b.setAttribute("aria-checked", String(b.dataset.v === setupMode));
-  $("setup-mode-note").textContent = setupState && setupState.bias_override ?
-    "DS41_ROUTE_BIAS in ds41-paths.bat is set and wins over this." : MODE_NOTE[setupMode];
-  $("setup-gpu").setAttribute("aria-checked", String(setupGpu));
   const r = setupState && setupState.models.find((m) => m.id === $("setup-model").value);
+  if (!setupModeSet && r && r.default_mode) setupMode = r.default_mode;   // not chosen yet: this PC's default for the model
+  for (const b of $("setup-mode").querySelectorAll("button")) b.setAttribute("aria-checked", String(b.dataset.v === setupMode));
+  const measured = r && r.modes && r.modes[setupMode] ? ` On this PC: ${r.modes[setupMode]} (measured).` : "";
+  const rec = r && r.default_mode === setupMode ? " Recommended for this PC." : "";
+  $("setup-mode-note").textContent = setupState && setupState.bias_override ?
+    "DS41_ROUTE_BIAS in ds41-paths.bat is set and wins over this." : MODE_NOTE[setupMode] + measured + rec;
+  $("setup-gpu").setAttribute("aria-checked", String(setupGpu));
   $("setup-model-note").textContent = !r ? "" : !r.installed ? "Not installed: Choose Model.bat downloads it." : r.blocked || "";
   $("setup-apply").disabled = !r || !r.installed || !!r.blocked;
 }
@@ -560,7 +563,7 @@ async function loadSetup() {
   $("setup-pc").textContent = c.ram_gb ? `${c.ram_gb} GB of RAM` : "";
   $("setup-folder").textContent = c.custom_folder;
   $("setup-refused").innerHTML = c.refused.map((x) => `<li>${esc(x.name)}: ${esc(x.why)}</li>`).join("");
-  setupMode = c.mode; setupGpu = c.multi_gpu;
+  setupModeSet = !!c.mode; setupMode = c.mode || "fast"; setupGpu = c.multi_gpu;
   $("setup-gpu-row").hidden = !c.helper_gpu;
   if (c.helper_gpu) $("setup-gpu-note").textContent = `${c.helper_gpu.name} holds part of the model, for more speed`;
   $("setup-card").hidden = false;
@@ -569,10 +572,11 @@ async function loadSetup() {
 }
 $("setup-model").addEventListener("change", setupPaint);
 $("setup-refresh").addEventListener("click", loadSetup);
-$("setup-mode").addEventListener("click", (e) => { if (e.target.dataset.v) { setupMode = e.target.dataset.v; setupPaint(); } });
+$("setup-mode").addEventListener("click", (e) => { if (e.target.dataset.v) { setupMode = e.target.dataset.v; setupModeSet = true; setupPaint(); } });
 $("setup-gpu").addEventListener("click", () => { setupGpu = !setupGpu; setupPaint(); });
 $("setup-apply").addEventListener("click", async () => {
-  const body = {model: $("setup-model").value, mode: setupMode, multi_gpu: setupGpu};
+  const body = {model: $("setup-model").value, multi_gpu: setupGpu};
+  if (setupModeSet) body.mode = setupMode;     // untouched: the launcher keeps choosing this PC's default
   try {
     const r = await fetch("setup", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
     const b = await r.json();

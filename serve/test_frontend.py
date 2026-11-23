@@ -1,5 +1,6 @@
 """Chat history normalization before rendering the model's prompt."""
 import copy
+import json
 from pathlib import Path
 import unittest
 
@@ -199,7 +200,7 @@ class ForcedCallOpening(unittest.TestCase):
         from serve.frontend import forced_call
         one, two = [{"name": "a"}], [{"name": "a"}, {"name": "b"}]
         self.assertTrue(forced_call("required", one).endswith("<function=a>\n"))
-        self.assertTrue(forced_call("required", two).endswith("<function="))
+        self.assertEqual(forced_call("required", two), "<tool_call>\n")   # f096: the model writes <function=NAME>
         self.assertIsNone(forced_call("auto", one))
 
 
@@ -340,3 +341,33 @@ class FencedJsonCallInWrapper(unittest.TestCase):
         other = [{"name": "other", "parameters": {}}]
         calls, text = self.run_parser(raw, len(raw), False, tools=other)
         self.assertEqual((calls, text), ([], raw))
+
+
+class RawControlCharsInArguments(unittest.TestCase):
+    """A JSON parameter value with a raw newline or tab inside one of its strings (the model wrote the character
+    itself) decodes as JSON, not as the raw text (json.loads strict=False, after llama.cpp c90aa996b); whole and
+    streamed alike."""
+    TOOLS = [{"name": "edit", "parameters": {"type": "object", "properties": {
+        "path": {"type": "string"}, "edits": {"type": "array"}, "opts": {"type": "object"}}}}]
+
+    def run_parser(self, raw, chunk, stream_tools):
+        from serve.frontend import OutputParser
+        p = OutputParser(thinking=False, tools=self.TOOLS, stream_tools=stream_tools)
+        events = []
+        for i in range(0, len(raw), chunk):
+            events += p.feed(raw[i:i + chunk])
+        events += p.finish()
+        return [e.call.arguments for e in events if e.kind == "tool_call"]
+
+    def test_raw_newline_and_tab(self):
+        raw = ('<tool_call>\n<function=edit>\n<parameter=path>\na.py\n</parameter>\n<parameter=edits>\n'
+               '[{"old": "x = 1\n", "new": "x = 2\tdone"}]\n</parameter>\n<parameter=opts>\n{"note": "a\nb"}\n'
+               '</parameter>\n</function>\n</tool_call>')
+        want = {"path": "a.py", "edits": [{"old": "x = 1\n", "new": "x = 2\tdone"}], "opts": {"note": "a\nb"}}
+        for chunk in (len(raw), 1, 5):
+            for st in (False, True):
+                with self.subTest(chunk=chunk, stream_tools=st):
+                    calls = self.run_parser(raw, chunk, st)
+                    self.assertEqual(len(calls), 1)
+                    got = calls[0] if isinstance(calls[0], dict) else json.loads(calls[0])
+                    self.assertEqual(got, want)

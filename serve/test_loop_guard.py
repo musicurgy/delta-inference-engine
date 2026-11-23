@@ -1,4 +1,4 @@
-"""serve/test_loop_guard.py - the tool-call loop guard (serve/loop_guard.py, BACKLOG #69): what counts as the same call
+"""serve/test_loop_guard.py - the tool-call loop guard (serve/loop_guard.py): what counts as the same call
 N times in a row, the note it adds before the model's turn, and that every other request renders as before.
 
     python -m unittest serve.test_loop_guard -v
@@ -11,6 +11,7 @@ import io
 import json
 import sys
 import unittest
+from unittest import mock
 import urllib.request
 from pathlib import Path
 
@@ -35,9 +36,18 @@ def call(name="bash", args=None, cid="c"):
                                                          else json.dumps(args)}}
 
 
-def agent(*turns, user="fix the failing test", tail=None):
+WORDS = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi".split()
+
+
+def changing(k, j):
+    """A tool result that is new each time (not only by its numbers): no loop over the window."""
+    return f"failed in test_{WORDS[k]}_{WORDS[j]}"
+
+
+def agent(*turns, user="fix the failing test", tail=None, result="1 failed"):
     """An OpenAI chat request: the user's message, then for each turn an assistant message with its calls and one tool
-    result per call.  A turn is a list of calls, or a string (an assistant message without a call)."""
+    result per call.  A turn is a list of calls, or a string (an assistant message without a call).  `result`: the
+    text of every result, or a function (turn, call) -> its text."""
     msgs = [{"role": "system", "content": "You are a coding agent."}, {"role": "user", "content": user}]
     for k, turn in enumerate(turns):
         if isinstance(turn, str):
@@ -45,7 +55,8 @@ def agent(*turns, user="fix the failing test", tail=None):
             continue
         calls = [dict(c, id=f"call_{k}_{j}") for j, c in enumerate(turn)]
         msgs.append({"role": "assistant", "content": "", "tool_calls": calls})
-        msgs += [{"role": "tool", "tool_call_id": c["id"], "content": "1 failed"} for c in calls]
+        msgs += [{"role": "tool", "tool_call_id": c["id"], "content": result(k, j) if callable(result) else result}
+                 for j, c in enumerate(calls)]
     if tail:
         msgs += tail
     return {"model": "x", "max_tokens": 50, "tools": TOOLS, "messages": msgs}
@@ -148,10 +159,13 @@ class QwenPrompt(unittest.TestCase):
         return svc.tok.decode(ids), out.getvalue()
 
     def test_no_repeats_render_as_before(self):
-        """Byte for byte: guard on and guard off give the same ids for every request that is not a loop."""
-        reqs = [agent(*[[call()]] * 3), agent([call()], [call("read", {"path": "x"})], [call()], [call()]),
-                agent(*[[call()]] * 2 + ["thinking out loud"] + [[call()]] * 3), {"model": "x", "messages": [
-                    {"role": "user", "content": "hi"}]}]
+        """Byte for byte: guard on and guard off give the same ids for every request that is not a loop (results that
+        change each time: no loop over the window either)."""
+        reqs = [agent(*[[call()]] * 3, result=changing),
+                agent([call()], [call("read", {"path": "x"})], [call()], [call()], result=changing),
+                agent(*[[call()]] * 2 + ["thinking out loud"] + [[call()]] * 3, result=changing),
+                agent([call()], [call("read", {"path": "x"})], [call()], [call("read", {"path": "y"})]),
+                {"model": "x", "messages": [{"role": "user", "content": "hi"}]}]
         for req in reqs:
             with self.subTest(n=len(req["messages"])):
                 on, log = self.prompt(self.svc(), req)
@@ -259,10 +273,162 @@ class DeepSeekPrompt(unittest.TestCase):
         self.assertTrue(on.endswith(E.ASSISTANT_SP_TOKEN + E.thinking_start_token))
 
     def test_no_repeats_render_as_before(self):
-        for req in (agent(*[[call()]] * 3), agent([call()], [call(args={"command": "ls"})], [call()], [call()])):
+        for req in (agent(*[[call()]] * 3, result=changing),
+                    agent([call()], [call(args={"command": "ls"})], [call()], [call()], result=changing)):
             with self.subTest(n=len(req["messages"])):
                 self.assertEqual(self.prompt(req)[0], self.prompt(req, 0)[0])
 
+
+class Windowed(unittest.TestCase):
+    """0.95 (after Maya 770ddef / 989ee69): a call the last WINDOW calls since the user's message hold TIMES times with
+    the same arguments and result - A, B, A, B loops and loops with other calls between, which no run in a row shows."""
+
+    def w(self, req):
+        return LG.windowed(template_messages(req))
+
+    def test_alternating_calls(self):
+        a, b = call("read", {"path": "a.py"}), call("read", {"path": "b.py"})
+        self.assertIsNone(LG.repeated(template_messages(agent([a], [b], [a], [b], [a], [b]))))   # the run: never
+        self.assertIsNone(self.w(agent([a], [b], [a], [b])))                                        # twice each
+        self.assertEqual(self.w(agent([a], [b], [a], [b], [a])), ("read", 3))
+        self.assertEqual(self.w(agent([a], [b], [a], [b], [a], [b])), ("read", 3))
+
+    def test_three_in_a_row_with_the_same_result(self):
+        self.assertEqual(self.w(agent(*[[call()]] * 3)), ("bash", 3))
+        self.assertIsNone(self.w(agent(*[[call()]] * 2)))
+        self.assertIsNone(self.w(agent(*[[call()]] * 3, result=changing)))       # a new result each time: no loop
+
+    def test_numbers_only_in_a_row(self):
+        """The same call right after itself, its result different only in numbers: the same (a check run again with
+        nothing changed); with another call in between it needs the very same result."""
+        self.assertEqual(self.w(agent(*[[call()]] * 3, result=lambda k, j: f"{k} failed, {k * 7} passed")), ("bash", 3))
+        turns = [[call()], [call("read", {"path": "x"})]] * 2 + [[call()]]
+        self.assertIsNone(self.w(agent(*turns, result=lambda k, j: f"{k} failed")))
+        self.assertEqual(self.w(agent(*turns)), ("bash", 3))
+
+    def test_non_ascii_results_are_compared(self):
+        """Results in CJK text that differ are not the same; ones that differ only in numbers still are."""
+        logs = ["日志：成功", "日志：失败", "错误：磁盘已满"]
+        self.assertIsNone(self.w(agent(*[[call()]] * 3, result=lambda k, j: logs[k])))
+        self.assertEqual(self.w(agent(*[[call()]] * 3, result=lambda k, j: f"日志：{k} 个失败")), ("bash", 3))
+
+    def test_a_wait_needs_the_same_result(self):
+        poll = call(args={"command": "sleep 30; tail -n 1 train.log"})
+        self.assertIsNone(self.w(agent(*[[poll]] * 4, result=lambda k, j: f"step {k * 100}")))
+        self.assertEqual(self.w(agent(*[[poll]] * 3, result="step 100")), ("bash", 3))
+
+    def test_the_window_is_twelve_calls(self):
+        a = call("read", {"path": "a.py"})
+        other = [[call("read", {"path": f"f{k}.py"})] for k in range(10)]
+        self.assertIsNone(self.w(agent([a], *other, [a], [a])))                 # the first one fell out
+        self.assertEqual(self.w(agent([a], *other[:9], [a], [a])), ("read", 3))
+
+    def test_the_users_message_starts_over(self):
+        a, b = call("read", {"path": "a.py"}), call("read", {"path": "b.py"})
+        first = template_messages(agent([a], [b], [a]))
+        again = [{"role": "assistant", "content": "", "tool_calls": [dict(a, id="z")]},
+                 {"role": "tool", "tool_call_id": "z", "content": "1 failed"}]
+        for text, fires in (("now look at b.py instead", False), ("continue", True), ("OK.", True),
+                            ("<system-reminder>todo list changed</system-reminder>", True),
+                            ("<system-reminder>x</system-reminder> and also fix c.py", False)):
+            with self.subTest(text=text):
+                msgs = first + [{"role": "assistant", "content": "Done."}, {"role": "user", "content": text}] + again
+                self.assertEqual(LG.windowed(msgs) is not None, fires)
+        parts = [{"type": "text", "text": "go on"}]
+        self.assertTrue(LG.no_news({"role": "user", "content": parts}))
+
+    def test_only_the_windows_results_are_read(self):
+        """A long session: only the last WINDOW results are serialised and gisted, not every result before them."""
+        a, b = call("read", {"path": "a.py"}), call("read", {"path": "b.py"})
+        msgs = template_messages(agent(*[[call("read", {"path": f"f{k}.py"})] for k in range(40)], [a], [b], [a], [b], [a]))
+        with mock.patch.object(LG, "_gist", wraps=LG._gist) as gist:
+            self.assertEqual(LG.windowed(msgs), ("read", 3))
+        self.assertLessEqual(gist.call_count, LG.WINDOW)
+
+    def test_one_turn_counts_once(self):
+        """A batch with the same call three times is no loop by itself."""
+        self.assertIsNone(self.w(agent([call(), call(), call()])))
+        self.assertEqual(self.w(agent([call(), call()], [call("read", {"path": "x"})], [call()], [call()])), ("bash", 3))
+
+    def test_only_the_last_turns_calls(self):
+        """A loop that is over (the last turn made something else) gets no note."""
+        self.assertIsNone(self.w(agent(*[[call()]] * 3, [call("read", {"path": "x"})])))
+
+    def test_only_when_the_request_answers_the_call(self):
+        req = agent(*[[call()]] * 3)
+        req["messages"] = req["messages"][:-1]
+        self.assertIsNone(self.w(req))
+        self.assertIsNone(LG.windowed(template_messages(agent(*[[call()]] * 3)), 0))     # off
+        self.assertIsNone(LG.windowed([]))
+
+    def test_anthropic_alternating(self):
+        msgs = [{"role": "user", "content": "fix it"}]
+        for k in range(5):
+            path = "a.py" if k % 2 == 0 else "b.py"
+            msgs.append({"role": "assistant", "content": [
+                {"type": "tool_use", "id": f"t{k}", "name": "Read", "input": {"file_path": path}}]})
+            msgs.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": f"t{k}", "content": f"contents of {path}"},
+                {"type": "text", "text": "<system-reminder>Remember the todo list.</system-reminder>"}]})
+        self.assertEqual(LG.windowed(anthropic_to_messages({"messages": msgs, "max_tokens": 10})[0]), ("Read", 3))
+
+    def test_setting(self):
+        self.assertEqual(LG.window_setting(None), LG.TIMES)
+        self.assertEqual(LG.window_setting({"repeats": 5}), LG.TIMES)
+        self.assertEqual(LG.window_setting({"window": False}), 0)
+        self.assertEqual(LG.window_setting(False), 0)
+        self.assertEqual(LG.setting({"window": False}), LG.REPEATS)
+        self.assertEqual(LG.setting({"repeats": 5, "window": True}), 5)
+        with self.assertRaises(ValueError):
+            LG.setting({"window": "no"})
+
+    def test_prompt(self):
+        """Through the server: the window's note after the last result; the run's note wins when both fire; a
+        guard turned off (repeats 0) or the window off leaves the prompt as it was."""
+        q = QwenPrompt()
+        a, b = call("read", {"path": "a.py"}), call("read", {"path": "b.py"})
+        req = agent([a], [b], [a], [b], [a])
+        on, log = q.prompt(q.svc(), req)
+        off, _ = q.prompt(q.svc(0), req)
+        note = LG.window_note("read", 3)
+        head = off[:off.rindex("<|im_start|>assistant")]
+        self.assertEqual(on[len(head):], "<|im_start|>user\n" + note + "<|im_end|>\n" + off[len(head):])
+        self.assertIn("[strata] loop guard: read made 3 times in the last 12 calls", log)
+        svc = q.svc()
+        svc.loop_guard_window = 0
+        self.assertEqual(q.prompt(svc, req)[0], off)
+        both, log = q.prompt(q.svc(), agent(*[[call()]] * 4))
+        self.assertIn(LG.note("bash", 4), both)
+        self.assertNotIn(LG.window_note("bash", 4), both)
+
+
+
+class ReminderScan(unittest.TestCase):
+    """strip_reminders gives REMINDER.search / REMINDER.sub's results in linear time (the regex was quadratic on many
+    openers with no closer, and runs on every chat request)."""
+
+    def test_same_results_as_the_regex(self):
+        import random
+        from serve import loop_guard as LG
+        pieces = ["<system-reminder>", "</system-reminder>", "x", " ", "\n", "<system-", "reminder>", "</system"]
+        rng = random.Random(7)
+        cases = ["", "hi", "<system-reminder>a</system-reminder>", "<system-reminder>a</system-reminder> b",
+                 "<system-reminder>a", "</system-reminder><system-reminder>b</system-reminder>",
+                 "<system-reminder><system-reminder>a</system-reminder>x</system-reminder>"]
+        cases += ["".join(rng.choice(pieces) for _ in range(rng.randrange(0, 12))) for _ in range(3000)]
+        for text in cases:
+            want = (LG.REMINDER.search(text) is not None, LG.REMINDER.sub("", text))
+            self.assertEqual(LG.strip_reminders(text), want, repr(text))
+
+    def test_many_openers_without_a_closer_are_fast(self):
+        import time
+        from serve import loop_guard as LG
+        for text in ("<system-reminder>" * 20000, "<system-reminder>x" * 20000 + "</system-reminder>"):
+            t0 = time.perf_counter()
+            LG.no_news({"role": "user", "content": text})
+            self.assertLess(time.perf_counter() - t0, 0.5)
+        self.assertFalse(LG.no_news({"role": "user", "content": "<system-reminder>" * 20000}))
+        self.assertTrue(LG.no_news({"role": "user", "content": "<system-reminder>x</system-reminder>  "}))
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ real StrataEngine and Service, so the server's side is tested without a GPU: req
 wait for a slot, /metrics shows the slots, each request's history row is its own, and a conversation's next turn
 goes back to the slot that holds it."""
 import json
+import queue
 import sys
 import tempfile
 import threading
@@ -220,6 +221,59 @@ class ParallelArgs(unittest.TestCase):
 
         args = engine_args({"args": ["--pack", "p"], "parallel": 2})
         self.assertEqual(args[-2:], ["--batch", "2"])
+
+
+class SlotClaimHandover(unittest.TestCase):
+    """#100 (after upstream Xolotl 2d1df99d): a request leaving its slot hands its claim to the BDONE wait in one step.
+    The caller used to drop "its" claim after the wait had started; with BDONE already queued (a reply that ended on its
+    stop token) the wait freed the slot at once, the next request claimed it, and the late discard removed THAT request's
+    claim - the orphan reaper then freed a decoding slot and a third request got BGEN refusals and a 503."""
+
+    def engine(self, n=1):
+        e = StrataEngine("missing-executable", [], lazy=True)
+        e.slot_q = [queue.Queue() for _ in range(n)]
+        e.slot_busy = [True] * n
+        e.slot_held = [[] for _ in range(n)]
+        e.slot_claims, e.slot_releasing, e._orphan_seen = set(), set(), {}   # (a lazy engine sets these at its load)
+        if "slot_cv" not in e.__dict__:
+            e.slot_cv = threading.Condition()
+        e._send = lambda line: None                     # no engine process: BSTOP goes nowhere
+        return e
+
+    def test_the_claim_passes_to_the_bdone_wait_before_it_runs(self):
+        import serve.server as server
+        e = self.engine()
+        e.slot_claims.add(0)
+        e.slot_q[0].put("BDONE 0 5")                   # the reply ended on its stop token: BDONE is already there
+        waits = []
+
+        class Held:                                     # the BDONE wait, held back so the hand-over can be seen
+            def __init__(self, target=None, daemon=None, **kw):
+                waits.append(target)
+
+            def start(self):
+                pass
+
+        with mock.patch.object(server.threading, "Thread", Held):
+            e._release_slot_when_done(0, [1, 2, 3])
+        with e.slot_cv:
+            self.assertNotIn(0, e.slot_claims, "the leaving request's claim is still there for the caller to drop")
+            self.assertIn(0, e.slot_releasing)
+            e.ORPHAN_SLOT_S = 0.0
+            self.assertEqual(e._reap_orphan_slots(), [])  # owned by the wait: never reaped
+        waits[0]()                                      # BDONE: the slot is free
+        self.assertEqual((e.slot_busy, e.slot_releasing), ([False], set()))
+        with e.slot_cv:                                 # the next request takes it, and its claim stays
+            e.slot_busy[0] = True
+            e.slot_claims.add(0)
+            self.assertEqual(e._reap_orphan_slots(), [])
+        self.assertEqual(e.slot_claims, {0})
+
+    def test_a_slot_gone_after_a_restart_drops_the_claim(self):
+        e = self.engine(1)
+        e.slot_claims.add(3)                            # the engine came back with fewer slots
+        e._release_slot_when_done(3, None)
+        self.assertEqual(e.slot_claims, set())
 
 
 class PickSlot(unittest.TestCase):
@@ -729,6 +783,41 @@ class ParallelService(unittest.TestCase):
             self.assertEqual(t["prompt_n"] + t["cache_n"], r["usage"]["prompt_tokens"], t)
             self.assertEqual(t["predicted_n"], 10, t)
         self.assertFalse(any(self.engine.slot_busy))                 # the slots are free (no BDONE left for a wait)
+
+    def test_the_request_path_leaves_the_next_owners_claim(self):
+        """#100, the call site: once _release_slot_when_done returns, the slot may already be freed by its BDONE and
+        claimed by the next request; the leaving request's finally must not drop that claim (the late discard did)."""
+        self.start(2)
+        e = self.engine
+        real = e._release_slot_when_done
+        taken = []
+
+        def then_the_next_request_claims_it(slot, stream=None):
+            real(slot, stream)
+            deadline = time.time() + 10
+            while time.time() < deadline:               # the BDONE wait frees the slot ...
+                with e.slot_cv:
+                    if not e.slot_busy[slot] and slot not in e.slot_releasing:
+                        e.slot_busy[slot] = True        # ... and the next request claims it, all before this returns
+                        e.slot_claims.add(slot)
+                        taken.append(slot)
+                        return
+                time.sleep(0.01)
+
+        res = {}
+        with mock.patch.object(e, "_release_slot_when_done", then_the_next_request_claims_it):
+            a = threading.Thread(target=lambda: res.setdefault("a", self.chat("first question LONGREPLY", 200)))
+            a.start()
+            time.sleep(0.05)
+            res["b"] = self.chat("second question", 200)
+            a.join(30)
+        self.assertTrue(taken, "no request left a slot through _release_slot_when_done")
+        with e.slot_cv:
+            for slot in taken:
+                self.assertIn(slot, e.slot_claims, "the leaving request dropped the next owner's claim")
+                e.slot_claims.discard(slot)             # (the stand-in owner leaves)
+                e.slot_busy[slot] = False
+            e.slot_cv.notify_all()
 
     def test_a_request_moved_between_solo_and_slot_keeps_its_totals(self):
         """#1869/#1870: a request that read its prompt and decoded on the solo path, was STOPped when another arrived and

@@ -5,7 +5,7 @@ rem   build-ds41.bat portable    for OTHER PCs: any x86-64 CPU with AVX2 (Intel 
 rem                              AVX-512 / AVX-VNNI kernels are picked at run time), RTX 20 / 30 / 40 / 50 (sm_75;86;89;120),
 rem                              static MSVC runtime                                              -> build-ds41-portable\
 rem   build-ds41.bat compat-avx  for OLDER CPUs with AVX but not AVX2 (Sandy / Ivy Bridge, 2011-2013): ggml's AVX
-rem                              paths (round 154 here, the engine held at AVX: 38 tok/s vs 17.5 with the SSE4.2 build);
+rem                              paths (measured here, the engine held at AVX: 38 tok/s vs 17.5 with the SSE4.2 build);
 rem                              RTX 20 / 30 / 40 / 50, static MSVC runtime                        -> build-ds41-compat-avx\
 rem   build-ds41.bat compat      for the OLDEST: any x86-64 CPU with SSE4.2 (e.g. Westmere Xeons; the engine's AVX
 rem                              kernels are picked at run time where the CPU has AVX), slower on the CPU side; RTX 20 /

@@ -67,11 +67,21 @@ public:
     /// finish and reports errors.  `out` must stay alive and untouched until wait() returns - it is the destination, not
     /// a copy.  Lets a caller overlap a pass's reads with unrelated work (the dense half knows all hashes at begin()).
     struct Batch;
-    std::shared_ptr<Batch> start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err);
+    /// blk > 0 (STRATA_ENGRAM_READAHEAD, Abyss 77d4541's row store): the batch is deduped / sorted / coalesced per block of
+    /// `blk` tokens and per table, and the reads are queued table 0's blocks first, in token order, then table 1's - so
+    /// wait_cols() can hand a layer's first columns over while the rest is still being read.  The same rows land in the same
+    /// slots of `out` (exact); only the read order and the cross-block dedup differ.  blk = 0: one segment a table (as before).
+    std::shared_ptr<Batch> start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err, int blk = 0);
     bool wait(const std::shared_ptr<Batch> & b, std::string & err);
     /// Wait for table `e`'s rows of the batch only (its slot of `out` is complete on return; the other tables may still
     /// be reading).  wait() is still due before the batch is dropped.
     bool wait_table(const std::shared_ptr<Batch> & b, int e, std::string & err);
+    /// Wait for table `e`'s rows of tokens [t0, t1) of the batch only (a blk > 0 batch: the blocks covering them; blk = 0:
+    /// the whole table, as wait_table).  wait() is still due before the batch is dropped.
+    bool wait_cols(const std::shared_ptr<Batch> & b, int e, int64_t t0, int64_t t1, std::string & err);
+    /// Skip the batch's reads not yet started (a read-ahead nobody will take); wait() is still due, and `out` is then
+    /// partly unwritten - for a batch that is dropped.
+    static void cancel(const std::shared_ptr<Batch> & b);
     /// Drop this module's tables from the page cache (posix_fadvise DONTNEED on our own fds; not a global drop).
     void drop_cache();
     /// bytes read so far (stats)

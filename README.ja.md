@@ -1,4 +1,6 @@
-> **注意:** この翻訳は古いバージョンの内容です。0.94 については英語の [README.md](README.md) が最新です。
+> **注意:** この翻訳は古いバージョンの内容です。0.95 については英語の [README.md](README.md) が最新です。
+>
+> 0.95 の数値（DeepSeek V4.1：RAM 容量ごとの速度と一致率、すべての PC で UD-IQ2_XXS が標準）は英語の [README.md](README.md) の「Speed by RAM size (0.95)」にあります。ここの表は古い内容です。
 
 <h1 align="center">Strata</h1>
 

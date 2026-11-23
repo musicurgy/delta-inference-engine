@@ -68,6 +68,13 @@ class DrafterPlan(unittest.TestCase):
         with mock.patch.dict(os.environ, {"DS41_NO_DRAFTER": "1"}):
             self.assertEqual(self.plan(True), "none")
 
+    def test_a_checkpoint_without_its_own_matrix_requantises_uniformly(self):
+        """R-2: a row with no derived.drafter_imatrix never borrows 1017's"""
+        with mock.patch.dict(S._DE, {"drafter_imatrix": None}):
+            self.assertFalse(S.imatrix_usable())
+        with mock.patch.dict(S._CK, {"id": "v41"}):   # 1017's matrix offered to another checkpoint
+            self.assertFalse(S.imatrix_usable())
+
     def test_shipped_matrix_is_in_the_repo(self):
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         p = os.path.join(root, "tools", "v41", "serve", "drafter-imatrix.bin")

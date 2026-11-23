@@ -15,14 +15,24 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ckpt  # noqa: E402  (the checkpoint table: data/ds41/checkpoints.json)
+
 GB = 1e9
 MARGIN = 5 * GB
-Q2_NAME = "DeepSeek-V4.1-Flash-1017-Q2.gguf"
+# the checkpoint's file names (its row in data/ds41/checkpoints.json; "" = it has no such file)
+try:
+    _CK = ckpt.row()
+except ckpt.TableError as _e:   # e.g. an unknown DS41_CHECKPOINT: one clear line, not a traceback
+    sys.exit(f"setup_space: {_e}")
+_DE = _CK.get("derived") or {}
+Q2_NAME = ((_CK.get("models") or {}).get("ds4_q2") or {}).get("file") or ""
 Q2 = 365.7 * GB                                 # the ds4 Q2 GGUF: the model and its Engram tables
 MTP_SHARDS, SIDECAR, DRAFTER = 7.9 * GB, 7.9 * GB, 4.2 * GB
-VISION = 0.97 * GB                             # pictures: DeepSeek-V4.1-Flash-1017-Vision.gguf
+VISION = 0.97 * GB                             # pictures: the checkpoint's vision GGUF (1017: DeepSeek-V4.1-Flash-1017-Vision.gguf)
+VISION_NAME = _DE.get("vision") if _DE.get("vision_repo") else ""   # none to download: no step
 # the drafter: 0.94's (experts shrunk with drafter-imatrix.bin, +0.6% drafts accepted), 0.93's (uniform), their source
-IMX_NAME, UNIFORM_NAME, SOURCE_NAME = "V41-1017-MTP-iq2xxs-imx.gguf", "V41-1017-MTP-iq2xxs.gguf", "V41-1017-MTP.gguf"
+IMX_NAME, UNIFORM_NAME, SOURCE_NAME = _DE.get("drafter") or "", _DE.get("drafter_uniform") or "", _DE.get("drafter_source") or ""
 VOICE = 1.08 * GB                              # voice: speech\ (Parakeet TDT 0.6B v3 int8, Kokoro-82M v1.0, Silero VAD)
 
 
@@ -39,8 +49,12 @@ def partial(folder):
 
 
 def imatrix_usable():
-    """setup-ds41-models.bat's rule: drafter-imatrix.bin beside the engine build's v41_sidecar_requant.exe (or in
-    tools/v41/serve of a source checkout), and an exe that knows --imatrix (one from before 0.94 answers "unknown arg")"""
+    """setup-ds41-models.bat's rule: the checkpoint's importance matrix (its row's derived.drafter_imatrix; none: the
+    uniform requant) beside the engine build's v41_sidecar_requant.exe (or at its place in a source checkout), made for
+    this checkpoint (ckpt.imatrix_ok), and an exe that knows --imatrix (one from before 0.94 answers "unknown arg")"""
+    rel = _DE.get("drafter_imatrix")
+    if not rel:
+        return False
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     sys.path.insert(0, os.path.join(root, "tools", "v41", "serve"))
     try:
@@ -49,11 +63,16 @@ def imatrix_usable():
     except Exception:  # noqa: BLE001
         folder = "build-ds41"
     req = os.path.join(root, folder, "v41_sidecar_requant.exe")
-    imx = os.path.join(root, folder, "drafter-imatrix.bin")
+    imx = os.path.join(root, folder, os.path.basename(rel))
     if not os.path.exists(imx):
-        imx = os.path.join(root, "tools", "v41", "serve", "drafter-imatrix.bin")
+        imx = os.path.join(root, *rel.split("/"))
     if not os.path.exists(imx):
         return False
+    try:
+        if not ckpt.imatrix_ok(imx, _CK["id"])[0]:
+            return False
+    except (OSError, ckpt.TableError):
+        pass
     if not os.path.exists(req):
         return True   # no engine yet: first-start fetches the current one, which knows it
     try:
@@ -68,7 +87,7 @@ def drafter_plan(m):
     drafter yet) / upgrade (0.93's is there and 0.94's is made now: from the full-size drafter still on disk, or - asked
     for with setup-ds41-models.bat drafter-imx / DS41_DRAFTER_IMX=1 - after downloading its 7.9 GB of shards again) /
     opt-in (0.93's is there and kept: the 7.9 GB download for ~0.3% speed is the user's call)"""
-    if os.environ.get("DS41_NO_DRAFTER") == "1" or os.path.exists(os.path.join(m, IMX_NAME)):
+    if os.environ.get("DS41_NO_DRAFTER") == "1" or not IMX_NAME or os.path.exists(os.path.join(m, IMX_NAME)):
         return "none"
     has_uniform = os.path.exists(os.path.join(m, UNIFORM_NAME))
     if not has_uniform:
@@ -112,7 +131,7 @@ def main():
     except OSError:
         vis = ""
     vis = os.environ.get("DS41_VISION", "").strip().lower() or vis or "on"     # on by default since 0.94
-    if vis not in ("off", "0", "no", "none", "false", "disable", "disabled") and not os.path.exists(os.path.join(m, "DeepSeek-V4.1-Flash-1017-Vision.gguf.ok")):
+    if VISION_NAME and vis not in ("off", "0", "no", "none", "false", "disable", "disabled") and not os.path.exists(os.path.join(m, VISION_NAME + ".ok")):
         steps.append(("pictures (0.97 GB)", VISION, VISION))
     # voice (off unless voice-choice.txt / DS41_VOICE says cpu or gpu: Enable Voice.bat)
     try:
@@ -124,7 +143,7 @@ def main():
     if (voc == "cpu" or voc.startswith("gpu")) and not os.path.exists(
             os.path.join(m, "speech", "kokoro-multi-lang-v1_0", "model.onnx.ok")):
         steps.append(("voice (1.1 GB)", VOICE, VOICE))
-    if not old and not os.path.exists(os.path.join(m, Q2_NAME + ".ok")):
+    if not old and Q2_NAME and not os.path.exists(os.path.join(m, Q2_NAME + ".ok")):
         n = max(0.0, Q2 - size(os.path.join(m, Q2_NAME)) - partial(m))
         steps.append(("main model (366 GB download)", n, n))
     if not steps:

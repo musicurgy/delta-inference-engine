@@ -450,10 +450,15 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             }
             char gib[32];
             std::snprintf(gib, sizeof gib, "%.1f", (double) limit / (double) (1ull << 30));
+            // Pinning a large arena in one call is often refused on Windows; the slices then hold it, which is the
+            // normal path there, so say so plainly.  FAILED only when not even one slice could be pinned.
             note = (capped ? "cudaHostRegister limited to " + std::to_string(cap >> 30) + " GiB " + cap_why + "; " :
-                             "cudaHostRegister of the whole arena FAILED (" + std::string(cudaGetErrorString(e)) + "); " +
+                             (registered_slices > 0
+                                  ? "pinned in slices (one call for the whole arena was refused: " +
+                                        std::string(cudaGetErrorString(e)) + ", usual for a large arena); "
+                                  : "cudaHostRegister of the whole arena FAILED (" + std::string(cudaGetErrorString(e)) + "); ") +
                              (limited ? "slices capped at " + std::string(gib) + " GiB (" + limit_why +
-                                        "; STRATA_ARENA_PIN_GIB=auto; N sets a cap; #243); " : std::string())) +
+                                        "; STRATA_ARENA_PIN_GIB=auto; N sets a cap); " : std::string())) +
                    std::to_string(registered_slices) + " slices pinned (" + std::to_string(registered_bytes >> 30) +
                    " GiB); " + note;
             if (registered_bytes < bytes) {

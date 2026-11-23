@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
-from serve.winjob import contain   # (no serve.server import: winjob imports nothing of the server's)
+from serve.winjob import start_contained   # (no serve.server import: winjob imports nothing of the server's)
 
 # A short probe: a healthy local audio server answers /health at once; if it does not, it is not up yet.
 HEALTH_TIMEOUT_S = 2.0
@@ -82,16 +82,15 @@ class VoiceServer:
             args = [self.cmd, *[a.format(port=self.port) for a in self.args]]
             self._say(f"starting the {self.kind} server on port {self.port} (lazy)")
             try:
-                self.proc = subprocess.Popen(               # noqa: S603 - the command comes from the config
+                # ends with the server however it ends (Windows: closing the window, the Setup card's restart -
+                # os._exit): an orphan kept its port and answered the next start's health check, then refused its token
+                self.proc = start_contained(               # noqa: S603 - the command comes from the config
                     args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=self._log or (None if self.show_log else subprocess.DEVNULL), text=True,
                     env={**os.environ, **self.env, TOKEN_ENV: self.token})
             except OSError as e:
                 self.proc = None
                 raise RuntimeError(f"the {self.kind} server could not start: {e}") from None
-            # ends with the server however it ends (Windows: closing the window, the Setup card's restart - os._exit):
-            # an orphan kept its port and answered the next start's health check, then refused its token
-            contain(self.proc)
             self.stopped = False
             # the start counts as use: until the caller's touch() after ensure(), last_used was 0 (or the last
             # idle stop), so an idle-loop tick landing during a slow cold start stopped the child under the

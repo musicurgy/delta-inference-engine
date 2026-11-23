@@ -422,7 +422,7 @@ bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
 
 // The tables from a GGUF given as an --engram entry (a split GGUF: any of its files - every shard is searched):
 //   blk.{L}.engram_embd.weight, I8 [dim + dim/32, rows]: DeepSeek's FP8 rows, the 256 weight bytes then the 8 scale
-//     bytes (nazeshinjite's ds4 GGUF carries them inline: byte for byte the official shards', round 164) - one pread
+//     bytes (nazeshinjite's ds4 GGUF carries them inline: byte for byte the official shards') - one pread
 //     a row group;
 //   blk.{L}.engram_embd.weight, IQ4_NL [dim, rows]: ISTA-DASLab's Engram GGUF (upstream b2ad0ca), 144-byte rows;
 //   per_layer_token_embd.weight, IQ4_NL / MXFP8 / Q5_K [dim, rows(L1) + rows(L14)]: llama.cpp mainline's (Unsloth's) -
@@ -446,6 +446,12 @@ bool Ds41Engram::open_gguf(const std::string & path, std::string & err) {
                 t->shape[0] != (uint64_t) dim_ || t->shape[1] != total) {
                 err = "engram: per_layer_token_embd.weight in " + path + " is not IQ4_NL / MXFP8 / Q5_K [" + std::to_string(dim_) + ", " +
                       std::to_string(total) + "]";
+                return false;
+            }
+            // type 43 is also mainline ggml's F8_E4M3 (one byte a value, no block scale): told apart by the room it has
+            if (t->type == (uint32_t) kMxfp8 && ds41_type43_layout(m, *t, si) == Ds41Fp8Layout::F8E4M3) {
+                err = "engram: per_layer_token_embd.weight in " + path + " is type 43 with one byte a value (ggml's F8_E4M3, "
+                      "llama.cpp v0.9.0+), not the 33-byte MXFP8 blocks this reader takes";
                 return false;
             }
             qt = (int) t->type;
@@ -662,7 +668,8 @@ bool Ds41Engram::rows_reference(int64_t pos0, int n, std::vector<std::vector<flo
 // (so [off_w, off_w+len_w) is the exact byte span, one pread), and their scale bytes span [off_s, off_s+len_s) (a second).
 // The group dequantizes each row straight into its output slots - no intermediate buffer, no second pass.
 struct Ds41Engram::ReadGroup {
-    int64_t e = 0;                    // layer slot (indexes the batch's per-layer state)
+    int64_t e = 0;                    // layer slot (indexes `out` and the per-table counters)
+    int64_t s = 0;                    // segment (indexes uniq / packed / run_begin): e * nb + block; = e when nb = 1
     uint64_t off_w = 0, off_s = 0;    // weight / scale byte spans
     uint32_t len_w = 0, len_s = 0;
     uint32_t u0 = 0, count = 0;       // rows uniq[u0 .. u0+count)
@@ -672,13 +679,20 @@ struct Ds41Engram::Batch {
     int64_t n = 0;
     std::vector<std::vector<float>> * out = nullptr;  // [layer][n * cols * dim], the caller's storage
     std::vector<ReadGroup> groups;
-    std::vector<std::vector<uint32_t>> uniq;          // [layer] sorted unique row ids
-    std::vector<std::vector<uint64_t>> packed;         // [layer] sorted (row_id << 32 | slot): no-comparator sort
-    std::vector<std::vector<uint32_t>> run_begin;     // [layer] unique row -> first sorted position (size u+1)
+    // segments: [layer] when nb = 1; [layer * nb + block] for a blocked batch (start's blk > 0)
+    int64_t blk = 0, nb = 1;                          // tokens a block (0: one segment a table), blocks a table
+    std::vector<std::vector<uint32_t>> uniq;          // [segment] sorted unique row ids
+    std::vector<std::vector<uint64_t>> packed;         // [segment] sorted (row_id << 32 | slot): no-comparator sort
+    std::vector<std::vector<uint32_t>> run_begin;     // [segment] unique row -> first sorted position (size u+1)
     // In-RAM rows (hot set / row cache) found by start(): dequantized by the pool together with the reads (was serial on
     // the caller: a fully cached 4096-token prompt chunk took ~0.45 s single-threaded, 2026-10-19).
-    struct Hit { int32_t e; uint32_t k; const uint8_t * w; };
+    struct Hit { int32_t e; uint32_t k; const uint8_t * w; int32_t s; };
     std::vector<Hit> hits;
+    // the task's work items in order: >= 0 a read group, < 0 the hit chunk hch[-x - 1] (hits [first, second))
+    std::vector<int64_t> items;
+    std::vector<std::pair<size_t, size_t>> hch;
+    std::atomic<bool> cancelled { false };            // cancel(): the reads not yet started are skipped
+    std::unique_ptr<std::atomic<int64_t>[]> left_seg; // [segment] work left (nb > 1 only)
     std::shared_ptr<Task> read_task;
     std::atomic<int> bad { 0 };
     std::atomic<uint64_t> bytes { 0 };
@@ -687,8 +701,9 @@ struct Ds41Engram::Batch {
     std::atomic<int64_t> left[4] {};
     std::mutex left_mu;
     std::condition_variable left_cv;
-    void one_done(int e) {
-        if (left[e].fetch_sub(1) == 1) { std::lock_guard<std::mutex> lk(left_mu); left_cv.notify_all(); }
+    void one_done(int e, int64_t s) {
+        const bool seg0 = left_seg && left_seg[s].fetch_sub(1) == 1;
+        if (left[e].fetch_sub(1) == 1 || seg0) { std::lock_guard<std::mutex> lk(left_mu); left_cv.notify_all(); }
     }
 };
 
@@ -715,7 +730,8 @@ void Ds41Engram::drop_cache() {
     }
 }
 
-std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err) {
+std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err,
+                                                     int blk) {
     const int64_t nel = (int64_t) tables_.size();
     if (nel == 0) { err = "engram: no tables"; return nullptr; }
     if (n <= 0) { err = "engram: empty batch"; return nullptr; }
@@ -723,38 +739,54 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
     b->n = n;
     b->out = &out;
     const int64_t cols = cols_, dim = dim_, wb = wrow_, srsz = srow_, m = n * cols;   // dim: floats a row; wb + srsz: raw bytes
+    // blocked (STRATA_ENGRAM_READAHEAD): segment (e, block) covers tokens [block * blk, min(n, (block + 1) * blk)); each is
+    // deduped / sorted / coalesced on its own, so its rows complete together.  nb = 1: segment e = the whole table.
+    const int64_t nb = blk > 0 && blk < n ? (n + blk - 1) / blk : 1, nseg = nel * nb;
+    b->blk = nb > 1 ? blk : 0;
+    b->nb = nb;
+    if (nb > 1) {
+        b->left_seg.reset(new std::atomic<int64_t>[(size_t) nseg]);
+        for (int64_t s = 0; s < nseg; ++s) b->left_seg[s].store(0);
+    }
 
     std::vector<int64_t> ids((size_t) (nel * m));
     for (int64_t e = 0; e < nel; ++e)
         for (int64_t t = 0; t < n; ++t) hash(pos0 + t, (int) e, &ids[(size_t) ((e * n + t) * cols)]);
 
     out.resize((size_t) nel);
-    b->uniq.resize((size_t) nel); b->packed.resize((size_t) nel); b->run_begin.resize((size_t) nel);
-    for (int64_t e = 0; e < nel; ++e) {
+    b->uniq.resize((size_t) nseg); b->packed.resize((size_t) nseg); b->run_begin.resize((size_t) nseg);
+    std::vector<size_t> g_begin((size_t) nseg + 1, 0), h_begin((size_t) nseg + 1, 0);   // per segment: its groups / hits
+    for (int64_t e = 0; e < nel; ++e)
+      for (int64_t bi = 0; bi < nb; ++bi) {
+        const int64_t s = e * nb + bi;
+        g_begin[(size_t) s] = b->groups.size();
+        h_begin[(size_t) s] = b->hits.size();
         const Table & T = tables_[(size_t) e];
-        out[(size_t) e].assign((size_t) (m * dim), 0.0f);   // reuses the caller's capacity - no per-pass allocation
+        if (bi == 0) out[(size_t) e].assign((size_t) (m * dim), 0.0f);   // reuses the caller's capacity - no per-pass allocation
+        const int64_t i0 = nb > 1 ? bi * blk * cols : 0, i1 = nb > 1 ? std::min<int64_t>(n, (bi + 1) * blk) * cols : m;
+        const int64_t ms = i1 - i0;   // the segment's slots: [i0, i1) of the table's m
         // pack (row_id << 32 | slot) so the sort is a plain integer sort - no comparator, no indirection
-        auto & pk = b->packed[(size_t) e];
-        pk.resize((size_t) m);
+        auto & pk = b->packed[(size_t) s];
+        pk.resize((size_t) ms);
         const int64_t * id = &ids[(size_t) (e * m)];
-        for (int64_t i = 0; i < m; ++i) pk[(size_t) i] = ((uint64_t) (uint32_t) id[i] << 32) | (uint32_t) i;
+        for (int64_t i = i0; i < i1; ++i) pk[(size_t) (i - i0)] = ((uint64_t) (uint32_t) id[i] << 32) | (uint32_t) i;
         std::sort(pk.begin(), pk.end());
         // walk the sorted order once: unique rows (ascending -> ascending file offsets) and each unique row's slots
-        auto & uq = b->uniq[(size_t) e];
-        auto & rb = b->run_begin[(size_t) e];
-        for (int64_t p = 0; p < m; ++p) {
+        auto & uq = b->uniq[(size_t) s];
+        auto & rb = b->run_begin[(size_t) s];
+        for (int64_t p = 0; p < ms; ++p) {
             const uint32_t r = (uint32_t) (pk[(size_t) p] >> 32);
             if ((uint64_t) r >= (uint64_t) T.rows) b->bad.fetch_add(1);
             if (rb.empty() || uq.back() != r) { uq.push_back(r); rb.push_back((uint32_t) p); }
         }
-        rb.push_back((uint32_t) m);
+        rb.push_back((uint32_t) ms);
         const size_t u = uq.size();
         const uint64_t bw = T.off_w, bs = T.off_s;
         // In-RAM rows (hot set first, then the row cache) are dequantized into their slots now and never read; the
         // read groups below span the remaining rows only.
         std::vector<char> hit(u, 0);
         auto emit = [&](size_t k, const uint8_t * w) {   // queued; the pool dequantizes it (rows are never rewritten)
-            b->hits.push_back(Batch::Hit{ (int32_t) e, (uint32_t) k, w });
+            b->hits.push_back(Batch::Hit{ (int32_t) e, (uint32_t) k, w, (int32_t) s });
             hit[k] = 1;
         };
         if (!hot_keys_.empty()) {   // uq is ascending, so the search window only moves forward
@@ -791,46 +823,69 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
             const uint64_t w1 = bw + (uint64_t) uq[j - 1] * T.wst + (uint64_t) (T.packed ? wb + srsz : wb);
             const uint64_t s0 = bs + (uint64_t) uq[i] * T.sst;
             const uint64_t s1 = T.packed || srsz == 0 ? s0 : bs + (uint64_t) uq[j - 1] * T.sst + (uint64_t) srsz;
-            b->groups.push_back(ReadGroup{ e, w0, s0, (uint32_t) (w1 - w0), (uint32_t) (s1 - s0), (uint32_t) i, (uint32_t) (j - i) });
+            b->groups.push_back(ReadGroup{ e, s, w0, s0, (uint32_t) (w1 - w0), (uint32_t) (s1 - s0), (uint32_t) i, (uint32_t) (j - i) });
             i = j;
         }
-    }
+      }
+    g_begin[(size_t) nseg] = b->groups.size();
+    h_begin[(size_t) nseg] = b->hits.size();
     if (!b->groups.empty() || !b->hits.empty()) {
         auto t = std::make_shared<Task>();
         const int64_t ng = (int64_t) b->groups.size();
         constexpr int64_t HIT_CHUNK = 64;            // hits per work item
-        t->n = ng + ((int64_t) b->hits.size() + HIT_CHUNK - 1) / HIT_CHUNK;
+        // work items: one segment: every read group, then the hits in chunks (as before blocks existed); blocked: segment
+        // by segment (table 0's blocks in token order, then table 1's), each one's groups then its hit chunks
+        auto add_hits = [&](size_t h0, size_t h1) {
+            for (size_t h = h0; h < h1; h += HIT_CHUNK) {
+                b->hch.emplace_back(h, std::min(h1, h + (size_t) HIT_CHUNK));
+                b->items.push_back(-(int64_t) b->hch.size());
+            }
+        };
+        if (nb == 1) {
+            for (int64_t g = 0; g < ng; ++g) b->items.push_back(g);
+            add_hits(0, b->hits.size());
+        } else {
+            for (int64_t s = 0; s < nseg; ++s) {
+                for (size_t g = g_begin[(size_t) s]; g < g_begin[(size_t) s + 1]; ++g) b->items.push_back((int64_t) g);
+                add_hits(h_begin[(size_t) s], h_begin[(size_t) s + 1]);
+            }
+        }
+        t->n = (int64_t) b->items.size();
         Batch * bp = b.get();
-        for (const ReadGroup & G : b->groups) b->left[G.e].fetch_add(1);
-        for (const Batch::Hit & H : b->hits) b->left[H.e].fetch_add(1);
-        t->fn = [this, bp, dim, wb, srsz, ng](int64_t a, int64_t c) {
+        for (const ReadGroup & G : b->groups) { b->left[G.e].fetch_add(1); if (nb > 1) b->left_seg[G.s].fetch_add(1); }
+        for (const Batch::Hit & H : b->hits) { b->left[H.e].fetch_add(1); if (nb > 1) b->left_seg[H.s].fetch_add(1); }
+        t->fn = [this, bp, dim, wb, srsz](int64_t a, int64_t c) {
             uint8_t bw[4096 + 512], bs[1024];
             auto & outv = *bp->out;
-            for (int64_t g = a; g < c; ++g) {
-                if (g >= ng) {                       // a chunk of in-RAM rows: dequantize into the first slot, copy to the rest
-                    const size_t h0 = (size_t) (g - ng) * HIT_CHUNK, h1 = std::min(bp->hits.size(), h0 + HIT_CHUNK);
+            for (int64_t it = a; it < c; ++it) {
+                const int64_t g = bp->items[(size_t) it];
+                if (g < 0) {                         // a chunk of in-RAM rows: dequantize into the first slot, copy to the rest
+                    const size_t h0 = bp->hch[(size_t) (-g - 1)].first, h1 = bp->hch[(size_t) (-g - 1)].second;
+                    const bool skip = bp->cancelled.load(std::memory_order_relaxed);
                     for (size_t h = h0; h < h1; ++h) {
                         const Batch::Hit & H = bp->hits[h];
-                        const auto & pk = bp->packed[(size_t) H.e];
-                        const auto & rb = bp->run_begin[(size_t) H.e];
+                        if (skip) { bp->one_done(H.e, H.s); continue; }
+                        const auto & pk = bp->packed[(size_t) H.s];
+                        const auto & rb = bp->run_begin[(size_t) H.s];
                         float * oe = outv[(size_t) H.e].data();
                         float * o0 = oe + (size_t) (uint32_t) pk[rb[H.k]] * (size_t) dim;
                         deq_row(H.w, H.w + wb, o0);
                         for (uint32_t p = rb[H.k] + 1; p < rb[H.k + 1]; ++p)
                             std::memcpy(oe + (size_t) (uint32_t) pk[p] * (size_t) dim, o0, (size_t) dim * sizeof(float));
-                        bp->one_done(H.e);
+                        bp->one_done(H.e, H.s);
                     }
                     continue;
                 }
                 const ReadGroup & G = bp->groups[(size_t) g];
+                if (bp->cancelled.load(std::memory_order_relaxed)) { bp->one_done((int) G.e, G.s); continue; }
                 const Table & T = tables_[(size_t) G.e];
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
                     tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w, T.dfd_w) != (ssize_t) G.len_w ||
-                    (G.len_s && tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s, T.dfd_s) != (ssize_t) G.len_s)) { bp->bad.fetch_add(1); bp->one_done(G.e); continue; }
+                    (G.len_s && tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s, T.dfd_s) != (ssize_t) G.len_s)) { bp->bad.fetch_add(1); bp->one_done((int) G.e, G.s); continue; }
                 bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
-                const auto & uq = bp->uniq[(size_t) G.e];
-                const auto & pk = bp->packed[(size_t) G.e];
-                const auto & rb = bp->run_begin[(size_t) G.e];
+                const auto & uq = bp->uniq[(size_t) G.s];
+                const auto & pk = bp->packed[(size_t) G.s];
+                const auto & rb = bp->run_begin[(size_t) G.s];
                 float * oe = outv[(size_t) G.e].data();
                 const uint32_t r0 = uq[G.u0];      // the group's first (lowest-offset) row: the buffer's origin
                 for (uint32_t k = 0; k < G.count; ++k) {
@@ -853,7 +908,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                     for (uint32_t p = p0 + 1; p < rb[uu + 1]; ++p)               // ... and share it with the row's other slots
                         std::memcpy(oe + (size_t) (uint32_t) pk[p] * (size_t) dim, o0, (size_t) dim * sizeof(float));
                 }
-                bp->one_done(G.e);
+                bp->one_done((int) G.e, G.s);
             }
         };
         b->read_task = t;
@@ -896,6 +951,31 @@ bool Ds41Engram::wait_table(const std::shared_ptr<Batch> & b, int e, std::string
     }
     if (b->bad.load()) { err = "engram: " + std::to_string(b->bad.load()) + " row reads failed"; return false; }
     return true;
+}
+
+bool Ds41Engram::wait_cols(const std::shared_ptr<Batch> & b, int e, int64_t t0, int64_t t1, std::string & err) {
+    if (!b) { err = "engram: null batch"; return false; }
+    if (b->nb <= 1 || !b->left_seg) return wait_table(b, e, err);
+    if (e < 0 || e >= 4) { err = "engram: bad table"; return false; }
+    t0 = std::max<int64_t>(0, t0);
+    t1 = std::min<int64_t>(b->n, t1);
+    if (b->read_task && t0 < t1) {
+        const int64_t s0 = (int64_t) e * b->nb + t0 / b->blk, s1 = (int64_t) e * b->nb + (t1 - 1) / b->blk;
+        auto ready = [&] { for (int64_t s = s0; s <= s1; ++s) if (b->left_seg[s].load() > 0) return false; return true; };
+        if (!ready()) {
+            const auto c0 = std::chrono::steady_clock::now();
+            std::unique_lock<std::mutex> lk(b->left_mu);
+            b->left_cv.wait(lk, ready);
+            wait_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+            ++waits_;
+        }
+    }
+    if (b->bad.load()) { err = "engram: " + std::to_string(b->bad.load()) + " row reads failed"; return false; }
+    return true;
+}
+
+void Ds41Engram::cancel(const std::shared_ptr<Batch> & b) {
+    if (b) b->cancelled.store(true);
 }
 
 bool Ds41Engram::rows(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err) {

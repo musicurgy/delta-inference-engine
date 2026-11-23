@@ -175,7 +175,7 @@ void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, 
                                float* const* out, int r0, int r1) {
     bool bp = kBitplane && nblocks % 2 == 0;
     for (int t = 0; t < nt && bp; ++t) bp = a[t]->bp_pairs == nblocks / 2;
-    if (kBitplane) {   // once per outcome: whether the bit-plane kernel ran, and if not why (Xolotl win3090, round 51)
+    if (kBitplane) {   // once per outcome: whether the bit-plane kernel ran, and if not why (Xolotl)
         static std::atomic<int> said{0};
         const int bit = bp ? 1 : 2;
         if ((said.fetch_or(bit) & bit) == 0)

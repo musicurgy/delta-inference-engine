@@ -45,6 +45,12 @@ class _R:
 
 def read_header(path):
     """(metadata dict, tensors list of (name, dims, ggml type, offset)) from the file's header"""
+    meta, tensors, _ = _read_header(path)
+    return meta, tensors
+
+
+def _read_header(path):
+    """read_header + the byte where the header ends (the data section starts at the next general.alignment)"""
     with open(path, "rb") as f:
         r = _R(f)
         if f.read(4) != b"GGUF":
@@ -67,7 +73,47 @@ def read_header(path):
             typ = r.u("<I")
             off = r.u("<Q")
             tensors.append((name, dims, typ, off))
-    return meta, tensors
+        end = f.tell()
+    return meta, tensors, end
+
+
+# GGUF type ids the engine has a block layout for (block_geometry in include/strata/artifact/gguf_reader.hpp; checked by
+# test_gguf_head.py).  Any other id - ik_llama's 144+ (IQK / trellis types), Q8_K, F64, TQ1_0 / TQ2_0, Q1_0 - the engine
+# refuses by name (ds41_geometry.hpp ds41_type_known).
+KNOWN_TYPES = frozenset({0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+                         29, 30, 39, 40, 42, 43, 143})
+
+
+def layout43(dims, room):
+    """what a type-43 tensor holds, from its dims and the bytes it has in the file (up to the next tensor or the end):
+    "mxfp8" (Unsloth's Engram tables: one E8M0 scale + 32 E4M3 bytes per 32 values - what the engine reads),
+    "f8_e4m3" (mainline ggml's GGML_TYPE_F8_E4M3 = 43, llama.cpp v0.9.0+: one byte a value, no block scale) or
+    "unknown" (truncated).  The same rule as ds41_geometry.hpp ds41_type43_layout."""
+    n = 1
+    for d in dims:
+        n *= d
+    if dims and dims[0] % 32 == 0 and room >= n // 32 * 33:
+        return "mxfp8"
+    if room >= n:
+        return "f8_e4m3"
+    return "unknown"
+
+
+def type43_layout(path, name):
+    """layout43 of tensor `name` over the shards of the model `path` belongs to, or None when no shard holds it"""
+    import os
+    for p in split_paths(path):
+        if not os.path.exists(p):
+            continue
+        meta, tensors, end = _read_header(p)
+        for tn, dims, _, off in tensors:
+            if tn != name:
+                continue
+            align = meta.get("general.alignment") or 32
+            payload = os.path.getsize(p) - (end + align - 1) // align * align
+            nxt = min((o for _, _, _, o in tensors if o > off), default=payload)
+            return layout43(dims, min(nxt, payload) - off)
+    return None
 
 
 def split_paths(path):

@@ -43,11 +43,29 @@ P.CHOICE = SP.P.CHOICE = os.path.join(tmp, "model-choice.txt")
 SP.SETTINGS = os.path.join(tmp, "delta-settings.json")
 SP.list_gpus = lambda: [{"index": 0, "name": "RTX 3090", "mib": 24576}, {"index": 1, "name": "RTX 3060", "mib": 12288}]
 
-# the recommendation follows the RAM
-check("192 GB -> UD-IQ2_XXS", SP.recommended(192) == "UD-IQ2_XXS")
-check("128 GB -> UD-IQ2_XXS", SP.recommended(128) == "UD-IQ2_XXS")
-check("115 GB -> the default", SP.recommended(115) == "default")
-check("96 GB -> UD-IQ1_S", SP.recommended(96) == "UD-IQ1_S")
+# the recommendation: UD-IQ2_XXS from 110 GB up and when the RAM is not known, UD-IQ1_M below (at bias 0.10)
+for ram in (192, 128, 115, 110, None):
+    check(f"{ram} GB -> UD-IQ2_XXS", SP.recommended(ram) == "UD-IQ2_XXS")
+for ram in (109, 96, 64):
+    check(f"{ram} GB -> UD-IQ1_M", SP.recommended(ram) == "UD-IQ1_M")
+check("the menu tags say which RAM each pick is for", P.TAG.get("UD-IQ2_XXS") == " (110 GB and up)" and P.TAG.get("UD-IQ1_M") == " (under 110 GB)")
+check("the 1-bit files are still offered", "UD-IQ1_S" in P.UNSLOTH_Q and "UD-IQ1_M" in P.UNSLOTH_Q)
+
+# the Speed / Quality switch: this PC's default, the measured notes, a chosen Fast stays Fast
+IQ1M = "unsloth/UD-IQ1_M/x-UD-IQ1_M-00001-of-00005.gguf"
+check("64 GB + UD-IQ1_M defaults to Quality", SP.default_mode(IQ1M, 64) == "balanced")
+check("96 GB + UD-IQ1_S defaults to Quality", SP.default_mode("x-UD-IQ1_S-00001-of-00005.gguf", 96) == "balanced")
+check("128 GB + UD-IQ1_M and 64 GB + UD-IQ2_XXS default to Fast",
+      SP.default_mode(IQ1M, 128) == "fast" and SP.default_mode("x-UD-IQ2_XXS-00001-of-00006.gguf", 64) == "fast")
+n = SP.mode_notes(IQ1M, 64)
+check("notes at 64 GB, UD-IQ1_M", n["balanced"] == "89.9% agreement, 35 tok/s" and n["fast"] == "87.7% agreement, 42 tok/s"
+      and n["exact"] == "91.2% agreement, 16 tok/s", n)
+check("a cell that was not measured stays empty", SP.mode_notes(IQ1M, 192)["balanced"] == "", SP.mode_notes(IQ1M, 192))
+check("an own model has no notes", SP.mode_notes("custom/mine.gguf", 64) == {"fast": "", "balanced": "", "exact": ""})
+check("own-model rows carry the switch's default", all("default_mode" in r and "modes" in r for r in SP.catalog(models)["models"]))
+check("an old page's saved fast is not a choice", SP.chosen_mode({"mode": "fast"}) is None)
+check("a chosen fast is", SP.chosen_mode({"mode": "fast", "mode_chosen": True}) == "fast")
+check("quality / exact are always choices", SP.chosen_mode({"mode": "balanced"}) == "balanced" and SP.chosen_mode({"mode": "exact"}) == "exact")
 
 # the custom check
 good = models + "/custom/mine.gguf"
@@ -70,7 +88,7 @@ cat = SP.catalog(models)
 ids = {m["id"]: m for m in cat["models"]}
 check("the catalog is JSON", bool(json.dumps(cat)))
 check("custom models are listed", "custom/mine.gguf" in ids)
-check("a custom one-file model needs the default", "default" in ids["custom/mine.gguf"]["blocked"], ids["custom/mine.gguf"])
+check("a custom one-file model needs the ds4 Q2 file", "ds4 Q2" in ids["custom/mine.gguf"]["blocked"], ids["custom/mine.gguf"])
 check("a custom split model does not", ids["custom/split-00001-of-00003.gguf"]["blocked"] == "")
 check("the second card is found", cat["helper_gpu"] and cat["helper_gpu"]["index"] == 1, cat["helper_gpu"])
 # a card older than RTX 20 is never the second card (no code for it in the CUDA 13 builds); unknown cc still counts
@@ -110,11 +128,19 @@ check("a malformed pending is dropped, not a traceback", not SP.rollback() and "
 env = {**os.environ, "DS41_MODELS": os.path.join(tmp, "m2"), "DS41_RAM_GB": "115"}
 p = subprocess.run([sys.executable, str(HERE / "pick_model.py"), "--first"], input="1\n", capture_output=True, text=True, env=env)
 check("--first: the default exits 10", p.returncode == 10 and "recommended" in p.stdout, (p.returncode, p.stdout[-300:], p.stderr[-300:]))
-p = subprocess.run([sys.executable, str(HERE / "pick_model.py"), "--first"], input="6\n", capture_output=True, text=True, env=env)
+p = subprocess.run([sys.executable, str(HERE / "pick_model.py"), "--first"], input="7\n", capture_output=True, text=True, env=env)
 check("--first: the quality picks are offered", "UD-Q2_K_XL" in p.stdout and "UD-IQ3_XXS (most exact)" in p.stdout, p.stdout[-300:])
 check("--first: none explains and exits 11", p.returncode == 11 and "custom" in p.stdout, (p.returncode, p.stdout[-300:], p.stderr[-300:]))
-p = subprocess.run([sys.executable, str(HERE / "pick_model.py"), "--first"], input="x\n9\n\n", capture_output=True, text=True, env=env)
-check("--first: bad answers ask again, Enter takes the recommended", p.returncode == 10, (p.returncode, p.stdout[-300:]))
+p = subprocess.run([sys.executable, str(HERE / "pick_model.py"), "--first"], input="x\n9\n1\n", capture_output=True, text=True, env=env)
+check("--first: bad answers ask again", p.returncode == 10 and p.stdout.count("Please type one of the numbers") == 2,
+      (p.returncode, p.stdout[-300:]))
+# UD-IQ2_XXS is the recommended row (and Enter's) from 110 GB up, UD-IQ1_M below - checked on the menu, without downloading it
+for ram, want in (("115", "UD-IQ2_XXS"), ("96", "UD-IQ1_M"), ("64", "UD-IQ1_M"), ("192", "UD-IQ2_XXS")):
+    p = subprocess.run([sys.executable, str(HERE / "pick_model.py"), "--first"], input="7\n", capture_output=True, text=True,
+                       env={**env, "DS41_RAM_GB": ram})
+    rec = [l for l in p.stdout.splitlines() if "<- recommended" in l]
+    check(f"--first at {ram} GB: {want} is the recommended row and Enter's",
+          len(rec) == 1 and want in rec[0] and f"Enter = {rec[0].split('.')[0].strip()}" in p.stdout, p.stdout[-400:])
 
 print("all passed" if not FAILS else f"FAILED {len(FAILS)}")
 sys.exit(1 if FAILS else 0)

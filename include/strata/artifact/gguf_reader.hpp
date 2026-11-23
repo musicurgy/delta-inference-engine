@@ -416,7 +416,23 @@ public:
         auto it = meta_.find(key);
         return it == meta_.end() ? nullptr : &it->second;
     }
-    const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
+    const uint8_t* tensor_data(const TensorInfo& t) const { return base_ ? base_ + data_start_ + t.offset : nullptr; }
+    /// Whether the file is still mapped (release_mapping() not called).
+    bool mapped() const { return base_ != nullptr; }
+    /// Closes the view, the mapping and the file handle and keeps the parsed header: tensors(), metadata(),
+    /// data_start(), file_size() and path() stay valid, tensor_data() returns nullptr from then on.  Idempotent.
+    /// Why: NTFS serialises the unbuffered reads of a file while a view of it exists (Siege-Ladder 3aa63fac78,
+    /// 11 readers on one file 13.5 vs 4.5 GB/s) - tools/v41/engine STRATA_FILE_TIER_UNMAP releases the file tier's shards.
+    void release_mapping() {
+        close();
+        base_ = nullptr;
+#ifdef _WIN32
+        map_ = nullptr;
+        file_ = nullptr;
+#else
+        fd_ = -1;
+#endif
+    }
 
 private:
     void open() {
@@ -573,6 +589,8 @@ public:
     const GgufFile& shard(size_t i) const { return *shards_[i]; }
     /// The metadata shard: general.architecture and the model's keys.
     const GgufFile& meta() const { return *shards_[0]; }
+    /// Drops shard i's mapping (GgufFile::release_mapping): find(), in_bounds() and the headers stay valid.
+    void release_mapping(size_t i) { shards_[i]->release_mapping(); }
     /// The tensor named `name` (its shard index in `*shard`), or nullptr.
     const TensorInfo* find(const std::string& name, size_t* shard = nullptr) const {
         const auto it = index_.find(name);

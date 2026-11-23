@@ -1,4 +1,4 @@
-"""serve/test_prefix_memo.py - the agent-turn costs outside the engine (brainstorm_1107 idea 1, session_gap.md): the
+"""serve/test_prefix_memo.py - the agent-turn costs outside the engine: the
 tokenizer's prefix memo gives exactly a whole encode's ids, and the literal-mark pattern matches as the alternation did.
 
     python -m unittest serve.test_prefix_memo -v

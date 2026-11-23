@@ -18,7 +18,10 @@
 //   1. read_raw on --rows random rows per slot (plus the first and last row);
 //   2. the batch reader (start + wait) over the token file, n = 1, 7, 512, 4096 at several positions, no row cache;
 //   3. the same through the row cache (every batch twice: the second pass is served from the cached raw rows);
-//   4. the reference reader (rows_reference) on --b against the batch reader on --a.
+//   4. the reference reader (rows_reference) on --b against the batch reader on --a;
+//   5. STRATA_ENGRAM_READAHEAD's blocked batches (start blk = 256 / 100 / 7) on --b and its row cache: each block's columns
+//      already final when wait_cols hands them over (64 columns at a time, table by table), the whole batch equal to the
+//      plain one; and a cancelled batch's wait() returns without an error.
 // Exit 0 and "IDENTICAL" when every check matches.
 #include "ds41_engram.hpp"
 
@@ -157,7 +160,7 @@ int main(int argc, char ** argv) {
     const Case cases[] = { {0, 1}, {1, 1}, {100, 7}, {0, 512}, {777, 512}, {0, 4096}, {4096, 4096}, {8192, 4096},
                            {(int64_t) toks.size() - 1, 1}, {(int64_t) toks.size() - 512, 512} };
     int batches = 0, bfail = 0;
-    std::vector<std::vector<float>> oa, ob, oc, orf;
+    std::vector<std::vector<float>> oa, ob, oc, orf, ok5;
     for (const Case & c : cases) {
         auto ba = A.start(c.pos0, c.n, oa, err);
         if (!ba || !A.wait(ba, err)) { std::fprintf(stderr, "A batch: %s\n", err.c_str()); return 1; }
@@ -180,14 +183,39 @@ int main(int argc, char ** argv) {
         }
         if (!B.rows_reference(c.pos0, c.n, orf, err)) { std::fprintf(stderr, "B reference: %s\n", err.c_str()); return 1; }
         const bool s4 = same(ref, orf);
+        // 5. blocked batches: the columns wait_cols hands over are final, and the whole batch is the plain one's
+        bool s5 = true;
+        const std::vector<std::vector<float>> & pref = tol < 0 ? oa : ob;   // the plain batch rows of --b's format
+        for (int blk : { 256, 100, 7 }) {
+            for (int rep = 0; rep < 2; ++rep) {   // --b (no cache), then C (row cache: hits + reads mixed)
+                Ds41Engram & X = rep ? C : B;
+                auto bk = X.start(c.pos0, c.n, ok5, err, blk);
+                if (!bk) { std::fprintf(stderr, "blocked batch: %s\n", err.c_str()); return 1; }
+                const size_t per = (size_t) (X.n_cols() * X.row_dim());
+                for (size_t e = 0; e < pref.size(); ++e)
+                    for (int t0 = 0; t0 < c.n; t0 += 64) {
+                        const int t1 = std::min(c.n, t0 + 64);
+                        if (!X.wait_cols(bk, (int) e, t0, t1, err)) { std::fprintf(stderr, "wait_cols: %s\n", err.c_str()); return 1; }
+                        s5 = s5 && std::memcmp(ok5[e].data() + (size_t) t0 * per, pref[e].data() + (size_t) t0 * per,
+                                               (size_t) (t1 - t0) * per * sizeof(float)) == 0;
+                    }
+                if (!X.wait(bk, err)) { std::fprintf(stderr, "blocked wait: %s\n", err.c_str()); return 1; }
+                s5 = s5 && same(pref, ok5);
+            }
+        }
+        {   // a cancelled read-ahead: wait() returns, no error
+            auto bk = B.start(c.pos0, c.n, ok5, err, 256);
+            Ds41Engram::cancel(bk);
+            if (!bk || !B.wait(bk, err)) { std::fprintf(stderr, "cancelled batch: %s\n", err.c_str()); return 1; }
+        }
         ++batches;
-        if (!s2 || !s3 || !s4) {
+        if (!s2 || !s3 || !s4 || !s5) {
             ++bfail;
-            std::fprintf(stderr, "BATCH DIFFERS at pos %" PRId64 " n %d: batch %s, cached %s, reference %s\n", c.pos0, c.n,
-                         s2 ? "same" : "DIFF", s3 ? "same" : "DIFF", s4 ? "same" : "DIFF");
+            std::fprintf(stderr, "BATCH DIFFERS at pos %" PRId64 " n %d: batch %s, cached %s, reference %s, blocked %s\n", c.pos0, c.n,
+                         s2 ? "same" : "DIFF", s3 ? "same" : "DIFF", s4 ? "same" : "DIFF", s5 ? "same" : "DIFF");
         }
     }
-    std::printf("2-4. batches: %d cases (batch reader, row cache x2, reference reader), %d differ; --b row cache: %" PRIu64
+    std::printf("2-5. batches: %d cases (batch reader, row cache x2, reference reader, blocked x6 + cancel), %d differ; --b row cache: %" PRIu64
                 " hits, %" PRIu64 " misses\n", batches, bfail, C.cache_hits(), C.cache_misses());
     if (tol >= 0 && !errs.empty()) {
         std::sort(errs.begin(), errs.end());

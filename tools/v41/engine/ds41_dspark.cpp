@@ -5,6 +5,10 @@
 
 #include "ds41_geometry.hpp"
 #include "ds41_ops.hpp"
+#include "ds41_env.hpp"
+#include "ds41_fatal.hpp"
+#include "ds41_sys.hpp"
+#include "ds41_unmap.hpp"
 
 #include "ggml-alloc.h"
 
@@ -14,6 +18,8 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <new>
 #include <thread>
 
 using namespace strata;
@@ -37,6 +43,7 @@ struct Ds41DSpark::Impl {
     ggml_backend_buffer_t wbuf = nullptr;
     std::map<std::string, ggml_tensor *> w;
     const uint8_t * embd = nullptr;    // trunk token_embd rows on the mmap (embd_type: F16 ours, Q5_K ISTA's)
+    std::shared_ptr<const std::vector<uint8_t>> embd_copy;   // STRATA_FILE_TIER_UNMAP: the rows copied out (embd points here)
     int embd_type = GGML_TYPE_F16;
     size_t wbytes = 0;
     // state: per block window ring [DH, WIN]; inputs
@@ -47,6 +54,23 @@ struct Ds41DSpark::Impl {
     ggml_tensor * i_mask = nullptr, * i_bonus = nullptr, * i_pre = nullptr;
     ggml_tensor * i_u = nullptr, * i_invt = nullptr;   // step_sampled: per-slot uniforms, 1 / temperature
     std::vector<int> filled;           // ring slot -> position held (-1 empty)
+    // the step's host staging (Basalt 530f82793 / 6e08df3ae / 00d047e6c, the "cheap half"): every input of a step is
+    // written into ONE pinned host buffer and queued with ggml_backend_tensor_set_async on the backend's stream, the
+    // graph runs with ggml_backend_graph_compute_async, the 5 ids + 5 confidences come back by tensor_get_async into
+    // the same buffer, and the step synchronizes ONCE.  Before: up to 8 pageable synchronous uploads and 10 one-value
+    // synchronous reads a step (~20-60 us each under WDDM).  Pure data movement: the same bytes reach the same tensors
+    // in stream order, so drafts and confidences are bit-identical.  STRATA_DSPARK_STAGE=0: the old synchronous path
+    // (A/B arm); a backend without a host buffer type (CPU) takes it too.
+    ggml_backend_buffer_t hbuf = nullptr;
+    uint8_t * hb = nullptr;            // hbuf's base; null = not staged
+    size_t o_main = 0, o_mpos = 0, o_mslot = 0, o_emb = 0, o_bpos = 0, o_mask = 0, o_bonus = 0, o_u = 0, o_invt = 0;
+    size_t o_ids = 0, o_conf = 0;
+    // STRATA_PINNED_STAGE (default on; =0 the old reads): a sampled step's BS full-vocabulary CDF rows (q for the
+    // verifier, 5 x V floats = 2.6 MB) come back by tensor_get_async into the same pinned staging before the step's ONE
+    // sync, instead of BS synchronous pageable reads after it.  The caller reads them in place (staged_cdf()): the rows
+    // stay valid until the next sampled step.  Same bytes: drafts, q and the output are unchanged.
+    size_t o_cdf = 0;
+    bool cdf_staged = false;
     // graphs (one per (k, mode) shape: mode 0 = append only, 1 = draft by argmax, 2 = sampled draft), one allocator
     ggml_gallocr_t ga = nullptr;
     struct G { ggml_context * c = nullptr; ggml_cgraph * gf = nullptr; std::vector<ggml_tensor *> ids, conf, rids, cdf; };
@@ -61,6 +85,15 @@ struct Ds41DSpark::Impl {
     std::map<std::pair<int, int>, G> graphs;
     std::pair<int, int> last_key { -1, 0 };   ///< the graph ga was last planned for
     double ms = 0;
+    // STRATA_DSPARK_PARK (A7, park / unpark): the weights' bytes in host RAM (pinned: pbuf, a ggml host buffer;
+    // pageable: pheap), wctx's tensors in creation order, each at a 256-byte aligned offset; kept from the first park to
+    // the destructor
+    ggml_backend_buffer_t pbuf = nullptr;
+    std::unique_ptr<uint8_t[]> pheap;
+    uint8_t * pb = nullptr;
+    size_t pbytes = 0;
+    bool ppinned = false;
+    bool is_parked = false;
 
     ~Impl() {
         if (const char * cf = std::getenv("STRATA_DSPARK_COUNT"); cf && !counts.empty()) {
@@ -71,19 +104,22 @@ struct Ds41DSpark::Impl {
         }
         for (auto & kv : graphs) ggml_free(kv.second.c);
         if (ga) ggml_gallocr_free(ga);
+        if (hbuf) ggml_backend_buffer_free(hbuf);
         if (sbuf) ggml_backend_buffer_free(sbuf);
         if (sctx) ggml_free(sctx);
         if (wbuf) ggml_backend_buffer_free(wbuf);
         if (wctx) ggml_free(wctx);
+        if (pbuf) ggml_backend_buffer_free(pbuf);
     }
     ggml_tensor * W(const std::string & n) const {
         auto it = w.find(n);
-        if (it == w.end()) { std::fprintf(stderr, "[ds41_dspark] missing weight %s\n", n.c_str()); std::abort(); }
+        if (it == w.end()) { std::fprintf(stderr, "[ds41_dspark] missing weight %s\n", n.c_str()); ds41_fatal_exit(); }
         return it->second;
     }
     ggml_tensor * BW(int b, const std::string & n) const { return W("mtp." + std::to_string(b) + "." + n); }
     bool load(std::string & e);
     G & graph(int k, int mode);
+    void set_identity_pre();
     bool run(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf, const float * u, float inv_temp, float * cdf);
 };
 
@@ -225,6 +261,15 @@ bool Ds41DSpark::Impl::load(std::string & e) {
     size_t se = 0;
     main->find("token_embd.weight", &se);
     embd = main->shard(se).tensor_data(*te);
+    // STRATA_FILE_TIER_UNMAP (ds41_unmap.hpp, default off): the trunk is needed only for its token_embd rows now - take the
+    // shared copy (Ds41Dense's, the same bytes) and release the mapping of every trunk shard, which the file tier reads
+    // unbuffered.  ds41_generate touches the shards unbuffered after this init (Ds41FileBlobs::touch_unbuffered).
+    if (ds41_p3_unmap()) {
+        embd_copy = ds41_embd_copy(*main, e);
+        if (!embd_copy) return false;
+        embd = embd_copy->data();
+        for (size_t s = 0; s < main->size(); ++s) main->release_mapping(s);
+    }
     return true;
 }
 
@@ -265,9 +310,33 @@ bool Ds41DSpark::init(const Ds41DSparkConfig & cfg, std::string & err) {
     im.sbuf = ggml_backend_alloc_ctx_tensors_from_buft(im.sctx, ggml_backend_get_default_buffer_type(im.be));
     if (!im.sbuf) { err = "cannot allocate the DSpark state"; return false; }
     ggml_backend_buffer_clear(im.sbuf, 0);
-    std::vector<float> pre((size_t) (im.HC * im.BS), 0.0f);   // model.py make_identity_pre_mix: one-hot on copy 0
-    for (int64_t t = 0; t < im.BS; ++t) pre[(size_t) (t * im.HC)] = 1.0f;
-    ggml_backend_tensor_set(im.i_pre, pre.data(), 0, pre.size() * 4);
+    im.set_identity_pre();
+    // the pinned step staging (see Impl::hbuf); STRATA_DSPARK_STAGE=0 keeps the synchronous uploads / reads
+    if (!(std::getenv("STRATA_DSPARK_STAGE") && std::getenv("STRATA_DSPARK_STAGE")[0] == '0')) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(im.be);
+        ggml_backend_buffer_type_t hbt = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (hbt) {
+            size_t off = 0;
+            auto take = [&off](size_t n) { const size_t o = off; off += (n + 255) / 256 * 256; return o; };
+            im.o_main = take((size_t) im.KM * (size_t) (3 * im.D) * 4);
+            im.o_mpos = take((size_t) im.KM * 4);
+            im.o_mslot = take((size_t) im.KM * 4);
+            im.o_emb = take((size_t) (im.D * im.BS) * 4);
+            im.o_bpos = take((size_t) im.BS * 4);
+            im.o_mask = take((size_t) (MP * im.BS) * 4);
+            im.o_bonus = take(4);
+            im.o_u = take((size_t) im.BS * 4);
+            im.o_invt = take(4);
+            im.o_ids = take((size_t) im.BS * 4);
+            im.o_conf = take((size_t) im.BS * 4);
+            im.cdf_staged = !(ds41_env("STRATA_PINNED_STAGE", "STRATA_P3_HOST_STAGE") && ds41_env("STRATA_PINNED_STAGE", "STRATA_P3_HOST_STAGE")[0] == '0');
+            if (im.cdf_staged) im.o_cdf = take((size_t) im.BS * (size_t) im.V * 4);
+            im.hbuf = ggml_backend_buft_alloc_buffer(hbt, off);
+            if (im.hbuf) im.hb = (uint8_t *) ggml_backend_buffer_get_base(im.hbuf);
+            if (!im.hb) im.cdf_staged = false;
+        }
+        if (!im.hb) std::fprintf(stderr, "[ds41_dspark] no pinned step staging on this backend: synchronous uploads\n");
+    }
     im.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.be));
     reset();
     return true;
@@ -275,6 +344,125 @@ bool Ds41DSpark::init(const Ds41DSparkConfig & cfg, std::string & err) {
 
 void Ds41DSpark::reset() {
     p_->filled.assign(WIN, -1);
+}
+
+void Ds41DSpark::Impl::set_identity_pre() {
+    std::vector<float> pre((size_t) (HC * BS), 0.0f);   // model.py make_identity_pre_mix: one-hot on copy 0
+    for (int64_t t = 0; t < BS; ++t) pre[(size_t) (t * HC)] = 1.0f;
+    ggml_backend_tensor_set(i_pre, pre.data(), 0, pre.size() * 4);
+}
+
+// STRATA_DSPARK_PARK (A7): see the header.  Exactness: unpark() re-allocates wctx then sctx from the same buffer type
+// in init()'s order (the same sizes, so the same free VRAM afterwards), uploads the same bytes the first park read back,
+// clears the state buffer and writes the identity pre-mix as init() does, and starts a fresh graph allocator with an
+// empty window - the state a destroyed + re-created object starts from, minus the GGUF parse and the source upload.
+namespace {
+void ds41_dspark_detach(ggml_context * c) {   // forget a freed buffer: ggml_backend_alloc_ctx_tensors places only data == NULL
+    for (ggml_tensor * t = ggml_get_first_tensor(c); t; t = ggml_get_next_tensor(c, t)) {
+        t->data = nullptr;
+        t->buffer = nullptr;
+    }
+}
+size_t ds41_dspark_pad(size_t n) { return (n + 255) / 256 * 256; }
+}  // namespace
+
+bool Ds41DSpark::parked() const { return p_->is_parked; }
+size_t Ds41DSpark::host_bytes() const { return p_->pbytes; }
+bool Ds41DSpark::host_pinned() const { return p_->ppinned; }
+
+bool Ds41DSpark::park(bool pinned, size_t min_free_bytes, std::string & err) {
+    Impl & im = *p_;
+    if (im.is_parked) return true;
+    if (!im.wctx || !im.wbuf || !im.sctx || !im.sbuf) { err = "DSpark park: the stack is not loaded"; return false; }
+    ggml_backend_synchronize(im.be);
+    if (!im.pb) {
+        const uint64_t avail = ds41_sys::mem_available_bytes();   // 0 = unknown: let the pinned allocation decide
+        if (avail > 0 && avail < (uint64_t) im.wbytes + (uint64_t) min_free_bytes) {
+            char b[160];
+            std::snprintf(b, sizeof b, "DSpark park: %.2f GiB of RAM available, the copy needs %.2f + %.2f GiB free",
+                          avail / 1073741824.0, im.wbytes / 1073741824.0, min_free_bytes / 1073741824.0);
+            err = b;
+            return false;
+        }
+        size_t tot = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(im.wctx); t; t = ggml_get_next_tensor(im.wctx, t)) tot += ds41_dspark_pad(ggml_nbytes(t));
+        if (tot == 0) { err = "DSpark park: no weights"; return false; }
+        ggml_backend_buffer_t pbuf = nullptr;
+        std::unique_ptr<uint8_t[]> pheap;
+        uint8_t * pb = nullptr;
+        if (pinned) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(im.be);
+            ggml_backend_buffer_type_t hbt = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (!hbt) { err = "DSpark park: no pinned host buffer type on this backend"; return false; }
+            pbuf = ggml_backend_buft_alloc_buffer(hbt, tot);
+            if (!pbuf) { err = "DSpark park: the host copy could not be allocated"; return false; }
+            // ggml-cuda's host type falls back to a PAGEABLE CPU buffer when cudaMallocHost fails (the pinned budget
+            // is full): still exact and still no re-parse, only a slower upload - kept, and reported by host_pinned()
+            im.ppinned = ggml_backend_buffer_get_type(pbuf) == hbt;
+            pb = (uint8_t *) ggml_backend_buffer_get_base(pbuf);
+        } else {
+            // pageable (the default): outside the WDDM pinned budget, which the arena's auto pin leaves ~4 GiB of for
+            // the read-ahead slabs and the lazy pinned buffers
+            pheap.reset(new (std::nothrow) uint8_t[tot]);
+            if (!pheap) { err = "DSpark park: the host copy could not be allocated"; return false; }
+            im.ppinned = false;
+            pb = pheap.get();
+        }
+        size_t off = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(im.wctx); t; t = ggml_get_next_tensor(im.wctx, t)) {
+            ggml_backend_tensor_get(t, pb + off, 0, ggml_nbytes(t));
+            off += ds41_dspark_pad(ggml_nbytes(t));
+        }
+        im.pbuf = pbuf;
+        im.pheap = std::move(pheap);
+        im.pb = pb;
+        im.pbytes = tot;
+    }
+    // what the destructor frees on the card, in its order: the graph allocator's buffer, the state, the weights
+    if (im.ga) { ggml_gallocr_free(im.ga); im.ga = nullptr; }
+    im.last_key = { -1, 0 };
+    ggml_backend_buffer_free(im.sbuf);
+    im.sbuf = nullptr;
+    ds41_dspark_detach(im.sctx);
+    ggml_backend_buffer_free(im.wbuf);
+    im.wbuf = nullptr;
+    ds41_dspark_detach(im.wctx);
+    im.is_parked = true;
+    return true;
+}
+
+bool Ds41DSpark::unpark(std::string & err) {
+    Impl & im = *p_;
+    if (!im.is_parked) return true;
+    im.wbuf = ggml_backend_alloc_ctx_tensors_from_buft(im.wctx, ggml_backend_get_default_buffer_type(im.be));
+    if (!im.wbuf) { err = "DSpark unpark: cannot allocate the weights on the backend"; return false; }
+    size_t off = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(im.wctx); t; t = ggml_get_next_tensor(im.wctx, t)) {
+        ggml_backend_tensor_set_async(im.be, t, im.pb + off, 0, ggml_nbytes(t));
+        off += ds41_dspark_pad(ggml_nbytes(t));
+    }
+    ggml_backend_synchronize(im.be);
+    im.sbuf = ggml_backend_alloc_ctx_tensors_from_buft(im.sctx, ggml_backend_get_default_buffer_type(im.be));
+    if (!im.sbuf) { err = "DSpark unpark: cannot allocate the state"; return false; }
+    ggml_backend_buffer_clear(im.sbuf, 0);
+    im.set_identity_pre();
+    im.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.be));
+    im.is_parked = false;
+    reset();
+    return true;
+}
+
+// STRATA_FOLDS=1 (default off; ds41_ops.hpp ds41_folds_on): on a GPU backend the drafter's clamp / clamp / swiglu_split
+// chains (routed and shared experts) run as ONE GGML_GLU_OP_SWIGLU_CLAMP (silu(fminf(g, lim)) * fmaxf(fminf(u, lim), -lim),
+// unary.cuh's ggml_cuda_op_swiglu_clamp_single: for every non-NaN input the values of clamp.cu's fminf(fmaxf(x, lo), hi)
+// followed by the gated op_silu(g) * u, the STRATA_FUSE shared-expert form), and the routed + shared add inside the
+// hc_post kernel (ds41_hc_post_add).  ggml-cuda may then also fuse a gate + up product pair with the GLU (MMVQ, the
+// same kernel template with has_fusion; only where the unfused products take MMVQ themselves).
+static bool dspark_folds_on(ggml_backend_t be) {
+    static const bool on = ds41_folds_on();
+    if (!on || !be) return false;
+    ggml_backend_dev_t dev = ggml_backend_get_device(be);
+    return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
 static ggml_tensor * fake_quant_fp8(ggml_context * c, ggml_tensor * x) {
@@ -341,6 +529,7 @@ Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, int mode) {
     ggml_tensor * pre = i_pre;
     ggml_tensor * m4 = ggml_cast(c, ggml_reshape_4d(c, i_mask, MP, 1, 1, BS), GGML_TYPE_F16);
     const float lim = (float) Gm.swiglu_limit;
+    const bool folds = dspark_folds_on(be);   // STRATA_FOLDS
     for (int b = 0; b < 3; ++b) {
         // attention (Block.forward: hc_mixes of the input, hc_pre with the previous FFN's pre-mix, attn_norm)
         ggml_tensor * a_pre, * a_post, * a_comb;
@@ -381,17 +570,29 @@ Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, int mode) {
         ggml_tensor * x3 = ggml_reshape_3d(c, fn, D, 1, BS);
         ggml_tensor * ge = ggml_mul_mat_id(c, BW(b, "ffn.experts.w1.weight"), x3, ids);         // [NFF, NU, BS]
         ggml_tensor * ue = ggml_mul_mat_id(c, BW(b, "ffn.experts.w3.weight"), x3, ids);
-        if (lim > 0) { ue = ggml_clamp(c, ue, -lim, lim); ge = ggml_clamp(c, ge, NEG_INF, lim); }
-        ggml_tensor * act = ggml_mul(c, ggml_swiglu_split(c, ge, ue), ggml_reshape_3d(c, wts, 1, NU, BS));
+        ggml_tensor * glu;
+        if (lim > 0 && folds) glu = ggml_swiglu_clamp(c, ge, ue, lim);   // STRATA_FOLDS: 3 kernels -> 1
+        else {
+            if (lim > 0) { ue = ggml_clamp(c, ue, -lim, lim); ge = ggml_clamp(c, ge, NEG_INF, lim); }
+            glu = ggml_swiglu_split(c, ge, ue);
+        }
+        ggml_tensor * act = ggml_mul(c, glu, ggml_reshape_3d(c, wts, 1, NU, BS));
         ggml_tensor * de = ggml_mul_mat_id(c, BW(b, "ffn.experts.w2.weight"), act, ids);        // [D, NU, BS]
         ggml_tensor * routed = ggml_view_2d(c, de, D, BS, de->nb[2], 0);
         for (int64_t u = 1; u < NU; ++u) routed = ggml_add(c, routed, ggml_view_2d(c, de, D, BS, de->nb[2], (size_t) u * de->nb[1]));
         // shared expert
         ggml_tensor * up = ggml_mul_mat(c, BW(b, "ffn.shared_experts.w3.weight"), fn);
         ggml_tensor * gt = ggml_mul_mat(c, BW(b, "ffn.shared_experts.w1.weight"), fn);
-        if (lim > 0) { up = ggml_clamp(c, up, -lim, lim); gt = ggml_clamp(c, gt, NEG_INF, lim); }
-        ggml_tensor * se = ggml_mul_mat(c, BW(b, "ffn.shared_experts.w2.weight"), ggml_swiglu_split(c, gt, up));
-        x = ggml_dsv4_hc_post(c, ggml_add(c, routed, se), h, f_post, f_comb);
+        ggml_tensor * se;
+        if (lim > 0 && folds) {   // STRATA_FOLDS: the GLU in one kernel, the add inside hc_post
+            se = ggml_mul_mat(c, BW(b, "ffn.shared_experts.w2.weight"), ggml_swiglu_clamp(c, gt, up, lim));
+            x = ds41_hc_post_add(c, routed, se, h, f_post, f_comb);
+        } else {
+            if (lim > 0) { up = ggml_clamp(c, up, -lim, lim); gt = ggml_clamp(c, gt, NEG_INF, lim); }
+            se = ggml_mul_mat(c, BW(b, "ffn.shared_experts.w2.weight"), ggml_swiglu_split(c, gt, up));
+            x = folds ? ds41_hc_post_add(c, routed, se, h, f_post, f_comb)
+                      : ggml_dsv4_hc_post(c, ggml_add(c, routed, se), h, f_post, f_comb);
+        }
         pre = f_pre;
     }
     // ---- forward_head: hc_pre -> norm -> trunk head; Markov bias left to right; confidence
@@ -399,7 +600,10 @@ Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, int mode) {
     ggml_tensor * lg = ggml_mul_mat(c, W("output.weight"), rms_w(hn, W("mtp.2.norm.weight")));     // [V, BS]
     ggml_mul_mat_set_prec(lg, GGML_PREC_F32);
     ggml_tensor * tok = i_bonus;
-    for (int64_t i = 0; i < BS; ++i) {
+    // STRATA_DSPARK_HEAD_ROWS (cfg.head_rows): only the slots a verify window can take; slot i reads only slot i - 1's
+    // token, so the slots kept are the same ops on the same inputs as before
+    const int64_t NHR = cfg.head_rows > 0 ? std::min<int64_t>(BS, cfg.head_rows) : BS;
+    for (int64_t i = 0; i < NHR; ++i) {
         ggml_tensor * e = ggml_get_rows(c, W("mtp.2.markov_head.embed.weight"), tok);            // [256, 1]
         ggml_tensor * bias = ggml_mul_mat(c, W("mtp.2.markov_head.head.weight"), e);             // [V, 1]
         ggml_mul_mat_set_prec(bias, GGML_PREC_F32);
@@ -425,6 +629,16 @@ Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, int mode) {
         gr.conf.push_back(cf);
         ggml_build_forward_expand(gf, tok);
         ggml_build_forward_expand(gf, cf);
+        // Draft-id bounds guard (Maya 075cbe6, #860): ggml-cuda's argmax returns -1 for a row with no value above
+        // -FLT_MAX (all NaN / -inf), and that id would index the next slot's markov-embed get_rows (an illegal memory
+        // access the next sync reports, then an engine restart).  The NEXT slot reads a copy clamped to [0, V - 1] -
+        // exact for every real id (I32 -> F32 -> I32 is lossless below 2^24) - while the raw id is the output, and
+        // run() turns an out-of-range one into "no draft" from that slot on.  The sampled path's id is already a clamped
+        // count, and the last slot's id feeds nothing.  STRATA_DSPARK_ID_GUARD=0 leaves the clamp out (A/B arm only:
+        // the host-side check in run() stays).
+        static const bool id_guard = !(std::getenv("STRATA_DSPARK_ID_GUARD") && std::getenv("STRATA_DSPARK_ID_GUARD")[0] == '0');
+        if (!sampled && id_guard && i + 1 < NHR)
+            tok = ggml_cast(c, ggml_clamp(c, ggml_cast(c, tok, GGML_TYPE_F32), 0.0f, (float) (V - 1)), GGML_TYPE_I32);
     }
     return gr;
 }
@@ -435,22 +649,38 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
 
 bool Ds41DSpark::step_sampled(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf,
                               const float * u, float inv_temp, float * cdf) {
-    if (bonus < 0 || !u || !cdf) { p_->err = "DSpark step_sampled: needs a bonus token, uniforms and a cdf buffer"; return false; }
+    // cdf may be null when staged_cdf() is non-null: the rows are then read from the pinned staging in place
+    if (bonus < 0 || !u || (!cdf && !p_->cdf_staged)) { p_->err = "DSpark step_sampled: needs a bonus token, uniforms and a cdf buffer"; return false; }
     return p_->run(mh, pos, k, bonus, ids, conf, u, inv_temp, cdf);
 }
 
 int64_t Ds41DSpark::vocab() const { return p_->V; }
 
+const float * Ds41DSpark::staged_cdf() const {
+    return p_->cdf_staged ? (const float *) (p_->hb + p_->o_cdf) : nullptr;
+}
+
 bool Ds41DSpark::Impl::run(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf,
                            const float * u, float inv_temp, float * cdf) {
     Impl & im = *this;
     if (k < 1 || k > im.KM) { im.err = "DSpark step: k out of range"; return false; }
+    if (im.is_parked) { im.err = "DSpark step: the stack is parked (unpark first)"; return false; }
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<int32_t> mp(pos, pos + k), ms((size_t) k);
     for (int i = 0; i < k; ++i) { ms[(size_t) i] = pos[i] % (int) WIN; im.filled[(size_t) ms[(size_t) i]] = pos[i]; }
-    ggml_backend_tensor_set(im.i_main, mh, 0, (size_t) k * (size_t) (3 * im.D) * 4);
-    ggml_backend_tensor_set(im.i_mpos, mp.data(), 0, (size_t) k * 4);
-    ggml_backend_tensor_set(im.i_mslot, ms.data(), 0, (size_t) k * 4);
+    // an input goes through the pinned staging (async, on the backend's stream: ordered before the graph) or,
+    // unstaged, as before (a synchronous upload)
+    auto put = [&im](ggml_tensor * t, size_t o, const void * src, size_t n) {
+        if (im.hb) {
+            std::memcpy(im.hb + o, src, n);
+            ggml_backend_tensor_set_async(im.be, t, im.hb + o, 0, n);
+        } else {
+            ggml_backend_tensor_set(t, src, 0, n);
+        }
+    };
+    put(im.i_main, im.o_main, mh, (size_t) k * (size_t) (3 * im.D) * 4);
+    put(im.i_mpos, im.o_mpos, mp.data(), (size_t) k * 4);
+    put(im.i_mslot, im.o_mslot, ms.data(), (size_t) k * 4);
     const bool draft = bonus >= 0;
     if (draft) {
         const int p = pos[k - 1];
@@ -470,13 +700,13 @@ bool Ds41DSpark::Impl::run(const float * mh, const int * pos, int k, int bonus, 
             for (int64_t j = 0; j < im.BS; ++j) m[WIN + j] = 0.0f;
         }
         const int32_t bo = bonus;
-        ggml_backend_tensor_set(im.i_emb, emb.data(), 0, emb.size() * 4);
-        ggml_backend_tensor_set(im.i_bpos, bp.data(), 0, bp.size() * 4);
-        ggml_backend_tensor_set(im.i_mask, mask.data(), 0, mask.size() * 4);
-        ggml_backend_tensor_set(im.i_bonus, &bo, 0, 4);
+        put(im.i_emb, im.o_emb, emb.data(), emb.size() * 4);
+        put(im.i_bpos, im.o_bpos, bp.data(), bp.size() * 4);
+        put(im.i_mask, im.o_mask, mask.data(), mask.size() * 4);
+        put(im.i_bonus, im.o_bonus, &bo, 4);
         if (u) {
-            ggml_backend_tensor_set(im.i_u, u, 0, (size_t) im.BS * 4);
-            ggml_backend_tensor_set(im.i_invt, &inv_temp, 0, 4);
+            put(im.i_u, im.o_u, u, (size_t) im.BS * 4);
+            put(im.i_invt, im.o_invt, &inv_temp, 4);
         }
     }
     const int mode = !draft ? 0 : u ? 2 : 1;
@@ -491,12 +721,30 @@ bool Ds41DSpark::Impl::run(const float * mh, const int * pos, int k, int bonus, 
         t->buffer = nullptr;
     }
     const std::pair<int, int> key { k, mode };
+    // a failure after staged uploads were queued waits for them first: the staging must not be rewritten under a copy
+    auto fail = [&im](const char * what) { if (im.hb) ggml_backend_synchronize(im.be); im.err = what; return false; };
     if (im.last_key != key) {
-        if (!ggml_gallocr_reserve(im.ga, gr.gf)) { im.err = "DSpark graph reserve failed"; return false; }
+        if (!ggml_gallocr_reserve(im.ga, gr.gf)) return fail("DSpark graph reserve failed");
         im.last_key = key;
     }
-    if (!ggml_gallocr_alloc_graph(im.ga, gr.gf)) { im.err = "DSpark graph allocation failed"; return false; }
-    if (ggml_backend_graph_compute(im.be, gr.gf) != GGML_STATUS_SUCCESS) { im.err = "DSpark graph compute failed"; return false; }
+    if (!ggml_gallocr_alloc_graph(im.ga, gr.gf)) return fail("DSpark graph allocation failed");
+    if (im.hb) {
+        // staged: the graph, then the ids / confidences into the staging, all on the backend's stream - ONE sync
+        if (ggml_backend_graph_compute_async(im.be, gr.gf) != GGML_STATUS_SUCCESS) return fail("DSpark graph compute failed");
+        if (draft) {
+            for (size_t i = 0; i < gr.ids.size(); ++i) {
+                ggml_backend_tensor_get_async(im.be, gr.ids[i], im.hb + im.o_ids + i * 4, 0, 4);
+                ggml_backend_tensor_get_async(im.be, gr.conf[i], im.hb + im.o_conf + i * 4, 0, 4);
+            }
+            if (im.cdf_staged)
+                for (size_t i = 0; i < gr.cdf.size(); ++i)
+                    ggml_backend_tensor_get_async(im.be, gr.cdf[i], im.hb + im.o_cdf + i * (size_t) im.V * 4, 0, (size_t) im.V * 4);
+        }
+        ggml_backend_synchronize(im.be);
+    } else if (ggml_backend_graph_compute(im.be, gr.gf) != GGML_STATUS_SUCCESS) {
+        im.err = "DSpark graph compute failed";
+        return false;
+    }
     if (!gr.rids.empty()) {
         if (im.counts.empty()) im.counts.assign(gr.rids.size(), std::vector<int64_t>((size_t) im.NE, 0));
         for (size_t b = 0; b < gr.rids.size(); ++b) {
@@ -507,10 +755,39 @@ bool Ds41DSpark::Impl::run(const float * mh, const int * pos, int k, int bonus, 
     }
     if (draft) {
         for (size_t i = 0; i < gr.ids.size(); ++i) {
-            ggml_backend_tensor_get(gr.ids[i], &ids[i], 0, 4);
-            ggml_backend_tensor_get(gr.conf[i], &conf[i], 0, 4);
+            if (im.hb) {   // already here (staged above)
+                int32_t v;
+                std::memcpy(&v, im.hb + im.o_ids + i * 4, 4);
+                ids[i] = (int) v;
+                std::memcpy(&conf[i], im.hb + im.o_conf + i * 4, 4);
+            } else {
+                ggml_backend_tensor_get(gr.ids[i], &ids[i], 0, 4);
+                ggml_backend_tensor_get(gr.conf[i], &conf[i], 0, 4);
+            }
         }
-        for (size_t i = 0; i < gr.cdf.size(); ++i) ggml_backend_tensor_get(gr.cdf[i], cdf + i * (size_t) im.V, 0, (size_t) im.V * 4);
+        if (im.cdf_staged) {   // already in the staging (above); copied only for a caller that passed its own buffer
+            if (cdf && !gr.cdf.empty()) std::memcpy(cdf, im.hb + im.o_cdf, gr.cdf.size() * (size_t) im.V * 4);
+        } else {
+            for (size_t i = 0; i < gr.cdf.size(); ++i) ggml_backend_tensor_get(gr.cdf[i], cdf + i * (size_t) im.V, 0, (size_t) im.V * 4);
+        }
+        // the bounds guard's host half (Maya 075cbe6): an id outside [0, V) (argmax of a row with nothing finite) is
+        // "no draft" from that slot on - id -1, confidence -inf - so the callers cut the verify width there and never
+        // hand it to the trunk's embedding lookup.  Real ids pass untouched.
+        bool bad = false;
+        for (size_t i = 0; i < gr.ids.size(); ++i) {
+            if (!bad && ids[i] >= 0 && (int64_t) ids[i] < im.V) continue;
+            if (!bad) {
+                static int warned = 0;
+                if (warned++ < 8) std::fprintf(stderr, "[ds41_dspark] draft slot %zu: id %d outside the vocabulary (no finite logit) - no draft from here\n", i, ids[i]);
+            }
+            bad = true;
+            ids[i] = -1;
+            conf[i] = NEG_INF;
+        }
+        for (size_t i = gr.ids.size(); i < (size_t) im.BS; ++i) {   // STRATA_DSPARK_HEAD_ROWS: slots the head did not run
+            ids[i] = -1;
+            conf[i] = NEG_INF;
+        }
     }
     im.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;

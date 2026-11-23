@@ -1,0 +1,8 @@
+{
+ "checkpoint": "1017",
+ "fingerprint": "54bfaa8385e86d02",
+ "role": "rank",
+ "file": "rank-1017-share.bin",
+ "stamped": "2026-11-13T23:49:26Z",
+ "from": "in git: the 1017 model's expert ranking"
+}

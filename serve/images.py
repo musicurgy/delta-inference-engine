@@ -229,17 +229,13 @@ class ImageGen:
         self.progress = (0, job["steps"])
         with self.lock:
             with open(logf, "w", encoding="utf-8", errors="replace") as lf:
-                try:
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            stdin=subprocess.DEVNULL, env=image_env(self.cfg),
-                                            cwd=str(work), text=True, errors="replace", bufsize=1)
+                from serve.winjob import start_contained
+                try:                              # ends with the server (Windows)
+                    proc = start_contained(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           stdin=subprocess.DEVNULL, env=image_env(self.cfg),
+                                           cwd=str(work), text=True, errors="replace", bufsize=1)
                 except OSError as e:
                     raise ImageJobFailed(f"sd-cli did not start ({cmd[0]}): {e}") from e
-                try:
-                    from serve.winjob import contain
-                    contain(proc)                 # ends with the server (Windows)
-                except Exception:
-                    pass
                 why = None
 
                 def pump():

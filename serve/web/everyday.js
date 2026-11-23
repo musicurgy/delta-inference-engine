@@ -286,7 +286,7 @@ const APPS = {
            text: (b, k, m) => `set ANTHROPIC_BASE_URL=${b}\nset ANTHROPIC_AUTH_TOKEN=${k}\nset ANTHROPIC_MODEL=${m}\nset CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000\nclaude`,
            note: "Without CLAUDE_CODE_MAX_CONTEXT_TOKENS, Claude Code assumes 200K tokens and compacts there."},
   opencode: {name: "OpenCode", how: "In opencode.jsonc (in your project, or ~/.config/opencode/):",
-             // OpenCode 1.19's runtime reads only the "provider" (V1) form; "providers" is dropped (round 373, 11-08)
+             // OpenCode 1.19's runtime reads only the "provider" (V1) form; "providers" is dropped (measured, 11-08)
              text: (b, k, m) => JSON.stringify({$schema: "https://opencode.ai/config.json", provider: {delta: {
                npm: "@ai-sdk/openai-compatible", name: "Delta (local)",
                options: {baseURL: `${b}/v1`, apiKey: k},

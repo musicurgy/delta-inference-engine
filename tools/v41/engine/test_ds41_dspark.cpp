@@ -1,12 +1,15 @@
 // tools/v41/engine/test_ds41_dspark.cpp - the engine's DSpark draft stack on the offline harness's records.
 //
-//   test_ds41_dspark --sidecar V41-MTP-Vision.gguf -m V41-GSQ.gguf --main main.bin --gen gen.txt [--max N] [--dump F]
+//   test_ds41_dspark --sidecar V41-MTP-Vision.gguf -m V41-GSQ.gguf --main main.bin --gen gen.txt [--max N] [--dump F] [--park 1|2]
 //
 // main.bin / gen.txt = what tools/v41/dspark_accept.py reads (engine STRATA_DUMP_MAIN records {int32 token, int32 pos,
 // 3 x n_embd f32}: the first 128 are the prompt tail that seeds the window, the rest decode steps).  The same loop as
 // the harness: step j appends record j's main_hidden at its position and drafts with bonus = the next token; drafts are
 // scored against the tokens that followed (accepted length = the matching prefix).  --dump writes one line per scored
 // step: "j pos d0..d4 c0..c4" (compare with dspark_accept.py --dump-drafts).
+// --park 1|2 (STRATA_DSPARK_PARK, A7): after the first 64 seed records, park the stack (1 = pageable host copy, 2 =
+// pinned), unpark it and start again from record 0 - the --dump must be byte-identical to a run without --park (the
+// same weights, a cleared state and an empty window, as a freshly loaded stack).
 #include "ds41_dspark.hpp"
 
 #include "ggml-backend.h"
@@ -14,6 +17,7 @@
 #include "ggml-cuda.h"
 #endif
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,7 +27,7 @@
 
 int main(int argc, char ** argv) {
     std::string side, model, mainf, genf, dump;
-    int max = 0;
+    int max = 0, park = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto nx = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
@@ -33,10 +37,11 @@ int main(int argc, char ** argv) {
         else if (a == "--gen") genf = nx();
         else if (a == "--max") max = std::atoi(nx().c_str());
         else if (a == "--dump") dump = nx();
+        else if (a == "--park") park = std::atoi(nx().c_str());
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (side.empty() || model.empty() || mainf.empty() || genf.empty()) {
-        std::fprintf(stderr, "usage: test_ds41_dspark --sidecar F -m F --main main.bin --gen gen.txt [--max N] [--dump F]\n");
+        std::fprintf(stderr, "usage: test_ds41_dspark --sidecar F -m F --main main.bin --gen gen.txt [--max N] [--dump F] [--park 1|2]\n");
         return 2;
     }
 #ifdef DS41_HAVE_CUDA
@@ -92,6 +97,19 @@ int main(int argc, char ** argv) {
         if (!ds.step(mh, &pos[(size_t) j], 1, score ? seq[(size_t) j + 1] : -1, ids, conf)) {
             std::fprintf(stderr, "step %d: %s\n", j, ds.last_error().c_str());
             return 1;
+        }
+        if (park > 0 && j == 63) {   // --park: still seeding (no step scored yet), so restarting at 0 changes nothing
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!ds.park(park >= 2, 0, err)) { std::fprintf(stderr, "park: %s\n", err.c_str()); return 1; }
+            const auto t1 = std::chrono::steady_clock::now();
+            if (!ds.unpark(err)) { std::fprintf(stderr, "unpark: %s\n", err.c_str()); return 1; }
+            const auto t2 = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "park (%s, %.2f GB host copy) %.1f ms, unpark %.1f ms\n", ds.host_pinned() ? "pinned" : "pageable",
+                         ds.host_bytes() / 1e9, std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                         std::chrono::duration<double, std::milli>(t2 - t1).count());
+            park = 0;
+            j = -1;
+            continue;
         }
         if (!score) continue;
         ms_sum += ds.last_ms();

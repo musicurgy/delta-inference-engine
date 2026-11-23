@@ -268,7 +268,7 @@ int main(int argc, char** argv) {
     // 285 MHz (- / 576 / 1157 us); an expert every 300 us ~1 GHz (- / 584 / 663 us); every 150 us 1.7 GHz, 60 W
     // (165 / 177 / 249 us, p90 802 at 20 ms); every 100 us 2.6 GHz, ~100 W while serving (137 / 142 / 151 us).
     // This fork: OFF by default (DS41_HELPER_WARM_US=100 = upstream) - it needs this thread awake every 100 us, a whole
-    // CPU core the engine's pool shares (round 216: one core taken cut another engine run from 15.9 to 10.0 tok/s).
+    // CPU core the engine's pool shares (measured: one core taken cut another engine run from 15.9 to 10.0 tok/s).
     const double warm_us = std::getenv("DS41_HELPER_WARM_US") ? std::atof(std::getenv("DS41_HELPER_WARM_US")) : 0.0;
     // ... but only until no request came for DS41_HELPER_WARM_IDLE_S (default 10; 0 = always): then the card may idle
     // (the keep-warm holds it at ~83 W, fan on, with no one using the model); the first request after that wakes it
@@ -334,7 +334,7 @@ int main(int argc, char** argv) {
     int ast = 0;                 // 0 idle, 1 victim leaving (grace), 2 copy in flight
     int32_t a_le = -1, a_slot = -1, a_buf = -1;
     // the admission copy goes up in DS41_HELPER_CHUNK_KB pieces (default 256), one in flight: on a narrow link a whole
-    // blob (~10 MB: ~11 ms on x1) queued ahead of a request's rows held every request up (round 216: tier 86 -> 248 ms
+    // blob (~10 MB: ~11 ms on x1) queued ahead of a request's rows held every request up (measured: tier 86 -> 248 ms
     // a verify pass)
     const size_t a_chunk = (size_t) (std::getenv("DS41_HELPER_CHUNK_KB") ? std::atof(std::getenv("DS41_HELPER_CHUNK_KB")) : 256.0) * 1024;
     size_t a_off = 0, a_bytes = 0;
@@ -402,7 +402,7 @@ int main(int argc, char** argv) {
                    "admission copy");
                 ck(cudaEventRecord(cev, cst), "admission event");
                 // wake this thread the moment the piece lands (it blocks on the segment's event between requests), so
-                // the next piece goes at once instead of after a 1 ms timeout (~40 ms a blob: round 217, 0.6% served)
+                // the next piece goes at once instead of after a 1 ms timeout (~40 ms a blob, 0.6% served)
                 ck(cudaLaunchHostFunc(cst, [](void* m) { static_cast<Ds41RemoteMap*>(m)->signal(); }, &map), "admission wake");
                 a_off += n;
                 return;

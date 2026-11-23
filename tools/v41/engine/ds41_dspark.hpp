@@ -32,6 +32,12 @@ struct Ds41DSparkConfig {
     /// The trunk's output.weight already on `backend` (Ds41Dense::weight): shared instead of a second copy (-0.7 GB).
     /// Any type (a requantized dense head only moves acceptance - drafts are verified).  nullptr = load from main_gguf.
     ggml_tensor * shared_head = nullptr;
+    /// STRATA_DSPARK_HEAD_ROWS (after Basalt d83cb5de9): the draft slots the head's Markov chain runs over -
+    /// the first head_rows of the block (the caller's depth: the rows a verify window can take); 0 = all `block`.
+    /// The block's body and the trunk-head product still run over every row (the attention is non-causal, and the
+    /// product's kernel stays the one it was), so each computed slot gets the same bytes as before.  A slot past
+    /// head_rows comes back as id -1, confidence -inf ("no draft", as the bounds guard marks one) and no cdf row.
+    int head_rows = 0;
 };
 
 class Ds41DSpark {
@@ -54,8 +60,26 @@ public:
     bool step_sampled(const float * main_hidden, const int * pos, int k, int bonus, int * ids, float * conf,
                       const float * u, float inv_temp, float * cdf);
     int64_t vocab() const;              ///< the head's vocabulary (the cdf row length)
+    /// STRATA_PINNED_STAGE (default on): the last sampled step's cdf rows in the pinned step staging (block x vocab()
+    /// floats), valid until the next sampled step; nullptr = not staged (pass step_sampled a cdf buffer).  When it is
+    /// non-null, step_sampled accepts cdf = nullptr and leaves the rows there (no 2.6 MB copy).
+    const float * staged_cdf() const;
     /// Forget the window (a new conversation / a rewind past it).
     void reset();
+    /// STRATA_DSPARK_PARK (A7): free every device buffer the stack holds (weights, state, graph buffer - what the
+    /// destructor frees on the card) but keep the weight bytes in host RAM (`pinned`: the backend's pinned host buffer
+    /// type, else pageable), so unpark() restores the stack with one H2D copy instead of a GGUF re-parse + upload.  The
+    /// first park copies the weights to the host (one D2H) and keeps that copy for the object's lifetime (the weights
+    /// never change), so later parks only free (`pinned` matters only then).  That first park is refused (false, err
+    /// says why, nothing freed) when the OS reports less than weight_bytes() + min_free_bytes of available RAM, the
+    /// allocation fails, or `pinned` and the backend has no host buffer type.
+    bool park(bool pinned, size_t min_free_bytes, std::string & err);
+    /// Re-create the device buffers in init()'s order, upload the kept bytes and re-zero the state exactly as init()
+    /// leaves it (window empty).  False: the object is unusable (err) - destroy it and init() a new one.
+    bool unpark(std::string & err);
+    bool parked() const;
+    size_t host_bytes() const;          ///< host bytes of the parked copy (0 before the first park)
+    bool host_pinned() const;           ///< the copy is pinned (false: ggml fell back to pageable RAM - slower upload)
     double last_ms() const;             ///< wall time of the last step's graph
     size_t weight_bytes() const;        ///< device bytes of the stack's weights
     const std::string & last_error() const;

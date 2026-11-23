@@ -29,6 +29,7 @@ def check(name, ok, detail=""):
 TOOLS = [{"type": "function", "function": {"name": "read_file", "description": "Read a file",
           "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "lines": {"type": "integer"}},
                          "required": ["path"]}}}]
+FLAT = [t["function"] for t in TOOLS]   # as the server hands them to the parser (a wrapped tool has no "name": f096)
 
 
 def t_template():
@@ -59,12 +60,28 @@ def t_template():
             check(f"template chat{i} {mode} no-gen is a prefix", got.startswith(hist) and len(hist) < len(got))
     # content parts, effort
     got = T.render([{"role": "user", "content": [{"type": "text", "text": "x"}, {"type": "text", "text": "y"}]}])
-    check("template content parts joined", got == E.encode_messages([{"role": "user", "content": "xy"}], "thinking"))
+    # 11-15 sweep: text parts are joined with a blank line, as DeepSeek's encoder joins a list's text items
+    check("template content parts joined", got == E.encode_messages([{"role": "user", "content": "x\n\ny"}], "thinking"))
     for eff, n in (("max", 100), (30, 30), ("low", 50), ("high", 75), ("xhigh", 75)):
         got = T.render([{"role": "user", "content": "q"}], reasoning_effort=eff)
         check(f"effort {eff!r} -> {n}", f"Reasoning Effort: {n} " in got, got[:120])
     got = T.render([{"role": "user", "content": "q"}])
     check("effort default -> 75", "Reasoning Effort: 75 " in got)
+
+
+def t_prefill():
+    """A conversation ending with an assistant message is continued (Anthropic prefill, DeepSeek's trailing assistant):
+    the prompt ends with that text, not with <｜end▁of▁sentence｜>; earlier assistant turns keep their end token."""
+    T = D.Ds41Template()
+    eos = E.eos_token
+    for kw in ({}, {"enable_thinking": False}):
+        p = T.render([{"role": "user", "content": "Write a haiku."}, {"role": "assistant", "content": "Autumn wind"}], **kw)
+        check(f"prefill continues the last assistant message {kw}", p.endswith("Autumn wind") and not p.endswith(eos),
+              repr(p[-40:]))
+        p = T.render([{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+                      {"role": "user", "content": "c"}], **kw)
+        check(f"earlier assistant turns still end with the end token {kw}", ("b" + eos) in p, repr(p[-60:]))
+    check("effort 'ultra' is DeepSeek's top level", D.effort_kwargs("ultra") == {"reasoning_effort": 100})
 
 
 def t_effort_kwargs():
@@ -91,8 +108,8 @@ def dsml(calls):
     return f"\n\n{D.CALLS_OPEN}\n" + "\n".join(inv) + f"\n{D.CALLS_CLOSE}"
 
 
-def run_parser(text, thinking, split):
-    p = F.OutputParser(thinking=thinking, tools=TOOLS)
+def run_parser(text, thinking, split, **kw):
+    p = F.OutputParser(thinking=thinking, tools=FLAT, **kw)
     ev = []
     for i in range(0, len(text), split):
         ev += p.feed(text[i:i + split])
@@ -128,7 +145,7 @@ def t_parser():
         for cut in range(text.index("<" + E.dsml_token), len(text) + 1):
             for step in (1, 7, 4096):
                 for reason in ("length", "cancel"):
-                    p = F.OutputParser(thinking=thinking, tools=TOOLS)
+                    p = F.OutputParser(thinking=thinking, tools=FLAT)
                     ev = []
                     for i in range(0, cut, step):
                         ev += p.feed(text[i:min(i + step, cut)])
@@ -158,7 +175,7 @@ def t_parser():
             bad = []
             for cut in range(len(head), len(whole) + 1):
                 for step in (1, 7, 4096):
-                    p, ev = F.OutputParser(thinking=thinking, tools=TOOLS), []
+                    p, ev = F.OutputParser(thinking=thinking, tools=FLAT), []
                     for i in range(0, cut, step):
                         ev += p.feed(whole[:cut][i:i + step])
                     ev += p.finish("length")
@@ -166,14 +183,14 @@ def t_parser():
                     if c.strip() != "Reading.":
                         bad.append((cut, step, c))
             check(f"{name}: cut anywhere, no markup in the content (thinking={thinking})", not bad, bad[:2])
-    # round 359's agent trace (UD-IQ2_XXS, greedy, bias 0.28): a stray word in the marker's place inside a calls block
+    # an agent trace (UD-IQ2_XXS, greedy, bias 0.28): a stray word in the marker's place inside a calls block
     o, cl = "<" + E.dsml_token, "</" + E.dsml_token
     stray = (f'Checking.\n\n{o} calls>\n<name invoke name="read_file">\n{o} parameter name="path" string="true">a.txt{cl} parameter>\n'
              f'{o} parameter name="lines" string="false">3{cl} parameter>\n{cl} invoke>\n{cl} calls>')
     bad = []
     for cut in range(len("Checking."), len(stray) + 1):
         for step in (1, 7, 4096):
-            p, ev = F.OutputParser(thinking=False, tools=TOOLS), []
+            p, ev = F.OutputParser(thinking=False, tools=FLAT), []
             for i in range(0, cut, step):
                 ev += p.feed(stray[:cut][i:i + step])
             ev += p.finish("stop" if cut == len(stray) else "length")
@@ -236,7 +253,22 @@ def t_param_schema():
     check("schema: a number where the type says so", arg(spec, "count", "7") == 7 and arg(spec, "n", "5") == 5 and arg(spec, "count", "null") is None)
     check("schema: no type decodes JSON", arg(spec, "free", "[1, 2]") == [1, 2])
     check("schema: string=true wins", arg(spec, "n", "5", "true") == "5")
+    # 0.95 (Abyss 66e4aa6): a boolean parameter written in Python's spelling is a bool; only where the schema says boolean
+    bools = {"name": "opt", "parameters": {"type": "object", "properties": {
+        "flag": {"type": "boolean"}, "maybe": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}, "s": {"type": "string"},
+        "either": {"type": ["boolean", "string"]}, "free": {}}}}
+    got = [arg(bools, "flag", v) for v in ("True", "False", " TRUE\n", "true", "false", '"True"')]
+    check("schema: a boolean written True / False is a bool", got == [True, False, True, True, False, True], got)
+    got = (arg(bools, "maybe", "False"), arg(bools, "maybe", "null"), arg(bools, "flag", "yes"), arg(bools, "s", "True"),
+           arg(bools, "either", "True"), arg(bools, "free", "True"), arg(spec, "n", "True"),
+           D.ds41_parse_tool_call(f' name="x">{D.P_OPEN} name="a" string="false">True{D.P_CLOSE}').arguments["a"])
+    check("schema: True stays text where the schema does not say boolean", got == (False, None, "yes", "True", "True", "True", "True", "True"), got)
     check("schema: without a schema, JSON", D.ds41_parse_tool_call(f' name="x">{D.P_OPEN} name="a" string="false">3{D.P_CLOSE}').arguments == {"a": 3})
+    # llama.cpp c90aa996b: a raw newline / tab inside a JSON value's string (the model wrote the character) is JSON
+    got = arg(spec, "free", '[{"old": "x = 1\n", "new": "x = 2\tdone"}]')
+    check("schema: raw control characters in a JSON value's string", got == [{"old": "x = 1\n", "new": "x = 2\tdone"}], got)
+    got = D.ds41_parse_tool_call(f' name="x">{D.P_OPEN} name="a" string="false">{{"k": "a\nb"}}{D.P_CLOSE}').arguments
+    check("schema: raw control characters, without a schema", got == {"a": {"k": "a\nb"}}, got)
     check("schema: a union's variants type their parameters", arg(union, "id", "42") == "42" and arg(union, "every", "8") == 8 and arg(union, "name", "123") == "123")
 
     class P:
@@ -258,6 +290,186 @@ def t_undeclared_call():
     check("a DSML call to an undeclared tool is a call, no markup in the content", [x[0] for x in k] == ["bash"] and "DSML" not in c and "invoke" not in c, (c, k))
 
 
+QA_TOOLS = [{"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {
+    "content": {"type": "string"}, "n": {"type": "integer"}}}}}]
+QA_FLAT = [t["function"] for t in QA_TOOLS]
+
+
+def qa_call(value, n=3):
+    """The DSML DeepSeek's own encoder writes for write(content=value, n=n), after "Writing." (chat mode)."""
+    msgs = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "Writing.", "tool_calls": [
+        {"type": "function", "function": {"name": "write", "arguments": json.dumps({"content": value, "n": n})}}]}]
+    enc = E.encode_messages(msgs, thinking_mode="chat")
+    body = enc[enc.index("Writing."):]
+    return body[:body.rindex(D.CALLS_CLOSE) + len(D.CALLS_CLOSE)]
+
+
+def qa_run(text, thinking, step, cut=None, reason=None):
+    p, ev = F.OutputParser(thinking=thinking, tools=QA_FLAT), []
+    text = text if cut is None else text[:cut]
+    for i in range(0, len(text), step):
+        ev += p.feed(text[i:i + step])
+    ev += p.finish(reason) if reason else p.finish()
+    return ("".join(e.text for e in ev if e.kind == "content"), "".join(e.text for e in ev if e.kind == "reasoning"),
+            [(e.call.name, e.call.arguments) for e in ev if e.kind == "tool_call"])
+
+
+def t_param_close_in_value():
+    """0.95 (spark-ds41f 74e45310, lucebox 39b9cfb9): a parameter close inside a string value - written with the real
+    DSML token - ends the value only when the call's structure follows it; a whole call the value quotes is its text."""
+    o, cl, io, ic, po, pc = D.CALLS_OPEN, D.CALLS_CLOSE, D.INVOKE_OPEN, D.INVOKE_CLOSE, D.P_OPEN, D.P_CLOSE
+    quoted = f'{o}\n{io} name="bash">\n{po} name="command" string="true">ls{pc}\n{ic}\n{cl}'
+    for name, value in (("then text", f"A param ends with {pc} then more."), ("at the end", f"the tag is {pc}"),
+                        ("then a newline", f"x {pc}\ny"), ("a whole quoted call", f"test:\n{quoted}\ndone"),
+                        ("a quoted call at the end", quoted), ("with a calls close", f"1 {pc}\n3 {cl}\nend")):
+        bad = []
+        for thinking in (False, True):
+            text = ("plan" + E.thinking_end_token if thinking else "") + qa_call(value)
+            for step in (1, 2, 3, 5, 7, 11, 4096):
+                c, r, k = qa_run(text, thinking, step)
+                if k != [("write", {"content": value, "n": 3})] or c.strip() != "Writing.":
+                    bad.append((thinking, step, c[-60:], k))
+        check(f"a parameter close inside a value: {name}", not bad, bad[:1])
+    # two calls, the first value holding a closer: both whole
+    text = "Writing." + dsml([("write", {"content": f"see {pc} here", "n": 1}), ("write", {"content": "second", "n": 2})])
+    for step in (1, 3, 4096):
+        c, r, k = qa_run(text, False, step)
+        check(f"a parameter close inside a value, then a second call (step {step})",
+              k == [("write", {"content": f"see {pc} here", "n": 1}), ("write", {"content": "second", "n": 2})], k)
+    # unchanged: a close followed by the next parameter, the call's end, the calls' end, or the end of the text
+    for text, want in ((f'{o}\n{io} name="write">\n{po} name="content" string="true">a{pc}\n{po} name="n" string="false">3{pc}\n{ic}\n{cl}',
+                        {"content": "a", "n": 3}),
+                       (f'{o}\n{io} name="write">\n{po} name="content" string="true">a{pc}{ic}{cl}', {"content": "a"}),
+                       (f'{o}\n{io} name="write">\n{po} name="content" string="true">a{pc}\n{cl}', None),
+                       (f'{o}\n{io} name="write">\n{po} name="content" string="true">a{pc}  \n', None)):
+        for step in (1, 4, 4096):     # (None: a call without its invoke close is no call, as before)
+            c, r, k = qa_run("W." + text, False, step)
+            check(f"a parameter close the structure follows still ends the value ({len(text)}, step {step})",
+                  k == ([("write", want)] if want else []) and D.LITERAL_LT not in c, (c, k))
+
+
+def t_dsml_leak():
+    """R-5: DSML left in an answer is counted (once per answer) and logged; the events themselves never change."""
+    def leaks(text, thinking=False, step=1, reason=None):
+        before = D.DSML_LEAKS["answers"]
+        p, ev = F.OutputParser(thinking=thinking, tools=FLAT), []
+        for i in range(0, len(text), step):
+            ev += p.feed(text[i:i + step])
+        ev += p.finish(reason) if reason else p.finish()
+        return D.DSML_LEAKS["answers"] - before, "".join(e.text for e in ev if e.kind == "content")
+
+    call = "Reading." + dsml([("read_file", {"path": "a b.txt", "lines": 3})])
+    for step in (1, 5, 4096):
+        n, c = leaks(call, step=step)
+        check(f"a parsed call is no leak (step {step})", n == 0 and "DSML" not in c, (n, c))
+        n, c = leaks("plan " + E.dsml_token + " calls" + E.thinking_end_token + call, thinking=True, step=step)
+        check(f"DSML in the thinking is no leak (step {step})", n == 0, n)
+        n, c = leaks("The " + E.dsml_token + " token, and " + E.dsml_token + " again.", step=step)
+        check(f"the DSML token as answer text: counted once (step {step})", n == 1 and E.dsml_token in c, (n, c))
+        n, c = leaks('In XML: <invoke name="x"> is a tag.', step=step)
+        check(f"a marker-less invoke tag in prose: counted, text unchanged (step {step})",
+              n == 1 and c == 'In XML: <invoke name="x"> is a tag.', (n, c))
+    n, c = leaks("Done. <" + E.dsml_token + " inv", reason="stop")
+    check("a natural stop inside a tag keeps the text and counts it", n == 1 and c.endswith(E.dsml_token + " inv"), (n, c))
+    n, c = leaks("plain answer <｜DSML not a tag")
+    check("text that only starts like a tag is no leak", n == 0, n)
+
+
+def t_tool_qa():
+    """ds4's tool-call QA list (antirez 46e46e7, aa8fef4, d077fa6, fc6414c; MIT): split delimiters at every byte, literal
+    tool / thinking markers inside an argument, escapes, and a truncated call that stays truncated."""
+    literals = {"thinking tags": E.thinking_start_token + " x " + E.thinking_end_token, "calls close": D.CALLS_CLOSE,
+                "calls open": D.CALLS_OPEN, "invoke close": D.INVOKE_CLOSE, "bare invoke close": "</ invoke>",
+                "invoke open": f'{D.INVOKE_OPEN} name="bash">', "parameter open": f'{D.P_OPEN} name="n" string="false">',
+                "end of sentence": E.eos_token, "HTML entities": "&lt;div&gt; &amp; &quot;", "lone <": "a < b <"}
+    # (not covered: an invoke close followed by a calls close or another call's opening inside one value - that is
+    # also what a quant that left out the value's closing tag writes, and upstream #110's recovery wins there)
+    for name, lit in literals.items():
+        value = f"before {lit} after\n"
+        body, want = qa_call(value), [("write", {"content": value, "n": 3})]
+        ref = E.parse_message_from_completion_text(body + E.eos_token, "chat")
+        ref_ok = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in ref["tool_calls"]] == want
+        for thinking in (False, True):
+            text, bad = ("plan" + E.thinking_end_token if thinking else "") + body, []
+            for step in range(1, 24):
+                c, r, k = qa_run(text, thinking, step)
+                if k != want or c.strip() != "Writing." or (thinking and r != "plan"):
+                    bad.append((step, c[-60:], k))
+            check(f"QA: literal {name} inside an argument, every split 1..23 (thinking={thinking})", ref_ok and not bad,
+                  bad[:1] or "DeepSeek's parser differs")
+    # a cut anywhere inside such a call: no call, no markup, no placeholder in the content; a natural stop keeps the text
+    value = f"x {D.INVOKE_CLOSE} {D.CALLS_OPEN} y"
+    body, bad = qa_call(value), []
+    done = body.rindex(D.INVOKE_CLOSE) + len(D.INVOKE_CLOSE)        # the call is whole from here
+    for cut in range(body.index(D.CALLS_OPEN), len(body)):
+        for step in (1, 5, 4096):
+            c, r, k = qa_run(body, False, step, cut, "length")
+            if c.strip() != "Writing." or k != ([("write", {"content": value, "n": 3})] if cut >= done else []):
+                bad.append(("length", cut, step, c[-40:], k))
+            c, r, k = qa_run(body, False, step, cut, "stop")   # (a natural stop may still recover a call)
+            if D.LITERAL_LT in c or any(D.LITERAL_LT in json.dumps(a) for _, a in k):
+                bad.append(("stop", cut, step, c[-40:], k))
+    check("QA: a cut inside a call with literal tags in its value: no call, no DSML, no placeholder", not bad, bad[:2])
+    # upstream #110's recovery stays: a value's closing tag left out, the call ends at its invoke close
+    o, cl = D.CALLS_OPEN, D.CALLS_CLOSE
+    rf = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {
+        "path": {"type": "string"}}}}}]
+    for text, want in ((f'R.\n\n{o}\n{D.INVOKE_OPEN} name="read_file">\n{D.P_OPEN} name="path" string="true">a.txt{D.INVOKE_CLOSE}\n{cl}',
+                        [{"path": "a.txt"}]),
+                       (f'R.\n\n{o}\n{D.INVOKE_OPEN} name="read_file">\n{D.P_OPEN} name="path" string="true">a.txt{D.INVOKE_CLOSE}\n'
+                        f'{D.INVOKE_OPEN} name="read_file">\n{D.P_OPEN} name="path" string="true">b.txt{D.P_CLOSE}\n{D.INVOKE_CLOSE}\n{cl}',
+                        [{"path": "a.txt"}, {"path": "b.txt"}]),
+                       (f'R.\n\n{o}\n{D.INVOKE_OPEN} name="read_file">\n{D.P_OPEN} name="path" string="true">a.txt{D.INVOKE_CLOSE}\n'
+                        f'<name invoke name="read_file">\n{D.P_OPEN} name="path" string="true">b.txt{D.P_CLOSE}\n{D.INVOKE_CLOSE}\n{cl}',
+                        [{"path": "a.txt"}, {"path": "b.txt"}]),         # the next call opened with a stray word
+                       (f'R.\n\n{o}\n{D.INVOKE_OPEN} name="read_file">\n{D.P_OPEN} name="path" string="true">a.txt{D.INVOKE_CLOSE}',
+                        [{"path": "a.txt"}])):
+        bad = []
+        for step in (1, 3, 7, 4096):
+            p, ev = F.OutputParser(thinking=False, tools=[t["function"] for t in rf]), []
+            for i in range(0, len(text), step):
+                ev += p.feed(text[i:i + step])
+            ev += p.finish()
+            k = [e.call.arguments for e in ev if e.kind == "tool_call"]
+            if k != want:
+                bad.append((step, k))
+        check(f"QA: a value's closing tag left out, the call still ends ({len(want)} call(s))", not bad, bad[:1])
+    # escapes: DwarfStar's escaped closing spelling is undone one level; everything else stays as written
+    for value, want in (("&lt;" + D.P_CLOSE[1:], D.P_CLOSE), ("&amp;lt;" + D.P_CLOSE[1:], "&lt;" + D.P_CLOSE[1:]),
+                        ("&lt;" + D.INVOKE_CLOSE[1:], "&lt;" + D.INVOKE_CLOSE[1:]), ("a \\n b \\\" c", "a \\n b \\\" c")):
+        c, r, k = qa_run(qa_call(value), False, 3)
+        check(f"QA: escape {value[:12]!r}", k == [("write", {"content": want, "n": 3})], k)
+    # a call cut by max_tokens through the server: finish_reason stays "length", no tool_calls, whole or streamed
+    import serve.server as S
+    tok = S.ByteTokenizer()
+    tok.SPECIALS = tok.SPECIALS + [E.eos_token]       # V4.1's end of turn: one id, as the server asserts
+    body = qa_call("x " + D.INVOKE_CLOSE + " y")
+    cut = len(body[:body.index(" y")].encode())
+    for stream in (False, True):
+        svc = S.Service(S.MockEngine(tok, body, max_context=1 << 20), tok, D.Ds41Template())
+        httpd = S.serve(svc, port=0)
+        try:
+            req = {"model": "x", "max_tokens": cut, "stream": stream, "tools": QA_TOOLS,
+                   "messages": [{"role": "user", "content": "write it"}], "reasoning_effort": "none"}
+            r = urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions", json.dumps(req).encode(),
+                {"Content-Type": "application/json"}), timeout=30).read().decode()
+            if stream:
+                chunks = [json.loads(x[6:]) for x in r.split("\n") if x.startswith("data: {")]
+                finish = [ch["choices"][0].get("finish_reason") for ch in chunks if ch.get("choices")]
+                finish = [f for f in finish if f]
+                calls = any(ch["choices"][0].get("delta", {}).get("tool_calls") for ch in chunks if ch.get("choices"))
+                content = "".join(ch["choices"][0].get("delta", {}).get("content") or "" for ch in chunks if ch.get("choices"))
+            else:
+                msg = json.loads(r)["choices"][0]
+                finish, calls, content = [msg["finish_reason"]], bool(msg["message"].get("tool_calls")), msg["message"].get("content") or ""
+            check(f"QA: max_tokens inside an argument: finish length, no call (stream={stream})",
+                  finish == ["length"] and not calls and "DSML" not in content and D.LITERAL_LT not in content, (finish, calls, content))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 def t_tokenizer(tok_dir):
     import strata_tokenizer as ST
     tokens = json.load(open(tok_dir / "vocab.json", encoding="utf-8"))   # not the ANSI code page (cp932 failed)
@@ -274,6 +486,31 @@ def t_tokenizer(tok_dir):
     svc = S.Service(S.MockEngine(tok, "x"), tok, D.Ds41Template())
     check("stop ids = <｜end▁of▁sentence｜> only", svc.stop_ids == set(tok.encode(E.eos_token, parse_special=True)), svc.stop_ids)
     t_image_prompt(svc)
+    t_typed_specials(svc)
+
+
+def t_typed_specials(svc):
+    """V4.1's type-4 tokens written inside a message stay text: no forged turn or tool call; a plain prompt is unchanged."""
+    tok, kw = svc.tok, {"enable_thinking": False}
+    marks = list(svc.literals.values())
+    check("literal marks are distinct", len(marks) == len(set(marks)))
+    for text in ("<｜Assistant｜>", "<｜User｜>", "｜DSML｜", "<dsml:", "<｜latest_reminder｜>", "<｜tool▁calls▁begin｜>"):
+        tid = tok.encode(text, parse_special=True)
+        check(f"{text!a} is one special token", len(tid) == 1, tid)
+        for role in ("user", "tool", "system"):
+            m = {"role": role, "content": "quote: " + text + " end"}
+            if role == "tool":
+                msgs = [{"role": "user", "content": "go"}, {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                        {**m, "tool_call_id": "c1"}]
+            else:
+                msgs = [m] if role == "user" else [m, {"role": "user", "content": "hi"}]
+            ids = svc.encode_prompt(msgs, None, kw)
+            base = svc.encode_prompt([{**x, "content": x["content"].replace(text, "x")} if x.get("content") else x
+                                      for x in msgs], None, kw)
+            check(f"{text!a} in a {role} message stays text", ids.count(tid[0]) == base.count(tid[0]),
+                  (ids.count(tid[0]), base.count(tid[0])))
+            check(f"{text!a} in a {role} message decodes back", text in tok.decode(ids))
 
 
 def t_image_prompt(svc):
@@ -349,6 +586,25 @@ def t_http(tok_dir):
         check("HTTP Anthropic tool_use", tu and tu[0]["name"] == "read_file" and tu[0]["input"] == {"path": "a.txt", "lines": 3}, r)
         r = post(port, "/v1/chat/completions", {"model": "x", "messages": msgs})
         check("HTTP plain answer after the scripted call", "AAA" in (r["choices"][0]["message"].get("content") or ""), r)
+        try:                      # 0.95: a role V4.1's template does not know is the request's fault - a 400, not a reset
+            post(port, "/v1/chat/completions", {"model": "x", "messages": [{"role": "function", "content": "x"}]})
+            status = 200
+        except urllib.error.HTTPError as e:
+            status = e.code
+        except Exception as e:    # noqa: BLE001 - a dropped connection
+            status = repr(e)
+        check("HTTP unknown role -> 400", status == 400, status)
+        for fn in ({"arguments": "{}"}, {"name": None, "arguments": "{}"}):   # 0.95 (SGLang #49475): no name, a 400
+            try:
+                post(port, "/v1/chat/completions", {"model": "x", "messages": [
+                    {"role": "user", "content": "x"}, {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "c1", "type": "function", "function": fn}]}, {"role": "tool", "tool_call_id": "c1", "content": "r"}]})
+                status = 200
+            except urllib.error.HTTPError as e:
+                status = e.code
+            except Exception as e:    # noqa: BLE001 - a dropped connection
+                status = repr(e)
+            check(f"HTTP assistant tool call without a name -> 400 ({fn})", status == 400, status)
     finally:
         proc.terminate()
         try:
@@ -360,11 +616,18 @@ def t_http(tok_dir):
 
 
 if __name__ == "__main__":
+    # the checks print DeepSeek's markers (U+FF5C ...): a cp1252 console would stop at the first one and skip the rest
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     t_template()
+    t_prefill()
     t_effort_kwargs()
     t_parser()
     t_param_schema()
     t_undeclared_call()
+    t_tool_qa()
+    t_param_close_in_value()
+    t_dsml_leak()
     if len(sys.argv) > 1:
         t_tokenizer(Path(sys.argv[1]))
         t_http(Path(sys.argv[1]))

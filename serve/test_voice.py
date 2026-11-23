@@ -105,7 +105,7 @@ class VoiceServerOptions(unittest.TestCase):
         # start's health check reached the orphan, which refused the new token
         from unittest import mock
         v = VoiceServer("asr", {"cmd": "py", "port": 1, "start_timeout_s": 0.01})
-        with mock.patch("subprocess.Popen") as popen, mock.patch("serve.voice.contain") as contain:
+        with mock.patch("subprocess.Popen") as popen, mock.patch("serve.winjob.contain") as contain:
             popen.return_value.poll.return_value = None
             with self.assertRaises(RuntimeError):
                 v.ensure()

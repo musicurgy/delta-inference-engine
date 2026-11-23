@@ -4,12 +4,14 @@ Closing the console window, Task Manager or a crash end the server without runni
 the vision encoder and the MCP servers kept running on their own. `contain(proc)` puts a child in a job object that
 is set to kill everything in it when its last handle closes - and the only handle is this process's, which the OS
 closes however the server ends. Processes the child starts later join the same job. The server itself stays out of
-the job, so a browser that `--open` starts is not tied to it. Each child (and the server) is also opted out of Windows
+the job, so a browser that `--open` starts is not tied to it. `start_contained(args, ...)` starts a child already in
+the job, so what it starts in its first moments is in it too. Each child (and the server) is also opted out of Windows
 power throttling, see `no_throttle` (#691). Elsewhere, and if the job cannot be made, a no-op.
 """
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 
 _job = None
@@ -82,16 +84,114 @@ else:
 
 def contain(proc) -> bool:
     """Put a started subprocess.Popen in the kill-on-close job. True if it is in; False (harmlessly) otherwise."""
+    if proc is None or not _job_ready():
+        return False
+    try:
+        no_throttle(int(proc._handle))
+        return bool(_k32.AssignProcessToJobObject(_job, int(proc._handle)))
+    except (AttributeError, OSError, TypeError, ValueError):   # (TypeError: a stand-in, no handle)
+        return False
+
+
+# ---- starting a child inside the job (after Niko1221/Strata 5d87c4d8, MIT)
+_REAL_POPEN = subprocess.Popen    # the class itself, before a test can replace the name with a stand-in
+CREATE_SUSPENDED = 0x00000004
+
+
+def _job_ready() -> bool:
     global _job
-    if os.name != "nt" or proc is None:
+    if os.name != "nt":
         return False
     with _lock:
         if _job is None:
             _job = _make_job() or 0
-        if not _job:
-            return False
+        return bool(_job)
+
+
+def start_contained(args, **kw):
+    """`subprocess.Popen(args, **kw)` followed by `contain()`, without the gap between the two.  A child put in the job
+    after Popen returns has already run: an MCP server started through `npx` / `uvx` / a `.cmd` shim starts its real
+    process in its first milliseconds, and that process stayed outside the job and survived a hard kill of the server.
+    So the child is created suspended (the caller's own creationflags kept), put in the job, then resumed.  A refused
+    assignment still resumes it (it runs outside the job, as contain() leaves it).  If it cannot be resumed it never
+    ran an instruction: it is ended and started again the old way.  No job (not Windows, or the job could not be made):
+    plain Popen."""
+    if not _job_ready():
+        proc = subprocess.Popen(args, **kw)
+        contain(proc)
+        return proc
+    proc = subprocess.Popen(args, **{**kw, "creationflags": (kw.get("creationflags") or 0) | CREATE_SUSPENDED})
+    if not isinstance(proc, _REAL_POPEN):          # a test's stand-in: no suspended process behind it
+        contain(proc)
+        return proc
     try:
-        no_throttle(int(proc._handle))
-        return bool(_k32.AssignProcessToJobObject(_job, int(proc._handle)))
-    except (AttributeError, OSError, ValueError):
+        contain(proc)                              # False when refused (a job of the server's own forbids it): runs anyway
+        resumed = _resume(proc.pid)
+    except BaseException:
+        _end(proc)                                 # the caller never gets it: not left suspended
+        raise
+    if resumed:
+        return proc
+    _end(proc)
+    proc = subprocess.Popen(args, **kw)            # as before this change: started, then contained
+    contain(proc)
+    return proc
+
+
+def _end(proc) -> None:
+    """End a child the caller never got, and close its pipes."""
+    try:
+        proc.kill()
+        proc.wait(10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    for f in (proc.stdin, proc.stdout, proc.stderr):
+        try:
+            if f:
+                f.close()
+        except OSError:
+            pass
+
+
+if os.name == "nt":
+    class _ThreadEntry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ThreadID", wintypes.DWORD),
+                    ("th32OwnerProcessID", wintypes.DWORD), ("tpBasePri", wintypes.LONG),
+                    ("tpDeltaPri", wintypes.LONG), ("dwFlags", wintypes.DWORD)]
+
+    _TH32CS_SNAPTHREAD, _THREAD_SUSPEND_RESUME = 0x4, 0x2
+    _k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _k32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    _k32.Thread32First.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ThreadEntry))
+    _k32.Thread32Next.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ThreadEntry))
+    _k32.OpenThread.restype = wintypes.HANDLE
+    _k32.OpenThread.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _k32.ResumeThread.restype = wintypes.DWORD
+    _k32.ResumeThread.argtypes = (wintypes.HANDLE,)
+    _k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+
+def _resume(pid) -> bool:
+    """Resume the threads of a process created suspended (Popen closes the main thread's handle, so they are found by
+    a thread snapshot).  True if at least one was resumed."""
+    if os.name != "nt" or not isinstance(pid, int) or pid <= 0:
         return False
+    snap = _k32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return False
+    resumed = 0
+    try:
+        entry = _ThreadEntry()
+        entry.dwSize = ctypes.sizeof(_ThreadEntry)
+        ok = _k32.Thread32First(snap, ctypes.byref(entry))
+        while ok:
+            if entry.th32OwnerProcessID == pid:
+                th = _k32.OpenThread(_THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                if th:
+                    if _k32.ResumeThread(th) != 0xFFFFFFFF:
+                        resumed += 1
+                    _k32.CloseHandle(th)
+            ok = _k32.Thread32Next(snap, ctypes.byref(entry))
+    finally:
+        _k32.CloseHandle(snap)
+    return resumed > 0

@@ -121,13 +121,20 @@ class ChatTemplate:
 TEXT_PARTS = ("text", "input_text", None)
 
 
+# What joins a message's text parts.  Qwen's templates write list content back to back (""), the default; DeepSeek-V4.1's
+# encoder joins a list's text items with "\n\n" (dsv41_encoding), so serve_ds41 sets "\n\n" (11-15 sweep: "PART-A",
+# "PART-B" rendered as "PART-APART-B" - Claude Code sends several text blocks a turn; ik_llama 39ccfcb8, llama.cpp
+# 74bca3950 fixed the same).
+TEXT_PART_SEP = ""
+
+
 def _text_of(content) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
         return content
-    return "".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") in
-                   TEXT_PARTS)
+    return TEXT_PART_SEP.join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type")
+                              in TEXT_PARTS)
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
@@ -158,6 +165,15 @@ def budget_effort(tokens) -> dict:
     except (TypeError, ValueError):
         return {}
     return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
+
+
+def llama_budget(value) -> int | None:
+    """llama.cpp's `reasoning_budget` (0: thinking off, -1: no cap, N: at most N tokens of thinking) as a whole
+    number, or None when absent or not a whole number: a llama.cpp client's field is read where it makes sense and
+    never turns a request into an error (after Basalt 69518839b)."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _has_image(content) -> bool:
@@ -467,12 +483,55 @@ def _env_to_user(messages: list[dict]) -> list[dict]:
     return messages
 
 
+# 11-15 (opt-in, config "inline_system": true): keep a mid-conversation system message a system message.
+# DeepSeek-V4.1's own template renders it inline as <｜System｜> (SGLang #43549 keeps it); Qwen's Jinja template refuses
+# one past the start, so this stays off unless the model's template takes it.  Changes the prompt: quality A/B first.
+LATE_SYSTEM_INLINE = False
+
+
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
     """The chat template takes a system message only at the start ("System message must be at the beginning").
     Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
     turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages, in place:
-    merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
+    merging them into the first one would change the prompt's start and cost the conversation cache every turn.
+    LATE_SYSTEM_INLINE leaves them as they are (a template that renders them inline, as DeepSeek-V4.1's)."""
+    # 11-15 sweep (spark-ds41f 0645): several system messages AT THE START are one system prompt (the Responses path
+    # already merges its leading instructions this way); only a system message after the first non-system turn is late
+    lead = 0
+    while lead < len(messages) and messages[lead].get("role") == "system" and isinstance(messages[lead].get("content"), str):
+        lead += 1
+    if lead > 1:
+        messages = [dict(messages[0], content="\n\n".join(m["content"] for m in messages[:lead]))] + list(messages[lead:])
+    if LATE_SYSTEM_INLINE:
+        return messages
     return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
+
+
+def order_tool_results(messages: list[dict]) -> list[dict]:
+    """11-15 sweep: DeepSeek's DSML has no call ids - a tool result is matched to its call by position, so each run of
+    tool messages is put in the order of the calls of the assistant turn before it (a client may send results in the
+    order the tools finished).  Reads the private "_call_id" the converters put on calls and results, then drops it.
+    The Responses path does the same (responses._order_tool_results).  Source fixes: spark-ds41f 0178, colibri
+    08420625, ik_llama 6b55d2c7, llama.cpp f534da26e."""
+    i = 0
+    while i < len(messages):
+        if messages[i].get("role") != "tool":
+            i += 1
+            continue
+        j = i
+        while j < len(messages) and messages[j].get("role") == "tool":
+            j += 1
+        prev = messages[i - 1] if i else {}
+        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
+        rank = {cid: k for k, cid in enumerate(order) if cid}
+        if rank:
+            messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
+        i = j
+    for m in messages:
+        m.pop("_call_id", None)
+        for c in m.get("tool_calls") or []:
+            c.pop("_call_id", None)
+    return messages
 
 
 def _object_list(value, name: str) -> list[dict]:
@@ -589,10 +648,90 @@ def drop_server_tools(tools: list[dict], where: str) -> list[dict]:
     return keep
 
 
-def tool_arguments(raw) -> dict:
+def declared_parameters(tools, name):
+    """The parameter names a request declares for the tool `name` (the OpenAI, Anthropic and Responses tool shapes): a
+    set, empty when the tool declares none; None when the request does not declare it (Niko1221/Strata 0c99fcf85)."""
+    for t in tools if isinstance(tools, list) else ():
+        if not isinstance(t, dict):
+            continue
+        fn = t["function"] if isinstance(t.get("function"), dict) else t
+        if isinstance(name, str) and name and fn.get("name") == name:
+            schema = fn.get("parameters") or fn.get("input_schema")
+            props = schema.get("properties") if isinstance(schema, dict) else None
+            return set(props) if isinstance(props, dict) else set()
+    return None
+
+
+_WS = re.compile(r"\s*")
+
+
+def _cut_string(body: str):
+    """A JSON string's text the output ended inside -> the string as far as it goes (a half escape at the end is no
+    text); None when it does not read as one."""
+    m = re.search(r"(\\+)(u[0-9a-fA-F]{0,3})?$", body)
+    if m and len(m.group(1)) % 2:
+        body = body[:m.start() + len(m.group(1)) - 1]
+    try:
+        return json.loads('"' + body + '"', strict=False)
+    except ValueError:
+        return None
+
+
+def cut_arguments(text: str):
+    """0.95 (Niko1221/Strata 0c99fcf85): the members a call's JSON-object arguments got before the output ended inside
+    them (a client replays a call max_tokens cut short), as a dict: every complete `"key": value` pair and a string
+    value the text ends inside, as far as it goes.  A cut key, and a number / array / object the text ends in or
+    inside, are left out.  {} for `{` or `{"pa`; None when the text is not an object cut short (it does not start with
+    `{` and then a key or the end: `{cut`, prose, a list)."""
+    t = text.strip()
+    if not t.startswith("{"):
+        return None
+    i = _WS.match(t, 1).end()
+    if i < len(t) and t[i] != '"':
+        return None
+    out, dec = {}, json.JSONDecoder(strict=False)
+    while True:
+        i = _WS.match(t, i).end()
+        if i < len(t) and t[i] == ",":
+            i += 1
+            continue
+        if i >= len(t) or t[i] != '"':
+            break
+        try:
+            key, i = json.decoder.scanstring(t, i + 1, False)
+        except ValueError:
+            break                                   # a cut key
+        i = _WS.match(t, i).end()
+        if i >= len(t) or t[i] != ":":
+            break
+        i = _WS.match(t, i + 1).end()
+        if i < len(t) and t[i] == '"':
+            try:
+                value, i = json.decoder.scanstring(t, i + 1, False)
+            except ValueError:
+                cut = _cut_string(t[i + 1:])        # the string the output ended inside
+                if cut is not None:
+                    out[key] = cut
+                break
+        else:
+            try:
+                value, i = dec.raw_decode(t, i)
+            except ValueError:
+                break                               # a number, array or object cut short
+            if i >= len(t) and not isinstance(value, (dict, list)):
+                break                               # a number or word the text ends in may be cut
+        out[key] = value
+    return out
+
+
+def tool_arguments(raw, declared=None) -> dict:
     """A call's arguments from a client's history -> the mapping the template renders (both APIs).  A JSON object
-    (as text or already parsed) is used as it is; empty is {}; anything else (cut-off or malformed JSON, a list, a
-    number) is kept as text under "arguments" instead of refusing the whole conversation (#510)."""
+    (as text or already parsed) is used as it is; empty is {}.  Text that starts like an object but is not valid JSON
+    - a call max_tokens cut short - gives the members it still holds (cut_arguments), so the model is not shown a
+    parameter called "arguments" it would then write itself; `declared` = the tool's parameter names
+    (declared_parameters), None when unknown: a tool that really has a parameter "arguments" keeps the old form.
+    Anything else (malformed JSON, a list, a number) is kept as text under "arguments" instead of refusing the whole
+    conversation (#510)."""
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return {}
     if isinstance(raw, dict):
@@ -601,6 +740,10 @@ def tool_arguments(raw) -> dict:
         try:
             value = json.loads(raw)
         except ValueError:
+            if declared is None or "arguments" not in declared:
+                cut = cut_arguments(raw)
+                if cut is not None:
+                    return cut
             return {"arguments": raw}
         return value if isinstance(value, dict) else {"arguments": raw}
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
@@ -612,6 +755,39 @@ def reasoning_given(text) -> bool:
     model never sampled, the replayed prompt no longer tokenizes to the cached prefix, and the whole conversation is
     read again.  A blank body renders exactly like an absent one (antirez/ds4 a8ce74a)."""
     return isinstance(text, str) and bool(text.strip())
+
+
+def _has_something(m: dict) -> bool:
+    """A message that gives the model anything to read: text that is not blank, a part that is not text (a picture,
+    a file), a tool call, reasoning, or a tool result."""
+    if m.get("tool_calls") or m.get("role") == "tool":
+        return True
+    if isinstance(m.get("reasoning_content"), str) and m["reasoning_content"].strip():
+        return True
+    content = m.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") in ("text", "input_text", None):
+                if isinstance(p.get("text"), str) and p["text"].strip():
+                    return True
+            else:
+                return True
+    return False
+
+
+def require_messages(messages: list) -> None:
+    """0.95 (Strata 0.2.6): a chat request with no message, or only messages with nothing in them, is a 400 (OpenAI:
+    "empty array. Expected an array with minimum length 1").  The template would otherwise render just the assistant
+    turn - DeepSeek's encoder renders "<｜begin▁of▁sentence｜>" alone for no message - and the model would answer
+    nothing."""
+    if not messages:
+        raise ValueError("messages must be a non-empty list: send at least one message")
+    if not any(isinstance(m, dict) and _has_something(m) for m in messages):
+        raise ValueError("messages has nothing in it: every message is empty - send at least one message with content")
 
 
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
@@ -630,12 +806,18 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             out["reasoning_content"] = m["reasoning_content"]
         if m.get("tool_calls"):
             calls = []
-            for c in _object_list(m["tool_calls"], "tool_calls"):
+            for j, c in enumerate(_object_list(m["tool_calls"], "tool_calls")):
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
-                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))}})
+                if not isinstance(fn.get("name"), str):      # 0.95 (SGLang #49475): a 400 that says so, not a template crash
+                    raise ValueError(f"messages[{i}].tool_calls[{j}].function.name must be a string: the called tool's name")
+                declared = declared_parameters(req.get("tools"), fn.get("name"))
+                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"), declared)},
+                              "_call_id": c.get("id")})
             out["tool_calls"] = calls
+        if role == "tool" and m.get("tool_call_id"):
+            out["_call_id"] = m["tool_call_id"]          # order_tool_results puts the results in call order
         messages.append(out)
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
@@ -645,13 +827,31 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     given = req.get("reasoning_effort")
     # `false` is a level (thinking off, effort_kwargs): an `or` between the two fields dropped it
     kwargs.update(effort_kwargs(given if given is not None and given != "" else reasoning.get("effort")))
-    # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
+    # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}};
+    # SGLang and the DeepSeek-V4.1 recipes send {"chat_template_kwargs": {"thinking": false}} - the same switch
     for k, v in (req.get("chat_template_kwargs") or {}).items():
-        if k == "enable_thinking" and not v:
+        if k in ("enable_thinking", "thinking") and v is not None and not v:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
-    return _env_to_user(_late_system_to_user(messages)), tools, kwargs
+    # DeepSeek's own API: a top-level {"thinking": {"type": "disabled"}} on Chat Completions too (Anthropic's form)
+    thinking = req.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+        kwargs = {"enable_thinking": False}
+    if req.get("enable_thinking") is False:          # 11-15 sweep: a top-level enable_thinking (sparkflash D46, MiaAI)
+        kwargs = {"enable_thinking": False}
+    if reasoning.get("enabled") is False:            # OpenRouter's switch (0.95, pico-dgx-ds4 9ec2d0f)
+        kwargs = {"enable_thinking": False}
+    # llama.cpp's reasoning_budget, the weakest field: 0 turns thinking off; N > 0 names a level as Anthropic's
+    # budget_tokens does unless an effort was given (Service.reasoning_budget caps the thinking at N); -1 (no cap)
+    # keeps the default level.  chat_template_kwargs.preserve_reasoning is accepted and left to the template: /props
+    # chat_template_caps says whether it keeps earlier turns' thinking.
+    budget = llama_budget(req.get("reasoning_budget"))
+    if budget == 0:
+        kwargs = {"enable_thinking": False}
+    elif budget is not None and budget > 0 and not kwargs:
+        kwargs.update(budget_effort(budget))
+    return _env_to_user(_late_system_to_user(order_tool_results(messages))), tools, kwargs
 
 
 BILLING_HEADER = "x-anthropic-billing-header:"
@@ -759,22 +959,26 @@ def anthropic_request(req: dict, think_unasked: bool = True):
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
+                declared = declared_parameters(req.get("tools"), block.get("name"))
+                calls.append({"function": {"name": block.get("name"),
+                                           "arguments": tool_arguments(block.get("input"), declared)},
+                              "_call_id": block.get("id")})
             elif kind == "tool_result":
                 expanded = _tool_reference_text(block.get("content"), ctx)
                 if expanded is not None:
-                    messages.append({"role": "tool", "content": expanded})
+                    messages.append({"role": "tool", "content": expanded, "_call_id": block.get("tool_use_id")})
                     continue
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.
                 messages.append({"role": "tool", "content": _parts_of(_check_parts(
-                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS))})
+                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS)),
+                    "_call_id": block.get("tool_use_id")})
         if ran:
             flush_server()
             continue
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
-            out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
+            out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else TEXT_PART_SEP.join(text)}
             if reasoning_given("".join(reasoning)):
                 out["reasoning_content"] = "".join(reasoning)
             if calls:
@@ -792,7 +996,9 @@ def anthropic_request(req: dict, think_unasked: bool = True):
         kwargs.update(effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
-    elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
+    elif thinking is None and not any(req.get(k) for k in ("reasoning_budget_tokens", "thinking_token_budget",
+                                                          "thinking_budget", "thinking_budget_tokens")) \
+            and not think_unasked:
         # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
         # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
         # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none
@@ -800,7 +1006,7 @@ def anthropic_request(req: dict, think_unasked: bool = True):
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
-    return _env_to_user(_late_system_to_user(messages)), tools, kwargs, ctx
+    return _env_to_user(_late_system_to_user(order_tool_results(messages))), tools, kwargs, ctx
 
 
 # ------------------------------------------------------------------------------------------------ output parser
@@ -915,7 +1121,9 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
     if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another
         kind, name = "named", next(iter(names))
     if kind == "required" and names:
-        return CALL_START + "\n<function="
+        # 0.95 (Strata 0.2.12, PR #4828): only the wrapper - the model writes "<function=NAME>" itself.  From a written
+        # "<function=" Qwen3.8 went on with names no tool has (0 of 24 forced runs made a call; 24 of 24 with this)
+        return CALL_START + "\n"
     if kind == "named" and name in names:
         return CALL_START + f"\n<function={name}>\n"
     print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
@@ -924,6 +1132,20 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
 
 
 PARAM_START = "<parameter="
+
+
+def opener_name(after: str) -> str | None:
+    """The tool name a call's opening names: `after` is the text after CALL_START, whitespace dropped (here
+    `<function=NAME>`).  None while the name is still arriving; "" when it cannot be read (the call is read as before).
+    The DeepSeek layer (serve_ds41.py) replaces it for DSML's ` name="NAME">`."""
+    if not after.startswith(FUNC_START):
+        return ""
+    gt, nl = after.find(">"), after.find("\n")
+    if gt < 0 and nl < 0:
+        return None
+    if gt >= 0 and (nl < 0 or gt < nl):
+        return after[len(FUNC_START):gt].strip()
+    return ""
 
 
 def function_end(text: str) -> int:
@@ -1010,7 +1232,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             args[pname] = value
         else:
             try:
-                args[pname] = json.loads(value)
+                args[pname] = json.loads(value, strict=False)  # a raw newline in a string: c90aa996b
             except ValueError:
                 args[pname] = value
     return ToolCall(name=name, arguments=args)
@@ -1024,11 +1246,21 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 recover: bool = False):
+                 recover: bool = False, declared_only: bool = False, deferred: bool = True):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
+        # 0.95 (Strata #3075 / #3796 / #4622): `deferred` (the default, the config's "undeclared_tool_calls": "call",
+        # upstream 31c02061): any name is a call.  deferred=False ("text", opt-in): in the answer too, a call counts only
+        # for a tool the request declared - with tools declared a call for another name stays the text the model wrote
+        # (counted in `unread`, its name in `unread_names`; the server returns them as strata_rejected_tool_calls), and
+        # `declared_only` extends the rule to a request that declared none (Chat Completions, Anthropic: the client has
+        # no tool to run).  The Responses route leaves declared_only off: a Codex compaction request keeps its
+        # conversation's tools in the prompt only, and its calls come back as before.
+        self.declared_only, self.deferred = declared_only, deferred
+        self.unread = 0              # well-formed calls of an undeclared name returned as text
+        self.unread_names: list[str] = []   # the names (first few) of those
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -1046,6 +1278,7 @@ class OutputParser:
         self.end_tokens = None
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self.fence, self.line, self.ticks = "", "", 0
+        self._prev_blank = self._indented = False   # #4703: the line before was blank / this is inside an indented (4-space) code block
         # recover (opt-in, the config's "tool_call_recovery"): a declared tool's call written next to the template's
         # form is the call - `<parameter=NAME>` as the opener, JSON inside <tool_call>, a bare <function=NAME> at the
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
@@ -1056,11 +1289,25 @@ class OutputParser:
 
     def _ok_at(self, p: int) -> bool:
         """self.buf[p] would open a call: at the start of a line, outside a code fence and inline code."""
-        snap = (self.fence, self.line, self.ticks)
+        snap = self._snap()
         self._track(self.buf[:p])
         ok = self._opener_ok()
-        self.fence, self.line, self.ticks = snap
+        self._restore(snap)
         return ok
+
+    def _callable(self, name: str) -> bool:
+        """May a call for `name` be a call?  A tool the request declared; with none declared, only where
+        `declared_only` is off; any name with `deferred`."""
+        if self.deferred:
+            return True
+        if not self.schemas:
+            return not self.declared_only
+        if name in self.schemas:
+            return True
+        # a declared `namespace.member` (Responses, Codex's MCP tools) written `namespace__member`, the spelling the
+        # model learned; responses.py maps it back (Strata PR #3556)
+        return any(n[:i] + "__" + n[i + 1:] == name for n in self.schemas if isinstance(n, str)
+                   for i, c in enumerate(n) if c == ".")
 
     def _follower(self, after: str) -> str:
         """recover: what a `<tool_call>` followed (after whitespace) by `after` opens: "call" (`<function=`), "param"
@@ -1141,28 +1388,58 @@ class OutputParser:
                 self._line_parts.clear()
                 self._line_blocks = None
                 s = line.lstrip()
+                was_fenced = bool(self.fence)
                 if self.fence:
-                    if s.startswith(self.fence * 3):
+                    # #4702 (Strata 0.2.9): a fence is closed only by a line of at least as many of the same character as
+                    # opened it (CommonMark), so a ``` example inside a ```` file stays inside it
+                    run = len(s) - len(s.lstrip(self.fence[0]))
+                    if run >= len(self.fence):
                         self.fence = ""
                 elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
-                    self.fence = s[0]
+                    self.fence = s[0] * (len(s) - len(s.lstrip(s[0])))
                 elif not s:
                     self.ticks = 0
                 else:
                     self.ticks += line.count("`")
+                # #4703: an indented (4 spaces or a tab) code block starts after a blank line and goes on until a line
+                # that is not indented
+                if was_fenced or self.fence:
+                    self._prev_blank = self._indented = False
+                elif not s:
+                    self._prev_blank = True
+                elif line.startswith(("    ", "\t")):
+                    self._indented = self._prev_blank or self._indented
+                    self._prev_blank = False
+                else:
+                    self._prev_blank = self._indented = False
             else:
                 if part:
                     self._line_parts.append(part)
         return text
 
     def _opener_ok(self) -> bool:
-        """The reasoning text so far puts a `<tool_call>` at the start of a line, outside a code fence and outside
-        inline code."""
-        return not self.fence and not self.line.strip() and self.ticks % 2 == 0
+        """The reasoning text so far puts a `<tool_call>` at the start of a line, outside a code fence, inline code
+        and an indented code block."""
+        return not self.fence and not self.line.strip() and self.ticks % 2 == 0 and not self._in_indented_block()
+
+    def _in_indented_block(self) -> bool:
+        """#4703: the current line is part of an indented code block: four spaces or a tab, after a blank line or
+        another such line."""
+        return (self._prev_blank or self._indented) and self.line.startswith(("    ", "\t"))
+
+    def _snap(self) -> tuple:
+        return (self.fence, self.line, self.ticks, self._prev_blank, self._indented)
+
+    def _restore(self, snap: tuple) -> None:
+        self.fence, self.line, self.ticks, self._prev_blank, self._indented = snap
+
+    def _reset_track(self) -> None:
+        self.fence, self.line, self.ticks = "", "", 0
+        self._prev_blank = self._indented = False
 
     def _in_code(self) -> bool:
-        """The text so far leaves the next character inside a code fence or inline code."""
-        return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
+        """The text so far leaves the next character inside a code fence, inline code or an indented code block."""
+        return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1 or self._in_indented_block()
 
     def _quoted_think_end(self, i: int) -> bool | None:
         """#537: the `</think>` at self.buf[i] is the model quoting the tag while it thinks, not the end of the
@@ -1279,7 +1556,7 @@ class OutputParser:
                 if value.endswith("\n"):
                     value = value[:-1]
                 try:
-                    v = json.loads(value)
+                    v = json.loads(value, strict=False)
                 except ValueError:
                     v = value
                 args(json.dumps(v, ensure_ascii=False))
@@ -1406,7 +1683,7 @@ class OutputParser:
                 if self.end_tokens:
                     self.end_tokens -= 1
                 self.state, self.lead = "content", True
-                self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
+                self._reset_track()                             # the answer's own text starts here
             elif self.state == "content":
                 if self.lead:                                   # newlines right after </think> or a call
                     stripped = self.buf.lstrip("\n")
@@ -1447,10 +1724,10 @@ class OutputParser:
                     return out
                 # #1058: an opener inside a code fence or inline code is text (a quoted example), never a call.  The
                 # text before it decides, so streamed and whole outputs agree.  Mid-sentence openers still count.
-                snap = (self.fence, self.line, self.ticks)
+                snap = self._snap()
                 self._track(self.buf[:i])
                 in_code = self._in_code()
-                self.fence, self.line, self.ticks = snap
+                self._restore(snap)
                 if in_code:
                     out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
                     self.buf = self.buf[i + len(CALL_START):]
@@ -1484,6 +1761,24 @@ class OutputParser:
                         out.append(Event("content", self._track(self.buf[:j])))
                         self.buf = self.buf[j:]
                     return out
+                if (self.schemas or self.declared_only) and not self.deferred:
+                    # 0.95: a call counts only for a declared tool; the name must be complete to tell
+                    name = opener_name(after)
+                    if name is None:
+                        j = i
+                        while j > 0 and self.buf[j - 1] == "\n":
+                            j -= 1
+                        if j > 0:
+                            out.append(Event("content", self._track(self.buf[:j])))
+                            self.buf = self.buf[j:]
+                        return out
+                    if name and not self._callable(name):
+                        self.unread += 1                 # logged by the server: otherwise "the model ignored my tool" is the only clue
+                        if len(self.unread_names) < 5:
+                            self.unread_names.append(name[:80])
+                        out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
+                        self.buf = self.buf[i + len(CALL_START):]
+                        continue
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]

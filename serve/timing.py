@@ -25,7 +25,7 @@ a background response - is not stamped) and the handler logs it when the request
              turn +0, loaded +0, sent +3, first line +240, first token +812, first sent +1, done +5230 = 6421 ms
              (chars 81234, tokens 20311)
 
-The stamp list follows brainstorm_1107/agent_sessions.md (round 2, S0-S16), server side only.
+The stamp list covers the agent-session stages S0-S16, server side only.
 """
 from __future__ import annotations
 

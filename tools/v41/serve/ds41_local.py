@@ -15,8 +15,8 @@
 * "--arena-gib" "auto": the pinned/locked RAM arena that holds the routed experts the GPU cache cannot.  It is sized
   from the installed RAM: total - DS41_RAM_RESERVE_GIB (default 28 GiB: the engine's own ~12-14 GiB outside the
   arena - dense half, KV, prefill buffers, Engram hot set; measured - plus ~14 GiB for Windows and other programs;
-  a 64 GB PC gets a 31 GiB arena, a 96 GB PC 61, both tested without paging), capped at 140 GiB
-  (15,102 of the 15,360 experts; more buys nothing).  192 GB -> 140 GiB, 128 GB -> ~89 GiB: the other experts are
+  a 64 GB PC gets about a 35 GiB arena, a 96 GB PC about 67), capped at 140 GiB
+  (15,102 of the 15,360 experts; more buys nothing).  192 GB -> 140 GiB, 128 GB -> ~99 GiB: the other experts are
   read from the NVMe drive on demand (O_DIRECT), so less RAM costs speed, not correctness.  DS41_ARENA_GIB=N overrides.
 * "model_name" / "display_name": named after the model file the engine loads (deepseek-v4.1-flash-1017-ds4-q2 /
   -gsq-iq2_xs / -ud-iq1_s ...; "DeepSeek V4.1 Flash · Unsloth UD-IQ1_S"), so /v1/models and the chat page say which
@@ -43,17 +43,36 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(1, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cpu_level  # noqa: E402  (same folder)
+import ckpt  # noqa: E402  (tools/v41/ckpt.py: the checkpoint table, data/ds41/checkpoints.json)
 
 ROOT =os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 ARENA_CAP_GIB = 140
-KEEP_ALL_RAM_GIB = 80                                             # below: the drafter keeps 64 experts per block
-DSPARK_KEEP_SMALL = "tools/v41/serve/dspark_expert_counts_1017.txt:96,64,32"
-DSPARK_KEEP_BIG = "tools/v41/serve/dspark_expert_counts_1017.txt:112,80,48"   # the launcher's value on 22 GB+  # Start DeepSeek.bat's value for cards under 22 GB
+KEEP_ALL_RAM_GIB = 80                                             # below: the drafter keeps fewer experts (96,64,32)
+# the checkpoint's row in data/ds41/checkpoints.json (DS41_CHECKPOINT picks another than the default): its file names
+try:
+    CK = ckpt.row()
+except ckpt.TableError as _e:
+    sys.exit(f"ds41_local: {_e}")
+_DE = CK.get("derived") or {}
+Q2_FILE = ((CK.get("models") or {}).get("ds4_q2") or {}).get("file") or ""
+SLIM_FILE = ((CK.get("models") or {}).get("ds4_q2") or {}).get("slim") or ""
+
+
+def keep_values(de):
+    """(small, big) STRATA_DSPARK_KEEP values for a checkpoint row's "derived" block: <keep file>:96,64,32 (below
+    KEEP_ALL_RAM_GIB) and <keep file>:112,80,48 (Start DeepSeek.bat's value on cards of 22 GB+); (None, None) when the
+    row has no keep file (keep null: the drafter keeps all its experts)."""
+    k = (de or {}).get("keep")
+    return (f"{k}:96,64,32", f"{k}:112,80,48") if k else (None, None)
+
+
+DSPARK_KEEP_SMALL, DSPARK_KEEP_BIG = keep_values(_DE)
 # engine settings for this model, carried in the config's "env" (the server starts the engine with them - this script's
 # own environment does not reach it)
 ENGINE_ENV = {}
-BIG_ARENA_CAP_GIB, BIG_RAM_RESERVE_GIB = 158, 20.0   # files with bigger experts (below: round 294)
+BIG_ARENA_CAP_GIB, BIG_RAM_RESERVE_GIB = 158, 20.0   # files with bigger experts (below: measured)
 
 
 def page_settings():
@@ -81,6 +100,39 @@ def page_access(cfg, s):
         cfg["auto_pause_mib"] = s["auto_pause_mib"]
 
 
+# Below LOW_RAM_GIB the 1-bit Unsloth files run at route bias 0.10 instead of the config's 0.28: fewer of their experts
+# fit the RAM, and 0.28 then costs agreement (measured, real 64 / 96 GB, release engine: UD-IQ1_S 88.8 / 89.6% top-1 at
+# 0.10 vs 86.6 / 87.9% at 0.28; UD-IQ1_M 89.9 / 90.0% vs 87.7 / 89.6%), while 0.10 still writes faster than UD-IQ2_XXS at
+# 0.28 (UD-IQ1_S 39.9 / 44.9 vs 35.3 / 40.9 tok/s at the default sampling).  UD-IQ2_XXS and the others keep 0.28.
+LOW_RAM_GIB = 110
+LOW_RAM_BIAS = "0.10"
+
+
+def low_ram_bias(gguf, ram_gib):
+    """LOW_RAM_BIAS for an Unsloth UD-IQ1_S / UD-IQ1_M file on a PC under LOW_RAM_GIB, else "" (the config's bias)"""
+    name = os.path.basename(str(gguf or "")).upper()
+    # rounded like pick_model.ram_gb(), so the Setup card's default and the launcher agree right at the line
+    if ram_gib is not None and round(ram_gib) < LOW_RAM_GIB and re.search(r"UD-IQ1_[SM]\b", name):
+        return LOW_RAM_BIAS
+    return ""
+
+
+def route_bias_choice(settings, gguf, ram_gib):
+    """(bias, why) from the Setup card's switch: Quality = 0.10, Most exact = 0, Fast = "" (the config's 0.28).  A switch
+    the user never set (no "mode_chosen"; before 0.95 the page saved "fast" on every Apply) takes this PC's default:
+    LOW_RAM_BIAS for a 1-bit file under LOW_RAM_GIB, else the config's.  bias "" = the config's."""
+    mode = (settings or {}).get("mode")
+    if mode == "balanced":
+        return "0.10", "Setup card: quality (route bias 0.10)"
+    if mode == "exact":
+        return "0", "Setup card: most exact"
+    if mode == "fast" and (settings or {}).get("mode_chosen"):
+        return "", ""
+    rb = low_ram_bias(gguf, ram_gib)
+    return rb, (f"{ram_gib:.0f} GiB of RAM, a 1-bit model: route bias {rb} (the Setup card's Fast or DS41_ROUTE_BIAS "
+                "override it)" if rb else "")
+
+
 def total_ram_gib():
     if os.name == "nt":
         class MS(ctypes.Structure):
@@ -94,12 +146,145 @@ def total_ram_gib():
     return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
 
 
-def drafter_keep(ram_gib, env):
-    """STRATA_DSPARK_KEEP for the engine, or None (as the launcher left it): the 64 most-used experts per block below
-    KEEP_ALL_RAM_GIB when the launcher asked for all 128 (the variable unset or empty) and the drafter runs."""
-    if ram_gib < KEEP_ALL_RAM_GIB and env.get("STRATA_SERVE_DSPARK") and env.get("STRATA_DSPARK_KEEP", "").strip() in ("", DSPARK_KEEP_BIG):
-        return DSPARK_KEEP_SMALL
+def drafter_keep(ram_gib, env, de=None):
+    """STRATA_DSPARK_KEEP for the engine, or None (as the launcher left it): the smaller counts (DSPARK_KEEP_SMALL,
+    96,64,32) below KEEP_ALL_RAM_GIB when the launcher left the variable unset or empty, or at its 22 GB+ value, and the
+    drafter runs.  None too when the checkpoint row (`de`, default this checkpoint's "derived") has no keep file."""
+    small, big = keep_values(de) if de is not None else (DSPARK_KEEP_SMALL, DSPARK_KEEP_BIG)
+    if not small:
+        return None
+    if ram_gib < KEEP_ALL_RAM_GIB and env.get("STRATA_SERVE_DSPARK") and env.get("STRATA_DSPARK_KEEP", "").strip() in ("", big):
+        return small
     return None
+
+
+PROMPT_VARS = ("STRATA_WIDE_PROMPT", "STRATA_WIDE_PROMPT_MIN", "STRATA_BM_PREFILL_READAHEAD", "STRATA_ENGRAM_READAHEAD")
+# (new, old): switches renamed after the 0.95 release candidates.  The old name still counts when the new one is unset
+# (here: with_new_names; the engine: ds41_env.hpp), so saved settings keep their effect.
+RENAMED = (("STRATA_WIDE_PROMPT", "STRATA_D11_WIDE_PROMPT"), ("STRATA_WIDE_PROMPT_MIN", "STRATA_D11_WIDE_MIN"),
+           ("STRATA_PROMPT_SWEEP_PB", "STRATA_P3_SWEEP_PB"), ("STRATA_PROMPT_SWEEP_FIT", "STRATA_P3_SWEEP_FIT"))
+
+
+def with_new_names(env):
+    """`env` (a new dict) with each old name's value also under its new name where the new name is unset."""
+    out = dict(env)
+    for new, old in RENAMED:
+        if new not in out and old in out:
+            out[new] = out[old]
+    return out
+
+
+def prompt_profile(arena, experts, env):
+    """(engine env, launcher line) for the two prompt-speed settings, chosen by whether the routed experts fit in the RAM
+    arena (no file tier) or not (some are read from the SSD).  Measured at 192 GB (UD-IQ2_XXS, no file tier) and 64 GB
+    (UD-IQ1_S, file tier), prompt tok/s vs 0.95-rc with both on:
+      file tier:    4K +3%, 8K +6.5%, 32K +40%  -> wide prompt from 6144 rows + prefill read-ahead
+      no file tier: 4K -3%, 8K -3.5%, 32K +18%; read-ahead alone 4K -3%, 32K +5%; wide alone 32K +20%
+                    -> wide prompt from 16384 rows only, no read-ahead
+    `arena` / `experts` in GiB (None: unknown - the file-tier profile, the launcher's earlier default).  A variable the
+    user set (in `env`, under its new or old name) is kept: not in the returned env."""
+    env = with_new_names(env)
+    if arena is None or experts is None:
+        tier, why = True, "the experts' size or the arena is unknown"
+    elif arena < experts:
+        tier, why = True, f"routed experts {experts:.1f} GiB > arena {arena:g} GiB: a file tier"
+    else:
+        tier, why = False, f"routed experts {experts:.1f} GiB fit the arena {arena:g} GiB: no file tier"
+    # 0.95: + STRATA_ENGRAM_READAHEAD=1 on the file-tier profile (measured at a real 128 / 96 GB: prompts +1-2.5%, exact)
+    want = {"STRATA_WIDE_PROMPT": "1", "STRATA_WIDE_PROMPT_MIN": "6144", "STRATA_BM_PREFILL_READAHEAD": "1",
+            "STRATA_ENGRAM_READAHEAD": "1"} if tier \
+        else {"STRATA_WIDE_PROMPT": "1", "STRATA_WIDE_PROMPT_MIN": "16384"}
+    out = {k: v for k, v in want.items() if k not in env}
+    own = [f"{k}={env[k]}" for k in PROMPT_VARS if k in env]
+    name = "wide prompt from 6144 tokens + prefill read-ahead" if tier else "wide prompt from 16384 tokens, no read-ahead"
+    line = f"ds41_local: prompt profile: {name} ({why})" + (f"; yours kept: {', '.join(own)}" if own else "")
+    return out, line
+
+
+def file_tier(arena, experts):
+    """prompt_profile's choice: True = the file-tier profile (some experts read from the SSD, or the sizes unknown)."""
+    return arena is None or experts is None or arena < experts
+
+
+# STRATA_PROMPT_SWEEP_PB's default: the --prompt-batch the file-tier profile asks for when its batches are wide.  A
+# 29.8K-token prompt at 16384 is two full sweeps of the file tier; at 32768 it is one where the VRAM allows - the engine
+# takes only the width that fits (STRATA_PROMPT_SWEEP_FIT's counted budget, then a probe).  0 = the config's (16384):
+# widths of 24-32K have not been checked for identical output against 16384 yet (only 16384 vs 8192 has, measured),
+# so a wider value is experimental and may change the text written.
+PROMPT_SWEEP_PB = 0
+
+
+def sweep_fit_env(cur, pb, env):
+    """The engine env a raised prompt batch brings: STRATA_PROMPT_SWEEP_FIT=1 (the counted wide budget, which keeps the
+    prestage room) when `pb` is above the config's `cur`, unless the user set STRATA_PROMPT_SWEEP_FIT (or its old
+    name); else {}."""
+    env = with_new_names(env)
+    if pb is None or cur is None or pb <= cur or "STRATA_PROMPT_SWEEP_FIT" in env:
+        return {}
+    out = {"STRATA_PROMPT_SWEEP_FIT": "1"}
+    if "STRATA_PROMPT_SWEEP_SLACK_GIB" not in env:
+        out["STRATA_PROMPT_SWEEP_SLACK_GIB"] = "0.3"   # the measured setting
+    return out
+
+
+def env_int(env, name):
+    """A whole-number setting (>= 0) from `env`, None when unset or empty; a clear message (not a traceback) otherwise."""
+    v = str(env.get(name, "")).strip()
+    if not v:
+        return None
+    try:
+        f = float(v)
+    except ValueError:
+        f = float("nan")
+    if not (0 <= f < float("inf")) or f != int(f):
+        sys.exit(f"ds41_local: {name}={v!r} is not a whole number of tokens (>= 0)")
+    return int(f)
+
+
+def prompt_batch(args, tier, wide, capped, env):
+    """The --prompt-batch for this PC: (value or None to leave the config's, launcher line or None).
+
+    * DS41_PROMPT_BATCH=N (or STRATA_PROMPT_BATCH, ds41-engine.sh's name for it, which Windows did not read before
+      11-13): N, raised or lowered, over the config and every rule below - the sweep knob (16384 / 24576 / 32768).
+      The engine still takes only what fits the free VRAM.  0 = the chunk path (no layer-major batch).
+    * Else, on the file-tier profile with wide batches (`tier`, `wide`), and not for files whose bigger experts made
+      expand() cap the batch (`capped`): STRATA_PROMPT_SWEEP_PB (default PROMPT_SWEEP_PB, 0 = off; wider is experimental)
+      raises the config's value, never lowers it.
+    A raised width also turns on the engine's counted budget (sweep_fit_env).
+    `args` is the expanded engine args (read only); `env` the environment."""
+    env = with_new_names(env)
+    i = args.index("--prompt-batch") + 1 if "--prompt-batch" in args[:-1] else None
+    cur = int(float(args[i])) if i is not None else None
+    for name in ("DS41_PROMPT_BATCH", "STRATA_PROMPT_BATCH"):
+        n = env_int(env, name)
+        if n is not None:
+            return n, f"ds41_local: prompt batch {n} ({name}; the config's {cur if cur is not None else 'none'})"
+    if not (tier and wide) or capped or cur is None:
+        return None, None
+    n = env_int(env, "STRATA_PROMPT_SWEEP_PB")
+    # 0.95: 32768 by default at <= 64 GB of RAM (measured at a real 64 GB: 32K prompts +13.4%, 40K +12.0%, writing flat;
+    # 128 GB only +2-4% and 96 GB ~0, so the larger PCs keep the config's width)
+    n = (32768 if total_ram_gib() <= 72 else PROMPT_SWEEP_PB) if n is None else n
+    if n <= cur:
+        return None, None
+    return n, (f"ds41_local: prompt batch {n} (file tier with wide batches: a long prompt in fewer sweeps where the VRAM "
+               f"allows; STRATA_PROMPT_SWEEP_PB=0 keeps the config's {cur})")
+
+
+def big_expert_margins(gguf_name, env):
+    """0.95: the VRAM margins for a file whose experts are bigger than the default's (MXFP4 / IQ3_S / Q3_K / 4-bit rows):
+    (DS41_VRAM_MARGIN to set or None, the engine's --prompt-margin or None).  Their prompt path needs headroom the
+    default's does not (UD-IQ3_XXS: a 4096-token batch at 2 GiB ran out of VRAM; 2048 at 3 GiB ran clean, measured) -
+    but only while a prompt batch runs.  Kept free the whole time it cost ~170 expert slots in every decode (12.25 GiB
+    instead of ~14.7).  So by default the headroom goes to the prompt path alone (--prompt-margin: its keep-cache borrow
+    takes it from the cache and the regrow gives it back) and the slots keep the config's margin.  STRATA_BIG_BORROW=0
+    restores the earlier rule (the margin for both); a DS41_VRAM_MARGIN of the user's wins as before (nothing set here)."""
+    vm = "3" if "UD-IQ3_XXS" in os.path.basename(gguf_name) else "2"
+    if "DS41_VRAM_MARGIN" in env:
+        return None, None
+    if (env.get("STRATA_BIG_BORROW") or "").strip() == "0":
+        return vm, None
+    return None, vm
 
 
 def env_gib(name, default):
@@ -136,9 +321,12 @@ def expand(cfg):
     os.environ.setdefault("XO_ROOT", ROOT.replace("\\", "/"))
     os.environ.setdefault("DS41_MODELS", os.path.join(ROOT, "models").replace("\\", "/"))
     m = os.environ["DS41_MODELS"].replace("\\", "/").rstrip("/")
-    full = m + "/DeepSeek-V4.1-Flash-1017-Q2.gguf"
-    old = not os.path.exists(full) and os.path.exists(m + "/ds4-q2-slim.gguf") and \
-        os.path.exists(m + "/engram/model-00048-of-00048.safetensors")
+    # the checkpoint's ds4 Q2 GGUF ("" when the checkpoint has none: a model must then be picked)
+    full = m + "/" + Q2_FILE if Q2_FILE else ""
+    old = not os.path.exists(full) and bool(SLIM_FILE) and os.path.exists(m + "/" + SLIM_FILE) and \
+        os.path.exists(m + "/" + _DE.get("engram_dir", "engram") + "/model-00048-of-00048.safetensors")
+    # the config's ${DS41_RANK}: the checkpoint's own rank file ("" when it has none)
+    os.environ.setdefault("DS41_RANK", (os.environ["XO_ROOT"] + "/" + _DE["rank"]) if _DE.get("rank") else "")
     # model-choice.txt (Choose Model.bat, pick_model.py): another model to load - a file in the model folder or a full
     # path.  DS41_GGUF in the environment wins over it.
     if "DS41_GGUF" not in os.environ:
@@ -158,7 +346,9 @@ def expand(cfg):
                 os.environ["DS41_GGUF"] = p
             else:
                 print(f"ds41_local: model-choice.txt names {pick}, which is not in {m} - loading the default")
-    os.environ.setdefault("DS41_GGUF", m + "/ds4-q2-slim.gguf" if old else full)
+    if "DS41_GGUF" not in os.environ and not old and not full:
+        sys.exit(f"ds41_local: checkpoint {CK['id']} has no default model file - pick one with Choose Model.bat")
+    os.environ.setdefault("DS41_GGUF", m + "/" + SLIM_FILE if old else full)
     if "DS41_ENGRAM" not in os.environ:
         # Engram: a split GGUF (Unsloth's, llama.cpp mainline's) carries its own tables - read them (IQ4_NL up to
         # UD-IQ3_S: measured as good as DeepSeek's exact FP8 tables, 89.3 vs 89.0% top-1 on UD-IQ1_S, and no second file
@@ -180,8 +370,14 @@ def expand(cfg):
             except Exception as e:   # unreadable header: let the engine decide
                 print(f"ds41_local: could not read {os.path.basename(g)}'s header ({e}); trying its own Engram tables")
                 t = 20
+            if t == 43:   # id 43 is also mainline ggml's F8_E4M3 (one byte a value): the engine reads only MXFP8 under it
+                try:
+                    if gguf_head.type43_layout(g, "per_layer_token_embd.weight") == "f8_e4m3":
+                        t = "F8_E4M3 (type 43, one byte a value)"
+                except Exception:   # unreadable: as before, the engine decides
+                    pass
             if t is not None and t not in (13, 20, 43):
-                alt = m + "/engram" if old else full
+                alt = m + "/" + _DE.get("engram_dir", "engram") if old else full
                 if os.path.exists(alt):
                     print(f"ds41_local: {os.path.basename(g)} stores its Engram tables as "
                           f"{gguf_head.GGML_TYPE_NAMES.get(t, t)} - using the default model's exact FP8 tables ({alt})")
@@ -190,7 +386,7 @@ def expand(cfg):
                     sys.exit(f"ds41_local: {os.path.basename(g)} stores its Engram tables as "
                              f"{gguf_head.GGML_TYPE_NAMES.get(t, t)}, which this build cannot read, and the default model "
                              f"(its Engram tables) is not in {m}.  Install the default with Start DeepSeek.bat first.")
-        os.environ["DS41_ENGRAM"] = g if own else m + "/engram" if old else full
+        os.environ["DS41_ENGRAM"] = g if own else m + "/" + _DE.get("engram_dir", "engram") if old else full
         if own and t != 43:   # the Engram hot set holds FP8 rows: a file with other tables would only log "SKIPPED"
             ENGINE_ENV["STRATA_ENGRAM_HOT"] = "0"   # "0" = no hot set (ds41_engram.cpp)
     # ${DS41_BUILD}: the first build this CPU can run - this PC's own (build-ds41.bat), the portable one (AVX2), the one
@@ -211,20 +407,29 @@ def expand(cfg):
         return v
 
     out = walk(cfg)
+    # the checkpoint's tokenizer export, when it has its own folder (the default's is the config's tokenizer/)
+    tok = _DE.get("tokenizer_dir") or "tokenizer"
+    if tok != "tokenizer" and out.get("tokenizer") == m + "/tokenizer":
+        out["tokenizer"] = m + "/" + tok
     if out.get("log"):   # the server opens it for appending; a fresh clone has no logs/ folder
         os.makedirs(os.path.dirname(os.path.abspath(out["log"])), exist_ok=True)
     a = out.get("args", [])
+    if "--rank" in a[:-1] and not a[a.index("--rank") + 1].strip():   # a checkpoint without a rank file yet
+        i = a.index("--rank")
+        del a[i:i + 2]
+        print(f"ds41_local: checkpoint {CK['id']} has no rank file yet (data/ds41/checkpoints.json): the engine starts "
+              "without --rank")
     for i, x in enumerate(a[:-1]):
         if x == "--arena-gib" and a[i + 1] == "auto":
             a[i + 1] = f"{arena_gib():g}"
     # the route bias: the config's 0.28 on every PC; DS41_ROUTE_BIAS overrides it (0 = exact routing, 0.10 = the
     # high-agreement setting: 91.8 / 92.8% next-token agreement with DeepSeek's API vs 90.2 / 92.4% at 0.28, for about
-    # 18% of writing speed at 192 GB and 12-26% on 96 / 64 GB PCs - rounds 249, 250d, 250e, 250g, 2026-10-30 / 31)
+    # 18% of writing speed at 192 GB and 12-26% on 96 / 64 GB PCs - measured 2026-10-30 / 31)
     rb = os.environ.get("DS41_ROUTE_BIAS", "").strip()
-    if not rb:      # the chat page's Setup card: Fast (the config's), Balanced, Most exact
-        rb = {"balanced": "0.10", "exact": "0"}.get(page_settings().get("mode"), "")
-        if rb == "0":
-            print("ds41_local: Setup card: most exact")
+    if not rb:      # the chat page's Setup card (Fast / Quality / Most exact), else this PC's default
+        rb, why = route_bias_choice(page_settings(), os.environ.get("DS41_GGUF", ""), total_ram_gib())
+        if why:
+            print(f"ds41_local: {why}")
     for i, x in enumerate(a[:-1]):
         if x == "--route-bias":
             if rb:
@@ -242,23 +447,32 @@ def expand(cfg):
         a += ["--exl3", x3]
     # Bigger experts than the default's (MXFP4 / IQ3_S / Q3_K / 4-bit rows: Unsloth UD-Q2_K_XL and up): the batch
     # prompt path sizes its buffers and the kept cache for the default's ~10 MB experts and ran out of VRAM on
-    # UD-Q2_K_XL (round 287b: a 7K-token batch, then the cache regrow / c_bounce out of memory) - cap the prompt batch
+    # UD-Q2_K_XL (measured: a 7K-token batch, then the cache regrow / c_bounce out of memory) - cap the prompt batch
     # at 4096 tokens and keep 2 GiB of VRAM free unless the user set DS41_VRAM_MARGIN
+    big_experts = False   # (prompt_batch: the file-tier sweep width does not raise such a file's cap)
     try:
         import gguf_head
         big = {39, 21, 11, 12, 20, 23}   # MXFP4, IQ3_S, Q3_K, Q4_K, IQ4_NL, IQ4_XS
         ex = {v for k, v in gguf_head.tensor_types(os.environ["DS41_GGUF"]).items() if "_exps" in k or "experts" in k}
         if ex & big:
+            big_experts = True
             names = sorted(gguf_head.GGML_TYPE_NAMES.get(t, str(t)) for t in ex & big)
             # UD-IQ3_XXS (the largest menu file): prompt batch 2048 and 3 GiB free - its first card at 4096 / 2 ran out
-            # of VRAM in the prompt path (round 295); 2048 / 3 ran clean at 27.8 tok/s (round 311c)
-            pb_cap, vm = (2048, "3") if "UD-IQ3_XXS" in os.path.basename(os.environ["DS41_GGUF"]) else (4096, "2")
+            # of VRAM in the prompt path (measured); 2048 / 3 ran clean at 27.8 tok/s (measured)
+            pb_cap = 2048 if "UD-IQ3_XXS" in os.path.basename(os.environ["DS41_GGUF"]) else 4096
             if "--prompt-batch" in a[:-1] and int(float(a[a.index("--prompt-batch") + 1])) > pb_cap:
                 a[a.index("--prompt-batch") + 1] = str(pb_cap)
-            if "DS41_VRAM_MARGIN" not in os.environ:
+            # 0.95: the headroom goes to the prompt path only (big_expert_margins; STRATA_BIG_BORROW=0 = the earlier rule)
+            vm, pm = big_expert_margins(os.environ["DS41_GGUF"], os.environ)
+            if vm is not None:
                 os.environ["DS41_VRAM_MARGIN"] = vm
+            if pm is not None:
+                if "--prompt-margin" in a[:-1]:
+                    a[a.index("--prompt-margin") + 1] = pm
+                else:
+                    a += ["--prompt-margin", pm]
             # their experts outgrow the 140 GiB arena (UD-Q2_K_XL: ~177 GiB): on 192 GB of RAM the arena goes to
-            # 158 GiB with 20 GiB kept back instead of 28 (round 294: half the file tier, +2% +- 1.9%; ran clean on an
+            # 158 GiB with 20 GiB kept back instead of 28 (measured: half the file tier, +2% +- 1.9%; ran clean on an
             # idle PC - other programs get ~8 GB).  Only where it is larger than the usual arena; DS41_ARENA_GIB /
             # DS41_RAM_RESERVE_GIB still win.  192 GB-class PCs only: below that the usual 28 GiB reserve stays.
             if total_ram_gib() >= 170 and "DS41_ARENA_GIB" not in os.environ and "DS41_RAM_RESERVE_GIB" not in os.environ and "--arena-gib" in a[:-1]:
@@ -269,12 +483,14 @@ def expand(cfg):
                     names.append(f"arena {bigger:g} GiB")
             print(f"ds41_local: {os.path.basename(os.environ['DS41_GGUF'])} has "
                   f"{', '.join(n for n in names if not n.startswith('arena'))} experts (bigger than the "
-                  f"default's): prompt batch {pb_cap}, {os.environ['DS41_VRAM_MARGIN']} GiB of VRAM kept free" +
+                  f"default's): prompt batch {pb_cap}, " +
+                  (f"{pm} GiB of VRAM kept free for prompt batches (borrowed from the expert cache)" if pm is not None
+                   else f"{os.environ.get('DS41_VRAM_MARGIN')} GiB of VRAM kept free") +
                   "".join(f", {n}" for n in names if n.startswith("arena")))
         else:
             # experts a little over the usual arena (Unsloth UD-IQ2_XXS: 146 GiB vs 140): on 192 GB the arena covers
-            # them all, up to 150 GiB with 20 GiB kept back (rounds 302b / 307: +2.5%, the file tier gone)
-            # only split files (Unsloth's): ds4 Q2's 142.4 GiB at 147 measured -2.6% vs 140 (round 308: 39.68 vs 40.72) -
+            # them all, up to 150 GiB with 20 GiB kept back (measured: +2.5%, the file tier gone)
+            # only split files (Unsloth's): ds4 Q2's 142.4 GiB at 147 measured -2.6% vs 140 (measured: 39.68 vs 40.72) -
             # its residency changes the text it writes, which drafts worse
             eg = gguf_head.expert_gib(os.environ["DS41_GGUF"]) if "-00001-of-" in os.path.basename(os.environ["DS41_GGUF"]) else None
             if eg and total_ram_gib() >= 170 and "DS41_ARENA_GIB" not in os.environ and "DS41_RAM_RESERVE_GIB" not in os.environ                     and "--arena-gib" in a[:-1] and eg > float(a[a.index("--arena-gib") + 1]):
@@ -284,7 +500,7 @@ def expand(cfg):
                     a[i + 1] = f"{cover:g}"
                     print(f"ds41_local: {os.path.basename(os.environ['DS41_GGUF'])}'s experts are {eg:.1f} GiB: "
                           f"arena {cover:g} GiB")
-        # Unsloth UD-IQ2_XXS: the dense half re-quantized to q5_K instead of q6_K - round 304: +1.2% at greedy, the same
+        # Unsloth UD-IQ2_XXS: the dense half re-quantized to q5_K instead of q6_K - measured: +1.2% at greedy, the same
         # agreement with DeepSeek's API (91.07 / 94.50 vs 90.80 / 94.38%).  Only when the config's q6_K is in force.
         if "UD-IQ2_XXS" in os.path.basename(os.environ["DS41_GGUF"]) and os.environ.get("STRATA_DENSE_REQUANT", "q6_K") == "q6_K":
             ENGINE_ENV["STRATA_DENSE_REQUANT"] = "q5_K"
@@ -294,13 +510,43 @@ def expand(cfg):
     # also serves the file tier and prompts read ~3.5% slower at k=3 (B2's lowk, 11-03) - off below 192 GB-class RAM
     if total_ram_gib() < 170 and os.environ.get("STRATA_CHUNK_CPU", "") not in ("", "0"):
         ENGINE_ENV["STRATA_CHUNK_CPU"] = "0"
-    # Start DeepSeek.bat keeps all 128 drafter experts per block on a card of 22 GB or more (STRATA_DSPARK_KEEP unset;
-    # round 358, at 192 GB: ~+3% writing).  The 1.8 GB more of VRAM comes out of the expert cache, and on a 64 GB PC the
-    # cache's misses come from the SSD: the placement simulator prices 194 fewer slots at -5.7% there and -0.8% at 96 GB
-    # (trace-r244-64 / r231-96, review_lowram.md).  Below KEEP_ALL_RAM_GIB: 0.93's 64 most-used, until a 64 GB run decides.
+    # Start DeepSeek.bat sets the larger drafter counts (<keep>:112,80,48) on a card of 22 GB or more (measured, at
+    # 192 GB: ~+3% writing).  The VRAM they take comes out of the expert cache, and on a 64 GB PC the cache's misses
+    # come from the SSD: the placement simulator prices 194 fewer slots at -5.7% there and -0.8% at 96 GB.  Below
+    # KEEP_ALL_RAM_GIB: the smaller counts (<keep>:96,64,32), until a 64 GB run decides.  A row without a keep file:
+    # nothing set (the drafter keeps all its experts).
     keep = drafter_keep(total_ram_gib(), os.environ)
     if keep:
         ENGINE_ENV["STRATA_DSPARK_KEEP"] = keep
+    # the prompt-speed profile: by whether the routed experts fit the arena (prompt_profile).  EXL3 experts are not
+    # in the GGUF: their size is unknown here (the file-tier profile)
+    try:
+        arena = float(a[a.index("--arena-gib") + 1]) if "--arena-gib" in a[:-1] else None
+    except ValueError:
+        arena = None
+    experts = None
+    if not x3:
+        try:
+            import gguf_head
+            experts = gguf_head.expert_gib(os.environ["DS41_GGUF"])
+        except Exception:
+            experts = None
+    pe, line = prompt_profile(arena, experts, os.environ)
+    ENGINE_ENV.update(pe)
+    print(line)
+    # the prompt batch width: DS41_PROMPT_BATCH, else the file-tier profile's wider batch (prompt_batch)
+    w = with_new_names(os.environ).get("STRATA_WIDE_PROMPT", pe.get("STRATA_WIDE_PROMPT",
+                                       with_new_names(out.get("env") or {}).get("STRATA_WIDE_PROMPT", "")))
+    pb, pb_line = prompt_batch(a, file_tier(arena, experts), str(w).strip() not in ("", "0"), big_experts, os.environ)
+    pb_cur = int(float(a[a.index("--prompt-batch") + 1])) if "--prompt-batch" in a[:-1] else None
+    ENGINE_ENV.update(sweep_fit_env(pb_cur, pb, {**(out.get("env") or {}), **os.environ}))
+    if pb is not None:
+        if "--prompt-batch" in a[:-1]:
+            a[a.index("--prompt-batch") + 1] = str(pb)
+        else:
+            a += ["--prompt-batch", str(pb)]
+    if pb_line:
+        print(pb_line)
     if ENGINE_ENV:
         out["env"] = {**(out.get("env") or {}), **ENGINE_ENV}
     # DS41_GPU (ds41-paths.bat: the card with the most VRAM unless set): the server starts the engine on the config's
@@ -375,9 +621,9 @@ def helper_plan(out, a):
             "gpu_name": h["name"], "gib": h["mib"] / 1024 - 2.5, "name": "ds41_remote"}
 
 
-VISION_FILE = "DeepSeek-V4.1-Flash-1017-Vision.gguf"   # nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF
+VISION_FILE = _DE.get("vision") or ""   # 1017: DeepSeek-V4.1-Flash-1017-Vision.gguf (nazeshinjite/...-1017-ds4-GGUF)
 # on by default since 0.94 (the user, 11-07; off in 0.92 / 0.93), never on the engine's card unless asked: the CPU takes
-# no VRAM (decode unchanged, round 190); a second card reads a picture ~25x faster (RTX 3060, bf16: 0.41 vs 11.5 s on
+# no VRAM (decode unchanged, measured); a second card reads a picture ~25x faster (RTX 3060, bf16: 0.41 vs 11.5 s on
 # 6 CPU threads for a 1024x701 picture, 11-07)
 VISION_DEFAULT = "on"
 VISION_OFF = ("off", "0", "no", "none", "false", "disable", "disabled")
@@ -468,6 +714,8 @@ def vision_section(m, engine_gpu=None):
         return None
     side, ref = m + "/" + VISION_FILE, ROOT.replace("\\", "/") + "/tools/v41/vision/deepseek"
     missing = [os.path.basename(p) for p in (side, ref + "/vision.py") if not os.path.exists(p)]
+    if not VISION_FILE:   # a checkpoint without a vision file (data/ds41/checkpoints.json) yet
+        missing.insert(0, f"a vision file for checkpoint {CK['id']}")
     build = torch_build()
     if build is None:
         missing.append("PyTorch")
@@ -601,13 +849,14 @@ def voice_section(m, engine_gpu=None, helper_on=False):
 
 
 DEFAULT_NAME = "deepseek-v4.1-flash-1017-ds4-q2"   # the shipped config's model_name
+ID_PREFIX = CK.get("model_id_prefix") or "deepseek-v4.1-flash"   # 1017: deepseek-v4.1-flash-1017
 
 
 def model_names(path):
     """(model id, display name) for the model file the engine loads"""
     b = os.path.basename(path)
     low = b.lower()
-    if low in ("deepseek-v4.1-flash-1017-q2.gguf", "ds4-q2-slim.gguf"):
+    if low and low in (Q2_FILE.lower(), SLIM_FILE.lower()):
         tag, label = "ds4-q2", "ds4 Q2"
     elif low.startswith("ds41-gsq-") and low.endswith(".gguf"):          # a GSQ build: ds41-gsq-iq2_xs.gguf
         tag = "gsq-" + low[len("ds41-gsq-"):-len(".gguf")]
@@ -618,7 +867,141 @@ def model_names(path):
     else:                                                                 # any other GGUF: its own name
         stem = re.sub(r"-\d{5}-of-\d{5}$", "", b[:-5] if low.endswith(".gguf") else b)
         tag, label = re.sub(r"[^a-z0-9._-]+", "-", stem.lower()).strip("-"), stem
-    return f"deepseek-v4.1-flash-1017-{tag}", f"DeepSeek V4.1 Flash · {label}"
+    return f"{ID_PREFIX}-{tag}", f"DeepSeek V4.1 Flash · {label}"
+
+
+def derived_in_use(cfg):
+    """{role: path} of the checkpoint-derived files this config gives the engine and the server (R-2): the rank file,
+    the drafter and its expert counts (KEEP), the Engram hot set, Engram tables in their own folder, the vision file,
+    EXL3 experts, the tokenizer export.  The engine's environment is this process's (the launcher's) plus the config's
+    "env" (ENGINE_ENV above wins)."""
+    a = cfg.get("args", [])
+    env = {**os.environ, **(cfg.get("env") or {})}
+    root = cfg.get("cwd") or ROOT
+
+    def at(p):
+        return p if os.path.isabs(p) else os.path.join(root, p)
+    files = {}
+    if "--rank" in a[:-1]:
+        files["rank"] = at(a[a.index("--rank") + 1])
+    if env.get("STRATA_SERVE_DSPARK", "").strip():
+        files["drafter"] = env["STRATA_SERVE_DSPARK"]
+        keep = env.get("STRATA_DSPARK_KEEP", "").strip()
+        if keep:   # <counts file>:<K>[,<K1>,<K2>] - a Windows path has a ':' of its own
+            p, _, ks = keep.rpartition(":")
+            files["keep"] = at(p if p and re.fullmatch(r"[\d,]+", ks) else keep)
+    hot = env.get("STRATA_ENGRAM_HOT", "").strip()
+    if hot and hot != "0":
+        files["engram_hot"] = hot
+    model = a[a.index("-m") + 1] if "-m" in a[:-1] else ""
+    for i, x in enumerate(a[:-1]):
+        if x == "--engram":
+            for d in a[i + 1].split(";"):
+                if d and d != model and os.path.isdir(d):
+                    files["engram"] = d
+    if cfg.get("vision") and cfg["vision"].get("mmproj"):
+        files["vision"] = cfg["vision"]["mmproj"]
+    if "--exl3" in a[:-1]:
+        files["exl3"] = a[a.index("--exl3") + 1]
+    if cfg.get("tokenizer"):
+        files["tokenizer"] = cfg["tokenizer"]
+    return files
+
+
+def checkpoint_report(cfg):
+    """R-2: which checkpoint the model is (its stamp, file name or GGUF metadata; data/ds41/checkpoints.json), one line
+    on it, and a WARNING line for every derived file in use that was built from another checkpoint - and for a model
+    of another checkpoint than the launcher's file names (DS41_CHECKPOINT).  The config gets "checkpoint",
+    "model_key" (R-6: the main model's files + fingerprint - what the server keys the state learned from the model's
+    weights by: the learned expert profile, the reasoning memory) and "load_key" (the model key plus the drafter and
+    EXL3 files: what the load-time estimate depends on).  A drafter made again, or a start with or without it, changes
+    "load_key" only.  Warnings only: nothing is refused here."""
+    a = cfg.get("args", [])
+    if "-m" not in a[:-1]:
+        return
+    model = a[a.index("-m") + 1]
+    files = derived_in_use(cfg)
+    try:
+        mid, mfp, how = ckpt.which(model)
+        _, warns = ckpt.check(model, files)
+    except Exception as e:  # noqa: BLE001  (a broken stamp or table must not stop a start)
+        print(f"ds41_local: checkpoint check skipped ({e})")
+        return
+    if mid is None:
+        print(f"ds41_local: checkpoint of {os.path.basename(model)}: unknown (no stamp, and neither its name nor its "
+              f"metadata names one) - derived files not checked")
+    else:
+        label = (ckpt.load()["checkpoints"].get(mid) or {}).get("label", mid)
+        print(f"ds41_local: checkpoint {mid} ({label}, fingerprint {mfp or '?'}, by the model's {how})")
+        if mid != CK["id"]:
+            warns.insert(0, f"the model is checkpoint {mid}, but the launcher's file names are checkpoint {CK['id']}'s "
+                            f"(DS41_CHECKPOINT / data/ds41/checkpoints.json 'default')")
+    for w in warns:
+        print(f"ds41_local: WARNING - {w}.  Rebuild it from this checkpoint (setup-ds41-models.bat) or pick the "
+              f"matching model (Choose Model.bat): mixing checkpoints costs speed and drafts, never correctness")
+    cfg["checkpoint"] = {"id": mid, "fingerprint": mfp, "how": how, "files": CK["id"]}
+    try:
+        cfg["model_key"] = ckpt.model_key([model], mfp)
+        cfg["load_key"] = ckpt.model_key([model, files.get("drafter"), files.get("exl3")], mfp)
+    except OSError as e:
+        print(f"ds41_local: model key skipped ({e})")
+
+
+# R-6: state that outlives a start and depends on the model's weights, keyed by the model key ("model_key" above:
+# the main model only) - or, for the load-time estimate, by "load_key" (the model key + the drafter and EXL3 files).
+#   on disk, ours:   <config>.last-start.json (the load-time estimate)            -> deleted here when load_key changes
+#                    the config's "expert_profile_save" (opt-in, learned tier)    -> the server ignores and deletes it
+#                                                                                    (<save>.model-key differs)
+#   on disk, derived (rank, KEEP, drafter, vision, Engram hot set, tokenizer)     -> stamps + checkpoint_report()
+#   the user's own:  "slot_save_path" session files                             -> left alone: the engine refuses a
+#                                                                                    file saved with another model
+#                                                                                    (conversation_file.cpp fingerprint)
+#   in the engine process only (die with it; a model change is a new engine process): conversation cache slots,
+#   snapshots + snapshot stack, keep-cache, the parked conversation, DSpark seed rows; in the server process only:
+#   reasoning memory (bound to the key: serve/reasoning_memory.py), stored responses, the tokenizer's prefix memo,
+#   the vision encoder's per-start temp folder
+MODEL_KEY_FILE = "model-key.json"
+
+
+def model_state(cfg, out_path):
+    """R-6: the load key (the model key + drafter / EXL3 files) against the last start's (<config folder>/
+    model-key.json); when it changed, the persisted state above that is ours - the load-time estimate - is cleared.
+    The first start with this file only records the keys."""
+    key = cfg.get("model_key")
+    lkey = cfg.get("load_key") or key
+    if not key:
+        return
+    d = os.path.dirname(os.path.abspath(out_path))
+    path = os.path.join(d, MODEL_KEY_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+        prev, prev_l = rec.get("model_key"), rec.get("load_key") or rec.get("model_key")
+    except (OSError, ValueError, AttributeError):
+        prev = prev_l = None
+    if prev == key and prev_l == lkey:
+        return
+    if prev_l and prev_l != lkey:
+        cleared = []
+        last = os.path.splitext(os.path.abspath(out_path))[0] + ".last-start.json"
+        if os.path.exists(last):
+            try:
+                os.remove(last)
+                cleared.append(os.path.basename(last))
+            except OSError:
+                pass
+        what = (f"the model changed since the last start (key {prev} -> {key})" if prev != key else
+                f"the drafter / EXL3 files changed since the last start (load key {prev_l} -> {lkey})")
+        print(f"ds41_local: {what}" + (f": cleared {', '.join(cleared)}" if cleared else ""))
+    a = cfg.get("args", [])
+    try:
+        with open(path + ".part", "w", encoding="utf-8") as f:
+            json.dump({"model_key": key, "load_key": lkey,
+                       "model": os.path.basename(a[a.index("-m") + 1]) if "-m" in a[:-1] else None,
+                       "checkpoint": (cfg.get("checkpoint") or {}).get("id")}, f, indent=1)
+        os.replace(path + ".part", path)
+    except OSError:
+        pass
 
 
 def main():
@@ -640,12 +1023,14 @@ def main():
         if "--exl3" in args[:-1]:   # EXL3 experts on the default GGUF: named after the experts
             b = re.search(r"EXL3-([0-9.]+)bpw", args[args.index("--exl3") + 1], re.I)
             bpw = b.group(1) if b else ""
-            mid = f"deepseek-v4.1-flash-1017-exl3-{bpw}bpw" if bpw else "deepseek-v4.1-flash-1017-exl3"
+            mid = f"{ID_PREFIX}-exl3-{bpw}bpw" if bpw else f"{ID_PREFIX}-exl3"
             shown = f"DeepSeek V4.1 Flash · EXL3 {bpw} bpw".replace("  ", " ")
         if cfg.get("model_name", DEFAULT_NAME) == DEFAULT_NAME:
             cfg["model_name"] = mid
         cfg.setdefault("display_name", shown)
+    checkpoint_report(cfg)
     os.makedirs(os.path.dirname(os.path.abspath(sys.argv[2])), exist_ok=True)
+    model_state(cfg, sys.argv[2])
     with open(sys.argv[2], "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     a = cfg.get("args", [])
@@ -660,11 +1045,12 @@ def main():
     print(f"ds41_local: {total_ram_gib():.0f} GiB RAM -> expert arena {gib} GiB, route bias {out_bias(args)}; model {os.path.basename(model)}"
           + (f" with the EXL3 experts in {os.path.basename(x3)}" if x3 else "")
           + f" (Choose Model.bat picks another); models in {os.environ['DS41_MODELS']}")
-    # under ~110 GB of RAM the default reads most experts from the SSD (rounds 220 / 225 / 227, an RTX 3090): one line
-    # on the model that runs better there
-    if total_ram_gib() < 102 and os.path.basename(model) in ("DeepSeek-V4.1-Flash-1017-Q2.gguf", "ds4-q2-slim.gguf"):
-        print("ds41_local: tip - with this much RAM, Unsloth's UD-IQ1_S writes faster than the default (measured 36 / 31 "
-              "vs 27 / 20 tok/s at 96 / 64 GB; 89.1 vs 89.9% agreement): Choose Model.bat, 'download Unsloth UD-IQ1_S'")
+    # under ~110 GB of RAM the ds4 Q2 file reads most experts from the SSD (measured, an RTX 3090): one line on the
+    # model that runs better there - UD-IQ1_M at route bias 0.10, the pick under 110 GB since 0.95
+    if total_ram_gib() < 102 and os.path.basename(model) and os.path.basename(model) in (Q2_FILE, SLIM_FILE):
+        print("ds41_local: tip - with this much RAM, Unsloth's UD-IQ1_M writes faster than the ds4 Q2 file (0.95: 40 / 35 "
+              "tok/s at 96 / 64 GB; ds4 Q2 27 / 20 with 0.93) and agrees more (90.0 / 89.9 vs 89.9%): Choose Model.bat, "
+              "'download Unsloth UD-IQ1_M'")
     if cfg.get("vision"):
         where = (cfg["vision"].get("where") or "on the GPU") if cfg["vision"]["gpu"] else "on the CPU"
         if cfg["vision"].get("lazy"):

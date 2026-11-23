@@ -93,6 +93,44 @@ class EffortPaths(unittest.TestCase):
     def test_an_unknown_level_is_a_400_not_the_default(self):
         self.assertEqual(self.post("/v1/chat/completions", {"messages": MSG, "reasoning_effort": "huge"}), 400)
 
+    def test_llama_cpp_reasoning_budget_and_preserve_reasoning(self):
+        # llama.cpp clients: reasoning_budget 0 = off, -1 = no cap (default level), N = Anthropic's budget levels;
+        # the weakest field (a named effort wins, off from any field wins); never an error
+        for budget, want in ((0, "none"), (-1, "xhigh"), (500, "low"), (2048, "medium"), (8192, "xhigh"),
+                             (4096.0, "medium"), ("lots", "xhigh"), (None, "xhigh"), (True, "xhigh")):
+            with self.subTest(budget=budget):
+                self.assertEqual(self.level("/v1/chat/completions", {"messages": MSG, "reasoning_budget": budget}),
+                                 want)
+        self.assertEqual(self.level("/v1/chat/completions",
+                                    {"messages": MSG, "reasoning_effort": "low", "reasoning_budget": 9000}), "low")
+        self.assertEqual(self.level("/v1/chat/completions",
+                                    {"messages": MSG, "reasoning_effort": "high", "reasoning_budget": 0}), "none")
+        for preserve in (True, False, "yes"):
+            with self.subTest(preserve=preserve):
+                self.assertEqual(self.level("/v1/chat/completions", {
+                    "messages": MSG, "chat_template_kwargs": {"preserve_reasoning": preserve}}), "xhigh")
+        # the cap itself: reasoning_budget_tokens wins, -1 lifts a configured cap, a bad value keeps the config's
+        try:
+            self.svc.reasoning_budget_tokens = 300
+            for req, want in (({"reasoning_budget": 64}, 64), ({"reasoning_budget": -1}, None),
+                              ({"reasoning_budget": 0}, None), ({"reasoning_budget": "x"}, 300),
+                              ({"reasoning_budget": 64, "reasoning_budget_tokens": 32}, 32), ({}, 300),
+                              # 0.95: other providers' names (vLLM, Qwen, llama.cpp); reasoning_budget_tokens wins, then
+                              # the first in that order; a null does not hide the next name; 0 turns the cap off
+                              ({"thinking_token_budget": 20}, 20), ({"thinking_budget": 21}, 21),
+                              ({"thinking_budget_tokens": 22}, 22),
+                              ({"reasoning_budget_tokens": 40, "thinking_token_budget": 20, "thinking_budget": 21}, 40),
+                              ({"thinking_budget": 10_000, "thinking_budget_tokens": 22}, 10_000),
+                              ({"thinking_token_budget": None, "thinking_budget": 21}, 21),
+                              ({"thinking_budget": 0}, None), ({"thinking_budget": 25, "reasoning_budget": 64}, 25)):
+                with self.subTest(req=req):
+                    self.assertEqual(self.svc.reasoning_budget(req), want)
+            for bad in ({"thinking_budget": "lots"}, {"thinking_token_budget": 2.5}):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    self.svc.reasoning_budget(bad)
+        finally:
+            self.svc.reasoning_budget_tokens = 0
+
     def test_anthropic_output_config_and_thinking(self):
         for given, want in (("low", "low"), ("medium", "medium"), ("high", "xhigh")):
             with self.subTest(effort=given):

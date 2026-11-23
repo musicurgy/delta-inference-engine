@@ -28,7 +28,8 @@ import time
 import uuid
 
 from serve import frontend as _frontend
-from serve.frontend import Event, _late_system_to_user, _parts_of, document_text, reasoning_given
+from serve.frontend import (Event, _late_system_to_user, _parts_of, cut_arguments, declared_parameters, document_text,
+                            reasoning_given)
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -112,9 +113,11 @@ def _reasoning_text(item, param) -> str:
     return ""
 
 
-def _arguments(raw, param) -> dict:
+def _arguments(raw, param, declared=None) -> dict:
     """A function_call's arguments (a JSON string) -> the mapping the template renders.  Arguments that are not a JSON
-    object (a call the output ended inside) are kept as text rather than refusing the whole conversation."""
+    object are kept as text rather than refusing the whole conversation; a call the output ended inside (text that
+    starts like an object) gives the members it still holds, as frontend.tool_arguments says (0.95, `declared` = the
+    tool's parameter names, None when unknown)."""
     if isinstance(raw, dict):
         return raw
     if raw is None or (isinstance(raw, str) and not raw.strip()):
@@ -124,6 +127,10 @@ def _arguments(raw, param) -> dict:
     try:
         value = json.loads(raw)
     except ValueError:
+        if declared is None or "arguments" not in declared:
+            cut = cut_arguments(raw)
+            if cut is not None:
+                return cut
         return {"arguments": raw}
     return value if isinstance(value, dict) else {"arguments": value}
 
@@ -197,7 +204,7 @@ def input_messages(req: dict) -> list[dict]:
             if item.get("namespace"):
                 name = f"{item['namespace']}.{name}"
             if kind == "function_call":
-                args = _arguments(item.get("arguments"), param + ".arguments")
+                args = _arguments(item.get("arguments"), param + ".arguments", declared_parameters(req.get("tools"), name))
             else:
                 args = {"input": item.get("input") if isinstance(item.get("input"), str) else ""}
             target = open_turn if open_turn is not None and not thinking else turn()

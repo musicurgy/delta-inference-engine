@@ -277,7 +277,7 @@ class ResponsesToolChoice(Http):
                 code, b, _ = self.respond(tool_choice=choice)
                 self.assertEqual(code, 200, b)
                 self.assertEqual(self.calls(b), [("search", {"q": "2+2"})])
-                self.assertTrue(self.tok.decode(self.engine.prompts[-1]).endswith("<function=")
+                self.assertTrue(self.tok.decode(self.engine.prompts[-1]).endswith("<tool_call>\n")
                                 or self.tok.decode(self.engine.prompts[-1]).endswith("<function=search>\n"))
 
     def test_effort_uses_the_models_own_table(self):
@@ -520,6 +520,39 @@ class Endpoints(Http):
         self.assertFalse(m["capabilities"]["vision"])
         self.assertEqual(m["meta"]["n_ctx"], ctx)               # the old fields stay
         self.assertEqual((b["has_more"], b["first_id"], b["last_id"]), (False, m["id"], b["data"][-1]["id"]))
+
+    def test_models_key_only_when_switched_on_with_instructions(self):
+        """C2: /v1/models writes no "models" key by default (Codex would otherwise take a catalog entry and change its
+        prompt); STRATA_SERVE_MODELS_KEY=1 writes the Codex catalog entries beside "data", and only when the
+        config gives Codex base instructions."""
+        import os
+        import tempfile
+        code, b, _ = self.request("/v1/models")
+        self.assertEqual(code, 200, b)
+        self.assertNotIn("models", b)
+        before = b
+        old_env, old_file = os.environ.get("STRATA_SERVE_MODELS_KEY"), getattr(self.svc, "codex_base_instructions_file", None)
+        os.environ["STRATA_SERVE_MODELS_KEY"] = "1"
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                self.svc.codex_base_instructions_file = None
+                code, b, _ = self.request("/v1/models")
+                self.assertNotIn("models", b)                    # no instructions: Codex would get no system prompt
+                p = os.path.join(d, "codex.txt")
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write("You are Codex.")
+                self.svc.codex_base_instructions_file = p
+                code, b, _ = self.request("/v1/models")
+                self.assertEqual(code, 200, b)
+                self.assertEqual(b["models"][0]["slug"], self.svc.model)
+                self.assertEqual(b["models"][0]["base_instructions"], "You are Codex.")
+                self.assertEqual(b["data"], before["data"])       # the OpenAI list is unchanged
+            finally:
+                self.svc.codex_base_instructions_file = old_file
+                if old_env is None:
+                    os.environ.pop("STRATA_SERVE_MODELS_KEY", None)
+                else:
+                    os.environ["STRATA_SERVE_MODELS_KEY"] = old_env
 
     def test_codex_catalog(self):
         code, b, _ = self.request("/v1/codex/models.json")

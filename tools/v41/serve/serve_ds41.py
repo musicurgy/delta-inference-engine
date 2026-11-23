@@ -20,6 +20,8 @@ import json
 import os
 import re
 import sys
+if os.name == "nt":   # 0.95 (Niko1221/Strata 6f6099fe6): no _wmi (a 0xC0000005 crash on Python 3.12+), as serve/server.py
+    sys.modules.setdefault("_wmi", None)
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -57,7 +59,7 @@ ST.Tokenizer = Ds41Tokenizer
 
 # ---- reasoning effort: client spellings -> template kwargs (reasoning_effort = an int 1-100, or thinking off)
 EFFORT = {"none": 0, "off": 0, "disabled": 0, "false": 0, "minimal": 50, "low": 50, "medium": 62, "high": 75,
-          "xhigh": 75, "max": 100, "maximum": 100}
+          "xhigh": 75, "max": 100, "maximum": 100, "ultra": 100}   # "ultra": DeepSeek's API name for its top level
 
 
 def effort_kwargs(value) -> dict:
@@ -108,9 +110,14 @@ GEN_SUFFIXES = (E.ASSISTANT_SP_TOKEN + E.thinking_start_token, E.ASSISTANT_SP_TO
 
 
 def _text(content):
+    # "\n\n" between text items, as DeepSeek's encoder joins a list's text (11-15 sweep; frontend.TEXT_PART_SEP below)
     if content is None or isinstance(content, str):
         return content
-    return "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text", None))
+    return "\n\n".join(p.get("text", "") for p in content
+                       if isinstance(p, dict) and p.get("type") in ("text", "input_text", None))
+
+
+F.TEXT_PART_SEP = "\n\n"     # the server's own joins (frontend._text_of, Anthropic text blocks) as the encoder joins
 
 
 def to_encoder_messages(messages, tools):
@@ -166,8 +173,22 @@ class Ds41Template:
 
     def render(self, messages, tools=None, add_generation_prompt=True, **kw):
         mode = "chat" if kw.get("enable_thinking") is False else "thinking"
-        prompt = E.encode_messages(to_encoder_messages(messages, tools), thinking_mode=mode,
-                                   reasoning_effort=_level(kw.get("reasoning_effort")))
+        enc = to_encoder_messages(messages, tools)
+        # 11-15 (vllm#46256, found in spark-ds41f): a conversation that ENDS with an assistant message is a prefill -
+        # Anthropic's assistant prefill, DeepSeek's API ("a trailing assistant message continues it"), an agent's
+        # compaction call.  The encoder closed it with <｜end▁of▁sentence｜>, so the model was asked to write after
+        # its own end of text.  DeepSeek's own wo_eos leaves it open: the reply continues the message.  Only for a
+        # render that asks for a reply: a finished history (add_generation_prompt=False) keeps the end token, as the
+        # reference template writes it (the server's effort_end then sees full != mine + suffix and renders full).
+        prefill = add_generation_prompt and enc and enc[-1].get("role") == "assistant" and not enc[-1].get("tool_calls")
+        if prefill:
+            enc[-1] = {**enc[-1], "wo_eos": True}
+        prompt = E.encode_messages(enc, thinking_mode=mode, reasoning_effort=_level(kw.get("reasoning_effort")))
+        # 11-15 sweep (vLLM continue_final_message): a prefill that holds only reasoning continues the REASONING - the
+        # encoder closes it ("<think>Let me</think>"), which asked for the answer instead
+        if prefill and mode == "thinking" and not (enc[-1].get("content") or "").strip() \
+                and (enc[-1].get("reasoning_content") or "").strip() and prompt.endswith(E.thinking_end_token):
+            prompt = prompt[:-len(E.thinking_end_token)]
         if not add_generation_prompt:
             for s in GEN_SUFFIXES:
                 if prompt.endswith(s):
@@ -177,6 +198,10 @@ class Ds41Template:
 
 F.ChatTemplate = Ds41Template
 S.ChatTemplate = Ds41Template
+
+# ---- (opt-in, STRATA_SHARED_PREFIX=1, read by the engine too): each request names where its system + tools
+# block ends (sys_end=), and the engine keeps a restore point there that other conversations with that block resume from
+S.SHARED_PREFIX = (os.environ.get("STRATA_SHARED_PREFIX") or "").startswith("1")
 
 # ---- end of turn
 S.IM_END = E.eos_token
@@ -191,7 +216,19 @@ def _svc_init_ds41(self, engine, tokenizer, template, *a, **k):
     assert len(eos) == 1, eos
     self.stop_ids = set(eos)
     self.effort_end = False      # #458's tail-turn trick is Qwen text; V4.1's effort lives in the first system turn
-    self.literals = {**self.literals, E.IMAGE_PLACEHOLDER: "\U000f0e20"}
+    # 0.95: V4.1's turn, tool-call and DSML tokens (<｜User｜>, <｜Assistant｜>, ｜DSML｜, <dsml:, ...) are USER_DEFINED -
+    # type 4, matched even without parse_special - so one written inside a message (a pasted transcript, a file an agent
+    # reads, a tool result) became the real token: a forged turn or tool call.  Each gets a mark like the control tokens
+    # (text inside a message, the template's own tokens unchanged).  The marks start above every mark in use; the image
+    # placeholder's moves there too (its old fixed U+F0E20 was also a control token's mark).
+    lit = dict(self.literals)
+    base = max(map(ord, lit.values())) + 1
+    lit[E.IMAGE_PLACEHOLDER] = chr(base)
+    controls = set(getattr(tokenizer, "control_tokens", ()))
+    extra = [t for t in getattr(tokenizer, "special_tokens", {}) if t not in controls and t not in lit]
+    for k, t in enumerate(extra, 1):
+        lit[t] = chr(base + k)
+    self.literals = dict(sorted(lit.items(), key=lambda t: -len(t[0])))   # longest first, as the tokenizer matches
 
 
 S.Service.__init__ = _svc_init_ds41
@@ -428,12 +465,13 @@ def _param_kind(spec, name) -> str:
 
 
 def ds41_parse_tool_call(body: str, schema=None):
+    lit = lambda s: s.replace(LITERAL_LT, "<")     # tag-like text inside a value (_spell_tags) is the value's text
     m = re.match(r'\s*name="(.*?)">', body, re.DOTALL)
     if not m:
-        raise ValueError("malformed tool call: " + body[:80])
+        raise ValueError("malformed tool call: " + lit(body[:80]))
     args = {}
-    for key, is_str, value in _P_RE.findall(body[m.end():]):
-        value = unescape(value)
+    for key, is_str, value in _P_RE.findall(body[m.end():]):   # (0.95: after a value's end is found - a parameter
+        key, value = lit(key), unescape(lit(value))               # close inside it stays its text)
         kind = _param_kind(schema, key)
         if is_str == "true" or kind == "text":
             args[key] = value
@@ -441,12 +479,31 @@ def ds41_parse_tool_call(body: str, schema=None):
             args[key] = None if value.strip() == "null" else value
         else:
             try:
-                args[key] = json.loads(value)
+                args[key] = json.loads(value, strict=False)   # raw control characters in a string (llama.cpp c90aa996b)
             except ValueError:
                 args[key] = value
-    return F.ToolCall(name=m.group(1), arguments=args)
+            root, props = _tool_props(schema)
+            if isinstance(args[key], str) and "boolean" in _param_types(root, props.get(key)):
+                word = args[key].strip().lower()       # 0.95 (Abyss 66e4aa6): `True` / `False`, as written with thinking off
+                args[key] = {"true": True, "false": False}.get(word, args[key])
+    return F.ToolCall(name=lit(m.group(1)), arguments=args)
 
 
+_OPENER_NAME = re.compile(r'name="([^"\n]*)"\s*>')
+
+
+def ds41_opener_name(after: str):
+    """frontend.opener_name for DSML (0.95, undeclared_tool_calls): `after` follows `<｜DSML｜ invoke` (whitespace
+    dropped) -> the tool's name; None while it is still arriving; "" when it cannot be read (the call reads as before)."""
+    m = _OPENER_NAME.match(after)
+    if m:
+        return m.group(1)
+    if "\n" not in after and len(after) < 400 and ('name="'.startswith(after) or after.startswith('name="')):
+        return None
+    return ""
+
+
+F.opener_name = ds41_opener_name
 F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
 # xolotl: the 0.1.44 parser treats a call opener as a call only when Qwen's `<function=` follows it (else it is
 # prose naming the format); this model's follower is DSML (` name="...">`), so with FUNC_START = "" that guard always passes -
@@ -456,6 +513,7 @@ F.call_end = ds41_call_end
 F.parse_tool_call = ds41_parse_tool_call
 _op_init, _op_feed, _op_finish = F.OutputParser.__init__, F.OutputParser.feed, F.OutputParser.finish
 WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
+THINK_END = E.thinking_end_token
 
 
 # ---- low-bit quants' spellings of the tags (upstream #110): a quant sometimes writes a call's tags without the ｜DSML｜
@@ -464,7 +522,7 @@ WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
 # Every tag goes through here first and comes out in the one spelling the rest of this file reads.  Without the real
 # token a tag opens a call only inside a calls block, for a declared tool, or at the start of a line outside code, so
 # `< invoke name="rm">` in prose stays text; `<invoke>` (no marker) is never a tag.  A stray short word in the marker's
-# place - `<name invoke name="read_file">`, the UD-IQ2_XXS default's first tag in round 359's agent trace (greedy, bias
+# place - `<name invoke name="read_file">`, the UD-IQ2_XXS default's first tag in a measured agent trace (greedy, bias
 # 0.28) - is a tag only between a calls block's other tags (the calls / invoke states), never in prose or in a value.
 _M = r"(?P<tok>｜DSML｜\s*)?(?(tok)|(?:[\\＼｜]DSML[\\＼｜]\s*|[\\＼]\s*|(?P<stray>[A-Za-z_]{1,12})?\s+))"
 _ANY_TAG = re.compile(rf'<(?P<end>/?){_M}(?:(?:tool_|function_)?(?P<calls>calls)|(?P<word>invoke|parameter)'
@@ -473,6 +531,12 @@ _TAG_HEAD = re.compile(r"^</?(?:｜(?:D(?:S(?:M(?:L(?:｜)?)?)?)?)?|[\\＼](?:D(
 _TAG_REST = re.compile(rf"^</?{_M}(?P<rest>[^<>]*)$")
 _TAG_WORDS = ("calls", "tool_calls", "function_calls", "invoke", "parameter")
 _TAG_MAX = 600                  # a longer `<...` is text, not held any further
+# ds4 QA (antirez fc6414c, MIT): a tag's spelling inside a parameter's value - `</｜DSML｜ invoke>` or `</｜DSML｜ calls>` in
+# a file being written - is the value's text, as DeepSeek's own parser reads it (a value ends only at its parameter's
+# closing tag).  It leaves _spell_tags as LITERAL_LT + the rest, so neither the wrapper strip nor the call's end
+# (ds41_call_end) takes it for a tag; the parsed call and the events have the "<" back.
+LITERAL_LT = "<" + chr(0xE000)  # (a private-use character: "<" followed by it is not text a model writes)
+_VALUE_LOOK_MAX = 1 << 15       # a missing parameter close decided after this much text at the most
 
 
 def _maybe_tag(s: str, inside: bool = False) -> bool:
@@ -491,12 +555,45 @@ def _maybe_tag(s: str, inside: bool = False) -> bool:
                for w in _TAG_WORDS)                    # the word is whole: invoke's and parameter's attributes are arriving
 
 
+def _tag_line_done(self, line: str):
+    """A whole line of text between calls: the open code fence (0.95, Strata 0.2.9 #4702: closed only by a run of at
+    least as many of its character) and the indented code block (#4703: 4 spaces or a tab after a blank line), as
+    frontend.OutputParser._track follows them."""
+    s = line.lstrip()
+    was_fenced = bool(self.tag_fence)
+    if self.tag_fence:
+        if len(s) - len(s.lstrip(self.tag_fence[0])) >= len(self.tag_fence):
+            self.tag_fence = ""
+    elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
+        self.tag_fence = s[0] * (len(s) - len(s.lstrip(s[0])))
+    if was_fenced or self.tag_fence:
+        self.tag_blank = self.tag_indented = False
+    elif not s:
+        self.tag_blank = True
+    elif line.startswith(("    ", "\t")):
+        self.tag_indented = self.tag_blank or self.tag_indented
+        self.tag_blank = False
+    else:
+        self.tag_blank = self.tag_indented = False
+
+
 def _tag_text(self, text: str, out: list):
     out.append(text)
-    *done, self.tag_line = (self.tag_line + text).split("\n")
+    if self.tag_state != "text":     # a call's own text (a value may hold a fence of its own) is not prose
+        return
+    buf = self.tag_line + text
+    if THINK_END in buf:             # the answer's own text starts here: a fence the thinking left open is not its code
+        buf = buf.rsplit(THINK_END, 1)[1]
+        self.tag_fence, self.tag_blank, self.tag_indented = "", False, False
+    *done, self.tag_line = buf.split("\n")
     for line in done:
-        if line.lstrip().startswith("```"):
-            self.tag_fence = not self.tag_fence
+        _tag_line_done(self, line)
+
+
+def _tag_in_code(self) -> bool:
+    """The next character is inside a code fence or an indented code block (0.95, Strata 0.2.9): a call written
+    there - even with the real ｜DSML｜ token - is an example, never run."""
+    return bool(self.tag_fence) or ((self.tag_blank or self.tag_indented) and self.tag_line.startswith(("    ", "\t")))
 
 
 def _param_is_string(self, tool: str, name: str) -> str:
@@ -524,7 +621,7 @@ def _tag(self, m, out: list) -> bool:
         if st != "invoke" or end or m["name"] is None:
             return False
         out.append(f'{P_OPEN} name="{m["name"]}" string="{m["s"] or _param_is_string(self, self.tag_tool, m["name"])}">')
-        self.tag_state = "param"
+        self.tag_state, self.tag_quoted = "param", 0
         return True
     if word == "invoke":
         if end:
@@ -537,6 +634,8 @@ def _tag(self, m, out: list) -> bool:
         if st == "text" and not m["tok"] and (self.tag_fence or self.tag_line.count("`") % 2 or
                                                (m["name"] not in self.schemas and self.tag_line.strip())):
             return False
+        if st == "text" and _tag_in_code(self):    # 0.95: a call shown in code
+            return False
         out.append(f'{INVOKE_OPEN} name="{m["name"]}">')
         self.tag_state, self.tag_tool = "invoke", m["name"]
         return True
@@ -545,10 +644,71 @@ def _tag(self, m, out: list) -> bool:
             return False
         out.append(CALLS_CLOSE); self.tag_state = "text"
         return True
-    if st != "text" or (not m["tok"] and (self.tag_fence or self.tag_line.strip())):
+    if st != "text" or (not m["tok"] and (self.tag_fence or self.tag_line.strip())) or _tag_in_code(self):
         return False
     out.append(CALLS_OPEN); self.tag_state = "calls"
     return True
+
+
+def _value_goes_on(rest: str, final: bool):
+    """An invoke close inside a value: is it the value's text (True: a parameter close comes before the calls block
+    ends or another call opens, as DeepSeek's parser reads it) or the end of a call whose value's closing tag the model
+    left out (False, upstream #110's recovery)?  None: not known yet, hold it.  A stray-word invoke open (measured)
+    counts as another call opening: after that invoke close _tag takes it for one, as it does between call tags."""
+    for t in _ANY_TAG.finditer(rest):
+        if t["stray"]:
+            if t["word"] == "invoke" and not t["end"]:
+                return False
+            continue
+        if t["word"] == "parameter" and t["end"]:
+            return True
+        if (t["calls"] and t["end"]) or (t["word"] == "invoke" and not t["end"]):
+            return False
+    return False if final or len(rest) > _VALUE_LOOK_MAX else None
+
+
+def _param_close_goes_on(rest: str, final: bool):
+    """0.95 (spark-ds41f 74e45310): a parameter close inside a value - DSML has no escaping, so a file about DSML holds
+    one with the real token - ends the value only when, past whitespace, the call's structure follows it: another
+    parameter, the call's end, the calls block's end, another call, or the end of the text.  Anything else after it
+    (text, a second parameter close) and it is the value's text (True).  None: not known yet, hold it."""
+    s = rest.lstrip()
+    if not s:
+        return False if final or len(rest) > _VALUE_LOOK_MAX else None
+    if s[0] != "<":
+        return True
+    gt = s.find(">")
+    if gt < 0:
+        if final:
+            return False                             # cut inside the next tag: the value ended, as before
+        return None if _maybe_tag(s, True) else True
+    t = _ANY_TAG.fullmatch(s[:gt + 1])
+    if t is None:
+        return True
+    if t["calls"]:
+        return not t["end"]
+    if t["word"] == "invoke":
+        return not (t["end"] or t["name"] is not None)
+    return bool(t["end"]) or t["name"] is None       # a parameter open follows: the value ended
+
+
+def _quoted_close_goes_on(rest: str, final: bool, depth: int):
+    """lucebox 39b9cfb9: a parameter close the structure follows, inside a call the value quotes (`depth` of them still
+    open).  It is the quoted call's text (True) only when that reading holds: the quoted calls close and then a
+    parameter close ends the value.  Otherwise (an invoke open quoted alone) it ends the value (False), as before."""
+    for t in _ANY_TAG.finditer(rest):
+        if t["stray"] or t["calls"]:
+            continue
+        if t["word"] == "invoke":
+            depth += -1 if t["end"] else t["name"] is not None
+            depth = max(depth, 0)
+        elif t["end"] and depth == 0:
+            goes_on = _param_close_goes_on(rest[t.end():], final)
+            if goes_on is None:
+                return None
+            if not goes_on:
+                return True
+    return False if final or len(rest) > _VALUE_LOOK_MAX else None
 
 
 def _spell_tags(self, delta: str, final: bool) -> str:
@@ -567,10 +727,29 @@ def _spell_tags(self, delta: str, final: bool) -> str:
                 _tag_text(self, buf, out); buf = ""
             break
         m = _ANY_TAG.fullmatch(buf[:gt + 1]) if gt >= 0 else None
-        if m is not None and _tag(self, m, out):
+        literal = False
+        if m is not None and self.tag_state == "param" and m["word"] and not m["stray"]:
+            if m["end"] and self.tag_quoted and m["word"] == "invoke":
+                literal = True                       # lucebox 39b9cfb9: the end of a call the value quotes is text
+                self.tag_quoted -= 1
+            elif m["end"] and self.tag_quoted:       # a parameter close inside it: text if that reading holds
+                literal = _param_close_goes_on(buf[gt + 1:], final)
+                if literal is False:
+                    literal = _quoted_close_goes_on(buf[gt + 1:], final, self.tag_quoted)
+                if literal is None:
+                    break
+            elif m["end"]:
+                literal = (_value_goes_on if m["word"] == "invoke" else _param_close_goes_on)(buf[gt + 1:], final)
+                if literal is None:
+                    break                            # undecided: held (inside a call nothing is sent yet anyway)
+            elif m["word"] == "invoke" and m["name"] is not None:
+                self.tag_quoted += 1                 # a call the value quotes opens (text: no call opens inside a value)
+        if m is not None and not literal and _tag(self, m, out):
             buf = buf[gt + 1:]
-        else:
-            _tag_text(self, "<", out); buf = buf[1:]
+        else:                                        # text; a tag's spelling inside a value: LITERAL_LT
+            # 0.95: so is a real tag shown in code - neither the wrapper strip nor the call's opening takes it
+            quoted = m is not None and (self.tag_state == "param" or (self.tag_state == "text" and _tag_in_code(self)))
+            _tag_text(self, LITERAL_LT if quoted else "<", out); buf = buf[1:]
     self.tag_hold = buf
     return "".join(out)
 
@@ -580,7 +759,10 @@ def _op_init_ds41(self, *a, **k):
     self.stream_tools = False          # the streaming scanner reads Qwen's <function=...> body
     self.dsml_hold = ""
     self.echo_check, self.echo_hold = True, ""
-    self.tag_hold, self.tag_state, self.tag_tool, self.tag_line, self.tag_fence = "", "text", None, "", False
+    self.tag_hold, self.tag_state, self.tag_tool, self.tag_line, self.tag_fence = "", "text", None, "", ""
+    self.tag_blank = self.tag_indented = False         # 0.95: the indented code block (_tag_line_done)
+    self.tag_quoted = 0                # calls a value quotes, still open (_spell_tags)
+    self.leak_tail, self.leak_seen = "", False
 
 
 # 2026-10-19: after the server closes a thinking budget with REASONING_WRAP_UP, the 1017 sometimes repeats that sentence
@@ -622,8 +804,49 @@ def _strip_wrappers(self, delta: str, final: bool) -> str:
     return buf[:len(buf) - keep] if keep else buf
 
 
+def _literal_back(evs):
+    """LITERAL_LT -> "<" in the text of events (a call cut off inside a value and sent as text keeps its own text)."""
+    for ev in evs:
+        if LITERAL_LT in ev.text:
+            ev.text = ev.text.replace(LITERAL_LT, "<")
+    return evs
+
+
+# R-5: DSML markup that reached an answer as text.  V4 -> V4.1 renamed the tags and vLLM's parser then passed every
+# call through as plain text, with no error, for ~12 days; a new checkpoint can do the same to us.  This only counts
+# and logs (once per answer, with the text around it) - the events are never changed.  A model explaining DSML in
+# prose is counted too: the count is a signal to read the log, not a verdict.
+_LEAK_RE = re.compile(r'｜DSML｜|[\\＼]DSML[\\＼]|<\s*/?\s*(?:invoke|parameter)\s+name\s*=\s*"')
+_LEAK_TAIL = 48                  # longer than any marker the pattern matches: one split across two deltas is still seen
+DSML_LEAKS = {"answers": 0, "last": ""}
+
+
+def _leak_watch(self, evs):
+    if getattr(self, "leak_seen", True):
+        return evs
+    try:
+        for ev in evs:
+            if ev.kind != "content" or not ev.text:
+                continue
+            buf = self.leak_tail + ev.text
+            m = _LEAK_RE.search(buf)
+            if m is None:
+                self.leak_tail = buf[-_LEAK_TAIL:]
+                continue
+            self.leak_seen = True
+            snippet = buf[max(0, m.start() - 60):m.end() + 60]
+            DSML_LEAKS["answers"] += 1
+            DSML_LEAKS["last"] = snippet
+            print(f"[strata] DSML-looking text left in an answer (count {DSML_LEAKS['answers']} since start): "
+                  f"{snippet!r}", flush=True)
+            break
+    except Exception:   # noqa: BLE001 - a counter: never fail a request over it
+        pass
+    return evs
+
+
 def _op_feed_ds41(self, delta: str):
-    return _drop_wrap_echo(self, _op_feed(self, _strip_wrappers(self, _spell_tags(self, delta, False), False)))
+    return _leak_watch(self, _literal_back(_drop_wrap_echo(self, _op_feed(self, _strip_wrappers(self, _spell_tags(self, delta, False), False)))))
 
 
 def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reason=...)
@@ -641,7 +864,7 @@ def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reaso
         if self.echo_hold.strip() != WRAP_SENTENCE:
             out.append(F.Event("content", self.echo_hold))
         self.echo_hold = ""
-    return out
+    return _leak_watch(self, _literal_back(out))
 
 
 F.OutputParser.__init__ = _op_init_ds41
@@ -651,9 +874,11 @@ S.OutputParser = F.OutputParser
 
 # ---- tool_choice (forced calls, as upstream 34ac0f1): the server writes the call's opening itself and the model goes
 # on from it, so the opening must be DSML the way DeepSeek's encoder writes an assistant call - the frontend's is Qwen's
-# `<function=X>`, which this model would continue as plain text.  "required" stops after ` name="` (the model picks
-# the tool); a named tool is opened whole.  With thinking the server puts the blank line before it (after </think>);
-# without, the prompt ends with </think>, so prepare() adds it there.
+# `<function=X>`, which this model would continue as plain text.  "required" with several tools opens only the calls
+# block and the model writes the whole `<｜DSML｜ invoke name="X">` (0.95, Strata 0.2.12 PR #4828: from a written
+# `<function=` Qwen3.8 went on with names no tool has, 0 of 24 forced runs made a call, 24 of 24 after; ours stopped
+# after ` name="`, mid-tag and mid-token); a named tool (or the one tool) is opened whole.  With thinking the server
+# puts the blank line before it (after </think>); without, the prompt ends with </think>, so prepare() adds it there.
 _forced_call = F.forced_call
 
 
@@ -662,8 +887,7 @@ def ds41_forced_call(tool_choice, tools):
     if qwen is None:
         return None
     m = re.search(r"<function=([^>\n]+)>", qwen)
-    head = CALLS_OPEN + "\n" + INVOKE_OPEN + ' name="'
-    return head + m.group(1) + '">\n' if m else head
+    return CALLS_OPEN + "\n" + (INVOKE_OPEN + ' name="' + m.group(1) + '">\n' if m else "")
 
 
 S.forced_call = ds41_forced_call
@@ -711,6 +935,8 @@ class _Setup:
                         close()
                 except Exception as e:
                     print(f"[strata] while stopping for the restart: {e}", flush=True)
+            from serve import console_out
+            console_out.drain()          # os._exit skips the console queue's own end
             os._exit(_setup.RESTART_EXIT)
         _th.Thread(target=restart, daemon=True).start()
         out = {"restarting": True}

@@ -70,6 +70,11 @@ def main():
     for d in sorted({d for d, _ in groups}):
         json.dump({'metadata': {'total_size': sum(p[3] for p in plan)}, 'weight_map': filemap},
                   open(os.path.join(d, 'model.safetensors.index.json'), 'w'), indent=1)
+    # R-2: each folder gets <folder>/ckpt.json, the checkpoint the tables came from (DS41_CHECKPOINT names it)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ckpt
+    for d in sorted({d for d, _ in groups}):
+        ckpt.stamp_output(d, 'engram')
     print('use: --engram "' + ':'.join(sorted({d for d, _ in groups})) + '"')
 
 def write_one(dst, fname, plan, verify):

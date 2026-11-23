@@ -30,13 +30,20 @@ _KEYS = [k for k, _ in STEPS]
 _lock = threading.Lock()
 _state = {"active": False, "t0": None, "step": None, "detail": None, "error": None, "last_s": None, "reason": None}
 last_start_path: str | None = None          # set by main() from the run config: <config>.last-start.json
+# R-6: the run config's "load_key", else its "model_key" (ds41_local.py: the loaded files' sampled hash - main model,
+# drafter, EXL3 experts - + the checkpoint fingerprint).  A
+# record written for another model is not this model's estimate: ignored (a record without a key, as before)
+model_key: str | None = None
 
 
 def _read_last() -> float | None:
     if not last_start_path:
         return None
     try:
-        v = json.loads(Path(last_start_path).read_text(encoding="utf-8")).get("seconds")
+        rec = json.loads(Path(last_start_path).read_text(encoding="utf-8"))
+        if model_key and rec.get("model") and rec["model"] != model_key:
+            return None
+        v = rec.get("seconds")
         return float(v) if v and float(v) > 0 else None
     except (OSError, ValueError, TypeError, AttributeError):
         return None
@@ -71,8 +78,10 @@ def done() -> None:
         _state.update(active=False, step=None, detail=None, error=None)
     if took and last_start_path:
         try:
-            Path(last_start_path).write_text(json.dumps({"seconds": round(took, 1), "at": int(time.time())}),
-                                             encoding="utf-8")
+            rec = {"seconds": round(took, 1), "at": int(time.time())}
+            if model_key:
+                rec["model"] = model_key
+            Path(last_start_path).write_text(json.dumps(rec), encoding="utf-8")
         except OSError:
             pass
 

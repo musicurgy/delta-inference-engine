@@ -33,7 +33,7 @@ export STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.6}"
 export STRATA_SERVE_LOOKUP="${STRATA_SERVE_LOOKUP:-14}"
 export STRATA_SERVE_DSPARK_EVICT="${STRATA_SERVE_DSPARK_EVICT:-4096}"
 # Bounded replay: layers 21-39 run on a prompt's last 128 tokens only (agent sessions -4.6 to -6.6 %, quality inside
-# run-to-run noise on short and long turns, rounds 350 / 352 / 353).  =0 = off.
+# run-to-run noise on short and long turns).  =0 = off.
 export STRATA_ENC_BOUND="${STRATA_ENC_BOUND:-128}"
 # the serving switches Start DeepSeek.bat runs with (all exact: conversation cache, rollback, snapshots, the kept
 # expert cache, sampled drafts; its comments give the rounds).  serve/test_launcher_knobs.py keeps them equal to the
@@ -44,13 +44,24 @@ export STRATA_SERVE_ROLLBACK="${STRATA_SERVE_ROLLBACK:-8}"
 export STRATA_SERVE_BATCH_MIN="${STRATA_SERVE_BATCH_MIN:-64}"
 export STRATA_PASS_CAP_MIN="${STRATA_PASS_CAP_MIN:-4096}"
 export STRATA_SERVE_REWIND1="${STRATA_SERVE_REWIND1:-1}"
-export STRATA_SERVE_CACHE_SLOTS="${STRATA_SERVE_CACHE_SLOTS:-8}"
+export STRATA_SERVE_CACHE_SLOTS="${STRATA_SERVE_CACHE_SLOTS:-16}"
 export STRATA_SERVE_SNAP_STACK="${STRATA_SERVE_SNAP_STACK:-4}"
 export STRATA_SERVE_KEEP_CACHE="${STRATA_SERVE_KEEP_CACHE:-1}"
 export STRATA_SERVE_KEEP_LRU="${STRATA_SERVE_KEEP_LRU:-1}"
 export STRATA_SERVE_KEEP_MAX="${STRATA_SERVE_KEEP_MAX:-12000}"
 export STRATA_DSPARK_SAMPLE="${STRATA_DSPARK_SAMPLE:-1}"
 export STRATA_DSPARK_SAMPLE_T="${STRATA_DSPARK_SAMPLE_T:-0.5}"
+# 0.95 defaults, as Start DeepSeek.bat (=0 turns each off): sink rejection at 85000 (a sampled token that becomes an
+# attention sink is replaced by the next candidate; control tokens never), the drafter loaded at start, a 1024-row
+# sliding-window tail kept with each conversation snapshot, and copy yield (a lookup copy is taken only when its hit rate
+# beats the drafter's expected drafts; measured: agent turns +20% alone).  The launcher's decode kernel switches
+# (STRATA_FUSE, STRATA_X3, STRATA_ZC_PRED, STRATA_FOLDS), its draft gate (it would replace this sidecar's 0.6 confidence
+# stop) and its 2.8 GiB keep reserve (sized with its prestage 0 / batch 16384) are not set here: not measured on this setup.
+export STRATA_SINK_REJECT="${STRATA_SINK_REJECT:-85000}"
+export STRATA_DSPARK_EAGER="${STRATA_DSPARK_EAGER:-1}"
+export STRATA_SNAP_TAIL="${STRATA_SNAP_TAIL:-1024}"
+export STRATA_LOOKUP_YIELD="${STRATA_LOOKUP_YIELD:-1}"
+export STRATA_DSPARK_LGATE="${STRATA_DSPARK_LGATE:-1}"
 # Dense half (attention + shared expert + head, the file's Q8_0) re-quantized to Q6_K at load (ggml, file untouched):
 # 7.59 -> 5.86 GB, +1.6 GiB of VRAM expert slots -> decode +11 % after a 6.5K prompt, +15-35 % after 16.8K, edits
 # +9 %; prefill on long prompts -9 % (Q6_K MMQ).  Quality on the 100 API fixtures (S6, same bf16 path): KL vs FP8

@@ -95,3 +95,13 @@ models/
 /vision-choice.txt
 /voice-choice.txt
 /delta-settings.json
+
+# local secrets, crash dumps, profiler captures and assistant session files: never part of the repository
+.env
+.env.*
+*.dmp
+*.ncu-rep
+*.qdrep
+.claude/
+CLAUDE.md
+CLAUDE.local.md

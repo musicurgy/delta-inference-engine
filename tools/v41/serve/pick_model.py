@@ -24,51 +24,69 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 CHOICE = os.path.join(ROOT, "model-choice.txt")
-Q2 = "DeepSeek-V4.1-Flash-1017-Q2.gguf"
-SLIM = "ds4-q2-slim.gguf"   # an install from before 2026-10-27: the same model without its inline Engram tables
-UNSLOTH = "unsloth/DeepSeek-V4.1-Flash-1017-GGUF"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ckpt  # noqa: E402  (tools/v41/ckpt.py: the checkpoint table, data/ds41/checkpoints.json)
+
+# the checkpoint's files and repositories come from its row in data/ds41/checkpoints.json (DS41_CHECKPOINT picks
+# another row than the default, 1017)
+try:
+    CK = ckpt.row()
+except ckpt.TableError as _e:
+    sys.exit(f"pick_model: {_e}")
+_MO = CK.get("models") or {}
+Q2 = (_MO.get("ds4_q2") or {}).get("file")
+SLIM = (_MO.get("ds4_q2") or {}).get("slim")   # an install from before 2026-10-27: the same model without its inline Engram tables
+UNSLOTH = (_MO.get("unsloth") or {}).get("repo")
 # the revision our numbers were measured on (2026-10-20): Unsloth re-made UD-IQ1_S / UD-IQ1_M / UD-Q2_K_XL on 10-28 with
 # the same sizes and new content - pinned until the new files are measured
-UNSLOTH_REV = "60ad3651"
-# rounds 323 / 325: the re-made UD-IQ1_S is closer to DeepSeek than the pinned one (89.1 / 91.5% vs 87.5 / 90.2% at bias 0.28), same size
-# 0.94: the re-made UD-Q2_K_XL too (round 309: a tie with the pinned one - general 95.08 vs 95.25%, code + maths 96.80 vs
+UNSLOTH_REV = (_MO.get("unsloth") or {}).get("revision")
+# measured: the re-made UD-IQ1_S is closer to DeepSeek than the pinned one (89.1 / 91.5% vs 87.5 / 90.2% at bias 0.28), same size
+# 0.94: the re-made UD-Q2_K_XL too (measured: a tie with the pinned one - general 95.08 vs 95.25%, code + maths 96.80 vs
 # 96.60%, KL lower) - new downloads get Unsloth's latest; an existing install is not re-downloaded
-UNSLOTH_REV_OF = {"UD-IQ1_S": "8a6ec9cf", "UD-Q2_K_XL": "8a6ec9cf"}
+UNSLOTH_REV_OF = dict((_MO.get("unsloth") or {}).get("revision_of") or {})
 GB = 1e9
-# Writing tok/s through the server at 192 / 128 / 96 / 64 GB of RAM (the 96 / 64 GB columns: 2026-10-28/29, a PC with
-# that much RAM simulated by locking the rest away, so neither Windows' file cache nor the pagefile could use it; "-" =
-# not measured).  The model to recommend on a PC with less than LOW_RAM_GB of RAM:
+# Writing tok/s through the server at 192 / 128 / 96 / 64 GB of RAM: the Unsloth UD-IQ1_S / UD-IQ1_M / UD-IQ2_XXS /
+# UD-IQ3_XXS rows are 0.95's (greedy whole-chat cards on real 192 / 128 / 96 / 64 GB, the release engine); the others are
+# 0.93's ("-" = not measured).  The model to recommend: UD-IQ2_XXS from LOW_RAM_GB up, UD-IQ1_M below it.  On a 64 / 96 GB
+# PC UD-IQ1_M at route bias 0.10 (the launcher sets it there: ds41_local.LOW_RAM_BIAS) agrees more than UD-IQ2_XXS at 0.28
+# at about its speed, measured on real 64 / 96 GB with the release engine: 89.9 / 90.0% top-1 general agreement vs
+# 87.8 / 89.5%, and 35.0 / 40.5 vs 35.3 / 40.9 tok/s at the default sampling (two seeds each).  UD-IQ1_S at 0.10 is the
+# faster choice there (39.9 / 44.9 tok/s, 88.8 / 89.6%).
+PICK = "UD-IQ2_XXS"
+HIGH_RAM_PICK = PICK   # (0.93-0.94's name)
 LOW_RAM_GB = 110
-LOW_RAM_PICK = "UD-IQ1_S"
-# ... and on one with HIGH_RAM_GB or more (0.93's final cards: UD-IQ2_XXS writes about as fast as the default - 41.1 vs
-# 40.7 tok/s greedy, 39.7 vs 40.3 at the shipped sampling - agrees more, 91.1 / 94.5% vs 89.9 / 93.1% at the shipped bias, and is 65 GB smaller; at 128 GB it writes 5% slower,
-# 34.0 vs 35.9 tok/s, and the answers are worth that: 57 vs 52 of 99 on the benchmark)
-HIGH_RAM_GB = 120
-HIGH_RAM_PICK = "UD-IQ2_XXS"
+LOW_RAM_PICK = "UD-IQ1_M"
 # (menu name, GB on disk, writing tok/s, top-1 agreement with DeepSeek's API on general text: at the shipped route bias 0.28 for
-# the default and Unsloth (rounds 314-325), exact routing for GSQ and EXL3, which were not measured at 0.28)
-DEFAULT = ("ds4 Q2 (the default)", 366, "41 / 36 / 27 / 20", "89.9%")   # 96 / 64: rounds 234 (reserve 28 + read-ahead 8)
+# the default and Unsloth (measured), exact routing for GSQ and EXL3, which were not measured at 0.28)
+DEFAULT = ("ds4 Q2 GGUF", 366, "41 / 36 / 27 / 20", "89.9%")   # 96 / 64: measured (reserve 28 + read-ahead 8)
 GSQ = {   # file -> name, GB without Engram, speed, agreement, ISTA build name
     "ds41-gsq-iq2_xs.gguf": ("GSQ IQ2_XS", 159, "38 / 26 / - / -", "90.0%", "IQ2_XS"),
     "ds41-gsq-iq2_xxs.gguf": ("GSQ IQ2_XXS", 142, "41 / 32 / - / -", "87.8%", "IQ2_XXS"),
     "ds41-gsq-iq1_m.gguf": ("GSQ IQ1_M", 125, "42 / 37.5 / 34 / 28", "85.5%", "IQ1_M"),
 }
 UNSLOTH_Q = {   # quant -> GB to download (its Engram included), speed, agreement, its Engram tables
-    "UD-IQ1_S": (233, "41 / 41 / 36 / 31", "89.1%", "IQ4_NL"),   # 41.0 / 40.6 / 36.5 / 30.6 tok/s (round 325); 89.1 / 91.5 / 95.3%, rev 8a6ec9cf
-    "UD-IQ1_M": (250, "-", "-", "IQ4_NL"),
-    "UD-IQ2_XXS": (301, "41 / 34 / 29 / 21", "91.1%", "Q5_K"),    # 41.1 / 34.0 / 29.3 / 21.0 tok/s (round 317); 91.1 / 94.5 / 95.9% at bias 0.28
+    "UD-IQ1_S": (233, "50 / 49 / 44 / 40", "89.1%", "IQ4_NL"),   # 96 / 64: at bias 0.10 (43.9 / 40.3; 89.6 / 88.8%)   # 0.95: 49.8 / 48.9 / 48.5 / 45.0 tok/s; 89.1 / 91.5 / 95.3%, rev 8a6ec9cf
+    "UD-IQ1_M": (250, "48 / 47 / 40 / 35", "89.4%", "IQ4_NL"),   # 96 / 64: at bias 0.10 (40.2 / 35.2; 90.0 / 89.9%)   # 0.95: 48.1 / 46.6 / 46.2 / 41.5 tok/s; 89.4% general at 192 GB
+    "UD-IQ2_XXS": (301, "44 / 44 / 42 / 36", "91.1%", "Q5_K"),    # 0.95: 43.7 / 43.7 / 41.6 / 36.2 tok/s (44.6 at 192 on the final build); 91.1 / 94.5 / 95.9% at bias 0.28
     "UD-Q2_K_XL": (335, "31 / 27 / 23 / 15", "92.5%", "Q5_K"),    # 31.3 / 26.6 / 22.9 / 15.2 tok/s; 92.5 / 95.3 / 97.0% - the quality pick
-    "UD-IQ3_XXS": (395, "28 / 23 / 18 / 12", "92.7%", "the default's"),   # 28.2 / 22.8 / 18.3 / 11.7 tok/s; 92.7 / 95.9 / 97.4%; its Q6_K Engram tables are not read (the default's)
+    "UD-IQ3_XXS": (395, "28 / 26 / 23 / 19", "92.7%", "the default's"),   # 0.95: 27.8 / 25.8 / 23.2 / 18.7 tok/s (0.93: 28 / 23 / 18 / 12); 92.7 / 95.9 / 97.4%; its Q6_K Engram tables are not read (the default's)
     "UD-IQ3_S": (424, "-", "-", "IQ4_NL"),
     "UD-Q3_K_XL": (485, "-", "-", "exact"),
     "UD-Q4_K_XL": (501, "-", "-", "exact"),
     "UD-Q8_K_XL": (508, "-", "-", "exact"),
 }
-TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ3_XXS": " (most exact)", "UD-IQ2_XXS": " (128 GB and up)"}   # the picks the menu text below explains
+TAG = {"UD-Q2_K_XL": " (quality)", "UD-IQ3_XXS": " (most exact)", "UD-IQ2_XXS": " (110 GB and up)",
+       "UD-IQ1_M": " (under 110 GB)", "UD-IQ1_S": " (fastest)"}   # the picks the menu text below explains
 EXL3 = {   # folder in exl3/ -> name, GB to download, speed, agreement, Hugging Face repo
     "DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw": ("EXL3 2.5 bpw", 185, "25 / - / - / -", "94.4%",
-                                             "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw"),   # round 238
+                                             "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw"),   # measured
 }
+# the menu's rows are 1017's measurements: a checkpoint without that file (or repository) offers none of them
+EXL3 = {d: v[:4] + ((_MO.get("exl3") or {})[d],) for d, v in EXL3.items() if d in (_MO.get("exl3") or {})}
+if not UNSLOTH:
+    UNSLOTH_Q = {}
+if not (_MO.get("gsq") or {}).get("repo"):
+    GSQ = {}
 EXL3_MIN_RAM_GB = 180   # its experts are 159 GiB: below ~192 GB of RAM most of them would come from the SSD (not measured)
 
 
@@ -212,8 +230,8 @@ def custom_help(m):
     print(f"""
   Your own model: make the folder {os.path.join(m, "custom")} and copy it there, then start again.
     - a GGUF of DeepSeek-V4.1-Flash-1017 with all 384 experts: one .gguf file, or a split model's files together
-      (a split model carries its own Engram tables; one .gguf file needs the default model installed as well)
-    - or a folder of EXL3 experts (with its config.json), which also needs the default model
+      (a split model carries its own Engram tables; one .gguf file needs the ds4 Q2 GGUF installed as well)
+    - or a folder of EXL3 experts (with its config.json), which also needs the ds4 Q2 GGUF
   Start DeepSeek.bat then offers it here, and the Setup card on the chat page lists it.  A file this engine cannot
   run is refused with the reason.
 """)
@@ -228,7 +246,7 @@ def first():
     ram = ram_gb()
     rec = SP.recommended(ram)
     picks = [("default", DEFAULT[0], DEFAULT[1], DEFAULT[2], DEFAULT[3], "")]
-    for q in ("UD-IQ1_S", "UD-IQ2_XXS", "UD-Q2_K_XL", "UD-IQ3_XXS"):
+    for q in [q for q in ("UD-IQ1_S", "UD-IQ1_M", "UD-IQ2_XXS", "UD-Q2_K_XL", "UD-IQ3_XXS") if q in UNSLOTH_Q]:
         gb, tps, agr, eng = UNSLOTH_Q[q]
         # a model that reads the default's Engram tables needs the default as well: the disk column counts both
         picks.append((q, "Unsloth " + q + TAG.get(q, ""), gb + (DEFAULT[1] if eng == "the default's" else 0), tps, agr, ""))
@@ -274,13 +292,12 @@ def main():
         return first()
     m = models_dir()
     if not os.path.isdir(m):
-        sys.exit(f"No model folder at {m} yet - run Start DeepSeek.bat first: it sets up the default model.")
-    base = Q2 if os.path.exists(os.path.join(m, Q2)) else SLIM if os.path.exists(os.path.join(m, SLIM)) else None
+        sys.exit(f"No model folder at {m} yet - run Start DeepSeek.bat first: it sets up a model.")
+    base = Q2 if Q2 and os.path.exists(os.path.join(m, Q2)) else SLIM if SLIM and os.path.exists(os.path.join(m, SLIM)) else None
     cur = current()
     now = cur if cur and os.path.exists(cur if os.path.isabs(cur) else os.path.join(m, cur)) else base
     ram = ram_gb()
-    low = ram is not None and ram < LOW_RAM_GB
-    high = ram is not None and ram >= HIGH_RAM_GB
+    rec_q = LOW_RAM_PICK if ram is not None and ram < LOW_RAM_GB else PICK
     print(f"Model folder: {m}" + (f"   (this PC: {ram} GB of RAM)" if ram else "") + "\n")
     print("     model                                     disk     writing tok/s at             agreement with")
     print("                                                        192 / 128 / 96 / 64 GB RAM   DeepSeek's API")
@@ -289,14 +306,14 @@ def main():
     def row(kind, path, name, gb, tps, agr, note=""):
         menu.append((kind, path))
         mark = "  <- now" if kind == "use" and path == now else ""
-        rec = "  <- recommended for this PC" if (low and LOW_RAM_PICK in name) or (high and HIGH_RAM_PICK in name) else ""
+        rec = "  <- recommended for this PC" if ("Unsloth " + rec_q + " ") in (name + " ") else ""
         print(f"  {len(menu):>2}. {name:<39} {gb:>4} GB   {tps:<28} {agr:<8}{note}{mark}{rec}")
 
     if base:
         row("use", base, *DEFAULT)
     for f, (name, gb, tps, agr, _) in GSQ.items():
         if os.path.exists(os.path.join(m, f)):
-            row("use", f, name, gb, tps, agr, "  (+ the default's Engram)")
+            row("use", f, name, gb, tps, agr, "  (+ the ds4 Q2 file's Engram)")
     for q, (gb, tps, agr, eng) in UNSLOTH_Q.items():
         p = unsloth_first(m, q)
         if p:
@@ -304,7 +321,7 @@ def main():
     for d, (name, gb, tps, agr, _) in EXL3.items():
         p = exl3_ready(m, d)
         if p and base:
-            row("use", p, name, gb, tps, agr, "  (+ the default)")
+            row("use", p, name, gb, tps, agr, "  (+ the ds4 Q2 file)")
     free = shutil.disk_usage(m).free
 
     def room(gb):   # what a build / download says when it would not fit (picking it is refused below)
@@ -312,7 +329,7 @@ def main():
 
     gsq_todo = [(f, k) for f, k in GSQ.items() if not os.path.exists(os.path.join(m, f))]
     if gsq_todo and base:
-        print("\n  Build (ISTA-DASLab's GSQ-RCO experts into a copy of the default; 20-30 min at 100 MB/s):")
+        print("\n  Build (ISTA-DASLab's GSQ-RCO experts into a copy of the ds4 Q2 GGUF; 20-30 min at 100 MB/s):")
         for f, (name, gb, tps, agr, _) in gsq_todo:
             row("build", f, "build " + name, gb, tps, agr, room(gb))
     uns_todo = [q for q in UNSLOTH_Q if not unsloth_first(m, q)]
@@ -323,7 +340,7 @@ def main():
             row("download", q, "download Unsloth " + q + TAG.get(q, ""), gb, tps, agr, f"  ({eng} Engram){room(gb)}")
     x3_todo = [d for d in EXL3 if not exl3_ready(m, d)]
     if x3_todo and base:
-        print("\n  Download EXL3 2.5 bpw (exllamav3's format on the default's dense layers; 100 MB/s = ~30 min; 192 GB of RAM")
+        print("\n  Download EXL3 2.5 bpw (exllamav3's format on the ds4 Q2 GGUF's dense layers; 100 MB/s = ~30 min; 192 GB of RAM")
         print("  and an internal NVMe drive).  Unsloth UD-Q2_K_XL above agrees more AND writes faster - prefer it:")
         for d in x3_todo:
             name, gb, tps, agr, _ = EXL3[d]
@@ -331,17 +348,12 @@ def main():
             row("download", d, "download " + name.split(" (")[0], gb, tps, agr,
                 ("  - needs ~192 GB of RAM" if small else "") + room(gb))
     print("\n  Agreement: teacher-forced top-1 with DeepSeek's own model, general text, as shipped; exact routing for GSQ and")
-    print("  EXL3 (code + maths in the README).  From 120 GB of RAM: Unsloth UD-IQ2_XXS is the pick - on 192 GB it writes about")
-    print("  as fast as the default (41.1 vs 40.7 tok/s greedy, 39.7 vs 40.3 at the shipped sampling), on 128 GB 5% slower (34")
-    print("  vs 36), and it agrees more (91.1%, and 94.5% on code + maths against the default's 89.9 / 93.1%), from 65 GB less")
-    print("  disk; Unsloth UD-Q2_K_XL is the")
-    print("  quality pick (31 tok/s, 92.5% / 95.3%) - it agrees more than EXL3 2.5 bpw and writes ~25% faster; UD-IQ3_XXS is")
-    print("  the most exact (28 tok/s, 92.7% / 95.9%), UD-Q2_K_XL the faster of the two.  With less")
-    print("  RAM a smaller file writes faster (more of it fits; the rest is read from the SSD on every token): under")
-    print("  110 GB, Unsloth UD-IQ1_S, 36 / 31 tok/s at 96 / 64 GB against the default's 27 / 20, about one point lower")
-    print("  agreement.  (Measured on an RTX 3090.)\n")
+    print("  EXL3 (code + maths in the README).  Unsloth UD-IQ2_XXS is the pick from 110 GB of RAM: 44 tok/s at 192 and 128 GB,")
+    print("  91.1% (94.5% on code + maths).  Below 110 GB Unsloth UD-IQ1_M is: there the 1-bit files run at route bias 0.10, and")
+    print("  UD-IQ1_M agrees more than UD-IQ2_XXS (89.9 vs 87.8% at 64 GB) at its speed; UD-IQ1_S is faster (40 vs 35 tok/s).  Unsloth UD-Q2_K_XL is the quality pick (31 tok/s, 92.5% / 95.3%) - it agrees more than EXL3 2.5 bpw")
+    print("  and writes ~25% faster; UD-IQ3_XXS is the most exact (28 tok/s, 92.7% / 95.9%).  (Measured on an RTX 3090.)\n")
     if not menu:
-        sys.exit("No model yet - run Start DeepSeek.bat first: it downloads the default one.")
+        sys.exit("No model yet - run Start DeepSeek.bat first: it sets up a model.")
     pick = input(f"Number to use (1-{len(menu)}), Enter = keep the current one: ").strip()
     if not pick:
         print("Nothing changed.")
@@ -374,8 +386,8 @@ def main():
     elif kind == "download":
         gb = UNSLOTH_Q[f][0]
         if UNSLOTH_Q[f][3] == "the default's" and base is None:
-            sys.exit(f"Unsloth {f} reads its Engram tables from the default (ds4 Q2 GGUF), which is not in {m}: "
-                     "download the default first - nothing changed.")
+            sys.exit(f"Unsloth {f} reads its Engram tables from the ds4 Q2 GGUF, which is not in {m}: "
+                     "download the ds4 Q2 GGUF first - nothing changed.")
         free = shutil.disk_usage(m).free
         if free < (gb + 5) * GB:
             sys.exit(f"Not enough space for Unsloth {f}: it needs ~{gb + 5} GB free in {m}, there are {free / GB:.0f} GB.")

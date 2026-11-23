@@ -200,6 +200,14 @@ public:
     /// `f`, byte-identically to the pre-fork code.  Every job in `f`'s batch must share `n_embd`/`n_ff` (a model's
     /// geometry is uniform across its format classes; a mixed-geometry batch falls back to one call per job).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    /// run_split_multi_native in two halves (STRATA_CPU_SHARE_FIRST, Basalt b3ffc0021): start publishes the batch's
+    /// gate/up phase, which the workers take while the caller does other work (the GPU launches); finish has the
+    /// caller join that phase, then runs the intermediate quantization and the down phase as run_split_multi_native
+    /// does.  Same tasks, same row ranges, same kernels: the result is the same bytes.  A batch run_split_multi_native
+    /// would split (more than kMaxSplitMulti experts, or mixed geometry) runs whole in start.  `jobs`, their
+    /// activations and their outputs stay untouched by the caller until finish returns.
+    void start_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    void finish_split_multi_native();
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -237,6 +245,15 @@ public:
 
 private:
     int phase_tasks(int64_t rows) const;
+    /// run_split_multi_native's second half for a batch of `nb` experts at `mjobs_` whose gate/up phase is done: the
+    /// intermediate quantization (and GLM's LoRA a.h), the down phase, the LoRA's down delta.  Adds to the ms counters.
+    void split_multi_native_tail(const NativeFmt& f, int nb, std::chrono::steady_clock::time_point a,
+                                 std::chrono::steady_clock::time_point b);
+    // a started batch (start_split_multi_native): its epoch, format, experts (0: none pending) and start time
+    uint32_t pend_epoch_ = 0;
+    const NativeFmt* pend_f_ = nullptr;
+    int pend_n_ = 0;
+    std::chrono::steady_clock::time_point pend_t0_{};
     int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);

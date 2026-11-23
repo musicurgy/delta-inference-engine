@@ -148,6 +148,9 @@ def write(args):
             log(f"  [{i + 1}/{len(pl)}] {name} {kind} {a.nbytes / 1e6:.1f} MB")
     w.close()
     os.replace(args.out + ".tmp", args.out)
+    # R-2: the checkpoint it was made from, beside it (<out>.ckpt.json; DS41_CHECKPOINT or V41_SRC_URL names it)
+    import ckpt
+    ckpt.stamp_output(args.out, "drafter_source" if mtps and args.no_vision else "vision" if not mtps else "sidecar")
     log("done")
 
 

@@ -1,5 +1,6 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/q8_1_cpu.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -382,6 +383,10 @@ void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
 int native_gu_mt_min(int) { return 2; }
 void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
+// STRATA_CPU_Q8_1 (q8_1_cpu.hpp): off without native experts - no pool row reads a native activation
+bool cpu_q8_1_on() noexcept { return false; }
+bool cpu_q8_1_act(int) noexcept { return false; }
+void q8_1_quant_row(const float*, void*, int64_t) { std::abort(); }
 #endif
 
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {

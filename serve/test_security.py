@@ -18,7 +18,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import (ByteTokenizer, MockEngine, Service, allowed_hosts_of, host_allowed,  # noqa: E402
-                          host_name, host_names_for, origin_allowed, serve)
+                          host_name, host_names_for, origin_allowed, serve, Server)
+from http.server import BaseHTTPRequestHandler  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = {"localhost", "127.0.0.1", "::1"}
@@ -92,6 +93,23 @@ class OriginCheck(unittest.TestCase):
         for origin in ("http://evil.example.com", "http://1.2.3.4", "http://192.168.1.99:8095", "null", "",
                        "http://localhost.evil.com", "https://box.evil.com", "://x"):
             self.assertFalse(origin_allowed(origin, "127.0.0.1:8095", names, ["https://chat.example.com"]), origin)
+
+
+class ListenAddress(unittest.TestCase):
+    """The server listens without a host name lookup: http.server's own server_bind asks socket.getfqdn, which on a PC
+    with a stalled reverse lookup held every start for tens of seconds (after Niko1221/Strata 3e1fcaaf)."""
+
+    def test_bind_does_not_look_up_a_host_name(self):
+        looked = AssertionError("server_bind looked up a host name")
+        with mock.patch.object(socket, "getfqdn", side_effect=looked), \
+                mock.patch.object(socket, "gethostbyaddr", side_effect=looked):
+            with Server(("127.0.0.1", 0), BaseHTTPRequestHandler) as s:
+                self.assertNotEqual(s.server_address[1], 0)
+
+    def test_server_name_and_port_are_the_address(self):
+        with Server(("127.0.0.1", 0), BaseHTTPRequestHandler) as s:
+            self.assertEqual((s.server_name, s.server_port), ("127.0.0.1", s.server_address[1]))
+            self.assertGreater(s.server_port, 0)
 
 
 class OverHttp(unittest.TestCase):
@@ -227,6 +245,27 @@ class OverHttp(unittest.TestCase):
                 self.assertIn("evil.example.com", log)
         self.assertEqual(self.req("POST", "/v1/chat/completions", self.chat_body(),
                                   {"Content-Type": "text/plain", "Origin": "null"})[0], 403)
+
+    def test_empty_origin_and_get_v1_are_checked(self):
+        # 0.95 (Niko1221/Strata e23bad99b): an Origin header that is present but empty is not "no Origin", and GET /v1
+        # goes through the same check (no content type to check there); no Origin and the own page pass as before
+        self.start()
+        self.assertEqual(self.req("POST", "/v1/chat/completions", self.chat_body(),
+                                  {"Content-Type": "application/json", "Origin": ""})[0], 403)
+        for path in ("/v1/models", "/v1/status"):
+            for origin in ("http://evil.example.com", "null", ""):
+                self.assertEqual(self.req("GET", path, headers={"Origin": origin})[0], 403, (path, origin))
+            self.assertEqual(self.req("GET", path)[0], 200, path)
+            self.assertEqual(self.req("GET", path, headers={"Origin": f"http://127.0.0.1:{self.port}"})[0], 200, path)
+        # /models and /models/{id} are /v1/models under llama-server's names: the same check
+        for path in ("/models", f"/models/{self.svc.model}", f"/v1/models/{self.svc.model}"):
+            for origin in ("http://evil.example.com", ""):
+                self.assertEqual(self.req("GET", path, headers={"Origin": origin})[0], 403, (path, origin))
+            self.assertEqual(self.req("GET", path)[0], 200, path)
+            self.assertEqual(self.req("GET", path, headers={"Origin": f"http://127.0.0.1:{self.port}"})[0], 200, path)
+        self.svc.api_key = "s3cret"
+        self.assertEqual(self.req("GET", "/v1/models", headers={"Origin": "http://evil.example.com",
+                                                               "Authorization": "Bearer s3cret"})[0], 200)
 
     def test_own_and_local_pages_pass(self):
         self.start()

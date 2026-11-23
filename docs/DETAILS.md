@@ -826,7 +826,11 @@ print(r.choices[0].message.content)
   measured over its last 2,000 words and punctuation marks (counting passages over the last 30,000 words), and its
   last 2,048 characters are checked for a period of at most 64 characters (#1753: a loop written as one long word,
   such as a 24k-digit string cycling an 11-digit pattern, is a single word to the count and never repeats one
-  token); a periodic tail counts as fully repeated. If at
+  token); a periodic tail counts as fully repeated. `STRATA_SERVE_LOOP_SHAPE=1` (off by default) also counts
+  sentences that differ only in their numbers (after FLE Link's loop guard): in the last 4,000 characters, at least 24
+  sentences of 25+ characters whose commonest shape, numbers written as `#`, makes up at least 14 of them and 40%.
+  It is off because ordinary enumeration has that shape: replayed on 855 DeepSeek bake-off reasoning traces, it alone
+  would have cut 9, 8 of them correct answers (row-by-row table checks, lists of differences or intervals). If at
   least 25% belong to 12-word passages seen three times, `"stop"` ends the reply there as `"length"` and says so in
   the server window. `"recover"` stops and drains that generation, then goes on once from all its generated token
   ids with the template's low-effort sentence in place of the xhigh one in the first system message (a splice of
@@ -877,7 +881,7 @@ print(r.choices[0].message.content)
   does. A request without deferred tools is rendered exactly as before. `"tool_search": "off"` in
   `strata-<model>.json` lists every tool again. Whether the model calls a tool it found this way as reliably as one
   in the list is not measured yet.
-- **Loop guard (0.94, on by default).** When an agent makes the same tool call (same name and arguments) 4 times in a row, the server adds one short note before the model's next turn telling it to try something else or stop, and logs `loop guard: <tool> repeated N times`; `"loop_guard": {"repeats": N}` or `false` in `strata-<model>.json` (other requests are rendered exactly as before).
+- **Loop guard (0.94, on by default).** When an agent makes the same tool call (same name and arguments) 4 times in a row, the server adds one short note before the model's next turn telling it to try something else or stop, and logs `loop guard: <tool> repeated N times`; Since 0.95 it also counts over a window: a call that the last 12 tool calls since the user's last message hold 3 times with the same arguments and the same result (so `read A, read B, read A, read B, read A` is caught too) gets a note, logged as `loop guard: <tool> made N times in the last 12 calls`; a user's bare "continue" or Claude Code's `<system-reminder>` text does not start the count over. `"loop_guard": {"repeats": N}`, `{"window": false}` (the window off) or `false` in `strata-<model>.json` (other requests are rendered exactly as before).
 - **Streamed tool calls in the strict shape (0.94).** On `/v1/chat/completions` a call's first delta carries its id, type and function name and the later ones only `arguments`; no field is ever `null` and no `tool_calls` array is empty (OpenCode reportedly fails on both).
 - **Effort changes are logged (0.94).** DeepSeek V4.1's template puts `Reasoning Effort: N` at the start of the prompt, so changing the effort, or turning thinking on or off, inside a conversation reads it all again; the server logs `effort changed (high -> max): the whole conversation is read again` when that happens (nothing else changes).
 - **Timing lines (opt-in, 0.94).** `STRATA_TIMING=1` or `"timing": true` in `strata-<model>.json` logs one `timing` line per chat request with the ms between its server-side steps (received, parsed, converted, images, rendered, tokenized, prepared, turn, loaded, sent, first line, first token, first sent, done), to see where the time outside the engine's prompt timer goes; off by default.
@@ -908,6 +912,28 @@ print(r.choices[0].message.content)
   second call's parameters merge into the first). Anything else in those forms stays the text it is. Measured on
   1,462 agent turns (Qwen3.8 under Claude Code, from signalnine/q27's drift corpus): 98.3% read as intended with it,
   92.9% without. Off by default, so what a client gets back is unchanged unless you turn it on.
+- **Calls of tools the request did not declare (`undeclared_tool_calls`, default `"call"`).** A well-formed call of a
+  tool the request did not declare comes back as a tool call, as it always has here (upstream 31c02061): an agent can
+  answer the model with the tool names it has and ask again, which a call kept as text never lets it do.
+  `"undeclared_tool_calls": "text"` in `strata-<model>.json` (opt-in; upstream Strata's default, 0.2.12 #4622) keeps it
+  as the text the model wrote instead, with `strata_rejected_tool_calls` beside it (`[{"name": ..., "reason":
+  "undeclared"}]`, on the chat completion and its last stream chunk, and on the Anthropic message and its
+  `message_delta` event); the server log names them too. With `"text"`, on `/v1/chat/completions` and `/v1/messages`
+  this holds also for a request that declared no tool at all. The environment variable `STRATA_UNDECLARED_TOOL_CALLS`
+  sets the same; the config wins. Only a call the parser reads as a whole call is returned; prose and quoted examples
+  stay text.
+- **Calls shown in code are text.** A call written inside a code fence or an indented code block (4 spaces or a tab
+  after a blank line) is an example, never run - also with DeepSeek's real `｜DSML｜` token, and its calls block stays in
+  the text as written. A fence closes only on a line of at least as many of its character (CommonMark): a ```` ``` ````
+  example inside a ```` ```` ```` file stays inside it (upstream Strata 0.2.9, #4702 / #4703).
+- **An empty chat request is a 400.** `/v1/chat/completions` and `/v1/messages` answer a request with no message, or
+  only messages with nothing in them (blank text, no parts), with a 400 instead of a reply to nothing (DeepSeek's
+  encoder renders no message as `<｜begin▁of▁sentence｜>` alone).
+- **Forced `tool_choice` with several tools.** `"required"` (Anthropic `{"type": "any"}`) writes only the opening of
+  the calls block (`<｜DSML｜ calls>`; Qwen: `<tool_call>`) and the model writes the tool's name itself; a named
+  choice, or `"required"` with one tool, still opens the whole call. Upstream Strata 0.2.12 (PR #4828): with the name
+  left half-written the model went on with names the request never offered - 0 of 24 forced runs made a call, 24 of
+  24 after (measured on Qwen3.8; not measured on DeepSeek-V4.1 here).
 - **opencode's environment block in the user turn (opt-in).** opencode writes an `<env>` block (working directory,
   today's date) near the start of its system message, ahead of ~40K characters of instructions and tool definitions that
   are the same in every session. The prefix cache only reuses a prompt's start, so every new folder and every new day
@@ -1313,7 +1339,10 @@ more than 16 MiB apart. A symbolic link, a second hard link and a file with one 
 **Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
 decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
 re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
-seed** are honored per request (OpenAI and Anthropic fields), and so are stop strings (OpenAI `stop`, a string or up
+seed** are honored per request (OpenAI and Anthropic fields; a sampled request without a seed, and none in the config's
+`sampling` block or the shared settings, gets a new random one when `STRATA_SERVE_SEED=1` is set before starting -
+printed in the server window so `"seed": N` repeats it; unset or 0, the default in `Start DeepSeek.bat` for now, sends
+none, as before, and the engine goes on from its start seed, so the first sampled reply after a start is the same one), and so are stop strings (OpenAI `stop`, a string or up
 to 4; Anthropic `stop_sequences`): the answer ends before the first one, which is not sent, and the engine stops
 there (`finish_reason` "stop"; `stop_reason` "stop_sequence" with `stop_sequence` set to the one found); with the default adaptive expert tier a sampled result
 is not reproducible run to run - for seed-reproducible output add `--adapt-every 100000` (static residency) to the
@@ -1410,7 +1439,9 @@ levels, the freeform `apply_patch` tool and parallel tool calls. Save it (`curl 
 Codex wants its base instructions inside a catalog entry (`base_instructions`): point
 `"codex_base_instructions_file"` in `strata-<model>.json` at a text file with them (for example the instructions
 from the `models.json` Codex or DeepSeek ship), or paste them into the saved file. An empty `base_instructions` gives
-Codex no system prompt, so do not use the catalog without them.
+Codex no system prompt, so do not use the catalog without them. Newer Codex builds also read a `"models"` list from
+`/v1/models`; Strata writes it there only with `STRATA_SERVE_MODELS_KEY=1` and base instructions configured (off
+by default: once Codex reads an entry, its prompt is the entry's instructions instead of its own fallback).
 
 **Codex's compaction (opt-in: `"codex_compaction_cache": true` in `strata-<model>.json`).** When the context fills up (or
 on `/compact`), Codex sends the conversation once more with a request to summarize it, and with `tools: []`. The template
@@ -2035,6 +2066,97 @@ model's.
 **Measured here** (Q2_0, fixed experts, 2,557 teacher-forced tokens of code, a document and a chat): the top-1 token
 changes at 10% of positions, mean KL from the stock model 0.063 nats (max 4.1), perplexity +15% on code, +2.3% on
 the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
+
+---
+
+## DeepSeek V4.1: switches on by default (0.95)
+
+`Start DeepSeek.bat` turns these on unless you set them yourself; `set NAME=0` before starting turns each one off
+(`STRATA_KEEP_FIX_GIB` is a size, not a switch: `set STRATA_KEEP_FIX_GIB=4.3` gives the old reserve).
+`tools/v41/serve/ds41-engine.sh` (Linux) and the manual Windows configs `strata-ds41*-win.json` carry the ones marked
+"all" (`NAME=0 ./ds41-engine.sh`; in a config's `"env"` block, which wins over the environment, edit the value to
+`"0"`). The ones marked "launcher" were measured only through `Start DeepSeek.bat` on UD-IQ2_XXS; those configs run
+another model with its Q2_K drafter and keep them off.
+
+"Exact" means the same text as with the switch off at the same expert placement. Three of them move a few MiB of VRAM
+or the verify width, so the text a given seed writes can change; the 0.95 release bake-off checks their quality.
+
+| Switch | Default | Where | What it does | Off |
+|---|---|---|---|---|
+| `STRATA_SINK_REJECT` | `85000` | all | Attention-sink rejection: a sampled token whose row turns into an attention sink (column 2455 of the residual over the threshold after the last layer, after which the model writes noise) is replaced by the next candidate of its draw; control tokens are never held, rejected or used as a replacement. It never fired in the 99-question bake-off (same score without it). `STRATA_SINK_TRACE=1` prints the values. | `STRATA_SINK_REJECT=0` |
+| `STRATA_DSPARK_EAGER` | `1` | all | The DSpark drafter loads at start, before the server reports ready, instead of inside the first request. | `STRATA_DSPARK_EAGER=0` |
+| `STRATA_D3_DMA_EARLY` | `1` | launcher | Decode: every expert-miss copy of a layer is issued at once, before the kernels that use the experts already on the GPU; each PCIe kernel waits for its own copies only. Same experts, slots and kernels (exact). Needs `STRATA_D3_DMA_STREAM=1` (the launcher sets it). | `STRATA_D3_DMA_EARLY=0` |
+| `STRATA_SNAP_TAIL` | `1024` | all | Each cached conversation also keeps its last 1024 sliding-window rows in RAM, so a request that shares a prefix ending up to that far before the snapshot (an edited last message, a new question about the same document) resumes there instead of re-reading the prompt. | `STRATA_SNAP_TAIL=0` |
+| `STRATA_ZC_PRED` | `1` | launcher | Decode: the prefetch predictions come back as a kernel write into pinned host memory, not as a copy queued behind a prefetch DMA. Exact. Measured: +0.1-0.7%. | `STRATA_ZC_PRED=0` |
+| `STRATA_FUSE` | `1` | launcher | Decode: the router tail and the prefetch top-16 run as one kernel each, and the shared expert's clamped SwiGLU as one; each is bit-identical to the chain it replaces. It uses a few MiB less VRAM, which can move expert placement and so the text. Measured: +1.3-1.4% decode. | `STRATA_FUSE=0` |
+| `STRATA_X3` | `1` | launcher | Decode: each layer's last dense graph is launched together with the next layer's first (the same ops in the same order; exact with `STRATA_FUSE`). Measured: +0.2-1.3%. | `STRATA_X3=0` |
+| `STRATA_FOLDS` | `1` | launcher | Decode: the residual add folded into hc_post, and the drafter's clamped SwiGLU as one kernel. Exact. | `STRATA_FOLDS=0` |
+| `STRATA_DSPARK_GATE` | `1` | launcher | The drafts a pass verifies are chosen by expected tokens per ms, from the drafter's acceptance calibrated online; it replaces the `STRATA_DSPARK_CONF` / `STRATA_DSPARK_CUM` stop. The output distribution is exact; the text a given seed writes moves with the verify width. | `STRATA_DSPARK_GATE=0` |
+| `STRATA_DSPARK_LGATE` | **on** (launcher) | 0.95 default, sampled replies only (no effect at greedy): +2.0% chat, +2.3% agent turns; four bake-offs average 56 vs 58 without it (inside the noise) | On DSpark passes with sampled drafts (temperature above 0), the width comes from a learned acceptance predictor and acceptance coins drawn before the pass (coin-first); it replaces the gate there. Exact by construction (`test_ds41_lgate` checks it by simulation); same-seed texts move. `STRATA_DSPARK_LGATE_W=b,w0,...,w8` replaces the predictor's weights. | unset |
+| `STRATA_ENGRAM_READAHEAD` | **on** on the file-tier profile (64-128 GB) | exact | Engram rows read ahead in blocks, coalesced per table and block; a layer waits only for its own columns, and the next chunk is read behind the current one.  Prompts +1-2.5% at 96 / 128 GB.  `=N` (N >= 16) sets the block size; 0 = the old whole-chunk read. |
+| `STRATA_LOOKUP_LONG` | off | exact (drafts only) | The lookup drafter also tries older 8-token matches when the newest 256 give no full-length copy.  Fires only on very repetitive context (logs, tables): -18% passes there, nothing on chat or code. |
+| `STRATA_VRAM_RECORD` / `STRATA_VRAM_REPLAY` / `STRATA_VRAM_TRACE` | off | measurement only | Record the VRAM budget readings of one run and replay them in another, so expert placement (and so the text) is pinned for an exactness A/B. |
+| `STRATA_DSPARK_TRACE_X` | off | data collection | With `STRATA_DSPARK_TRACE`: extra trace fields for refitting the learned gate (pass ms and rows, think flag, the previous row's target entropy, the gate's width, per-draft top-4 mass, tv = sum min(p, q), p of the drafter's top choice). No output change. | unset |
+| `STRATA_LOOKUP_YIELD` | `1` | all | A lookup copy (`STRATA_SERVE_LOOKUP`) is taken only when its offer times the request's copy hit rate beats the drafter's expected accepted drafts; the offer starts at 8 tokens and doubles to 16 after a fully accepted copy. Measured with the gate: agent turns decode +24% (+20% alone), writing +0.6%. | `STRATA_LOOKUP_YIELD=0` |
+| `STRATA_KEEP_FIX_GIB` | `2.8` | launcher | A follow-up read as one batch of up to 512 new tokens frees this much of the GPU's expert cache for its batch (was 4.3 GiB, calibrated on long batches), so more hot experts stay on the card. Placement changes, so the text can. Measured: agent short turns decode +6.4%, writing +0.6%; safe down to 2.3 GiB. | `STRATA_KEEP_FIX_GIB=4.3` |
+
+`STRATA_CPU_SHARE_FIRST` was on in a release candidate and is off again: with expert placement pinned it still
+changes the text, and its gain was measured on another build.
+
+Opt-in (off unless you set them; `set NAME=...` before starting):
+- `STRATA_EXPERTS_DROP_MISS=5`: **experimental fast mode.** A routed expert of rank 5 or 6 is skipped when it is not
+  on the GPU (about 4% of routed expert uses at 192 GB). Measured: +6.8% decode at 192 GB (+8.7% over whole chats);
+  `=6` skips rank 6 only (+0.9%). It changes the answers: one 99-question bake-off scored 53 against 56 without it
+  (inside one run's noise, but lower), so it is not a default.
+- `STRATA_EXPERTS_USED_DECODE=5` / `4`: decode with 5 or 4 of the 6 routed experts per token (+1.9% / +9.4% at 192 GB,
+  +7.3% / +10% at 64 GB). A quality trade: one 99-question bake-off each scored 54 and 53 against 56.
+- `STRATA_IDLE_PREFETCH=1`: prefetch copies in chunks only while no demand copy waits (measured: the GPU stalled
+  12.6 ms a pass on prefetch copies at 192 GB), drained at the `--arena-adapt` sync points. Not recommended:
+  6-13% slower (it copies ~480 MB a pass, of which 42% is used).
+- `STRATA_X3B=1`: the next layer's decode work launched ahead behind a device gate, with a watchdog that opens a
+  gate the card has not opened in time; it sets `CUDA_MODULE_LOADING=EAGER` (unless you set it) so no kernel loads
+  inside an armed gate. `STRATA_X3B_SKIP_ENGRAM=1` keeps the Engram layers on the normal path. Not recommended:
+  in our last test a gate still timed out mid-run (the watchdog opened it) and it was not faster.
+- `STRATA_GATEUP_FUSE=1`, `STRATA_QFUSE=1` (exact with placement pinned, no measurable gain), `STRATA_PROMPT_FUSED=1` (fused
+  prompt-expert kernels: no gain on a 3090, rounding differs), `STRATA_SHARED_PREFIX=1` (redundant with the ordinary
+  prefix cache), `STRATA_CPU_Q8_1=1` (the CPU pool rounds activations as the card does), `STRATA_GPU_TIER_STATS=1`
+  (measurement).
+
+Still off (measurement and debugging): `STRATA_DMA_TRACE=1` (a `dma:` line every 32 verify passes),
+`STRATA_SNAP_TAIL_VERIFY=1` (checks each snapshot tail against the live window), `STRATA_DSPARK_HEAD_ROWS=1` (a decode
+experiment: the drafter head over the draft depth only), `STRATA_X3_STATS=1` (dense graph launches per pass).
+
+---
+
+## DeepSeek V4.1 switches renamed in 0.95
+
+The 0.95 release candidates introduced some DeepSeek V4.1 switches under internal working labels. They now have
+descriptive names. The old names still work, so a saved `set` line or script keeps its effect; when both are set,
+the new name wins.
+
+| Switch | Old name (still read) | What it does |
+|---|---|---|
+| `STRATA_FILE_TIER_UNMAP` | `STRATA_P3_UNMAP` | 1: the experts read from the SSD use unmapped, unbuffered files only (on by default in Start DeepSeek.bat; 0 turns it off) |
+| `STRATA_KV_GATHER` | `STRATA_P3_KVGATHER` | 1: a pass's attention keys and mask in one op each (off by default; needs the patched ggml) |
+| `STRATA_DSPARK_PARK` | `STRATA_P3_DSPARKPIN` | 1 / 2: keep the drafter's weights in pageable / pinned RAM while a long prompt frees its VRAM (off by default) |
+| `STRATA_DSPARK_PARK_FREE_GIB` | `STRATA_P3_DSPARKPIN_FREE_GIB` | the free RAM (GiB, default 8) that parking must leave |
+| `STRATA_FAST_TOPK` | `STRATA_P3_HOST_TOPK` | 0: the reference top-k candidate search (the fast one is on by default, same result) |
+| `STRATA_PINNED_STAGE` | `STRATA_P3_HOST_STAGE` | 0: logits and draft rows read without the pinned staging buffer (on by default) |
+| `STRATA_FATAL_ABORT` | `STRATA_P3_HOST_ABORT` | 1: a fatal error calls abort() on Windows too (a crash dump for a debugger) |
+| `STRATA_PROMPT_SWEEP_PB` | `STRATA_P3_SWEEP_PB` | a wider prompt batch for PCs with experts on the SSD - 0.95: 32768 by default at <= 64 GB of RAM (32-40K prompts +12-13%), 0 elsewhere; `=0` turns it off |
+| `STRATA_PROMPT_SWEEP_FIT` | `STRATA_P3_SWEEP_FIT` | 1: size a wide prompt batch from the VRAM it needs (set together with the wider batch) |
+| `STRATA_PROMPT_SWEEP_SLACK_GIB` | `STRATA_P3_SWEEP_SLACK_GIB` | VRAM (GiB, default 1.0) that budget leaves for the CUDA pool |
+| `STRATA_PROMPT_SWEEP_PROBE` | `STRATA_P3_SWEEP_PROBE` | 0: no test allocation of that budget |
+| `STRATA_PROMPT_SWEEP_PRESTAGE` | `STRATA_P3_SWEEP_PRESTAGE` | 0: that budget does not keep room for the layer prestage |
+| `STRATA_WIDE_PROMPT` | `STRATA_D11_WIDE_PROMPT` | 1: wide prompt batches (the launcher picks it) |
+| `STRATA_WIDE_PROMPT_MIN` | `STRATA_D11_WIDE_MIN` | the fewest new tokens a prompt needs for a wide batch |
+| `STRATA_PROMPT_SEED_VRAM` | `STRATA_D11_PROMPT_SEED_VRAM` | 1: refill the freed VRAM after a prompt with that prompt's experts (off by default) |
+| `STRATA_PROMPT_SEED_VRAM_MIN` | `STRATA_D11_PROMPT_SEED_VRAM_MIN` | the fewest routed tokens that make an expert a candidate for that |
+| `STRATA_RING_FIX` | `STRATA_D11_RINGFIX` | 0: turn off the state-ring fixes for live resumes (on by default) |
+| `STRATA_SERVE_SEED` | `STRATA_P3_SERVER_SEED` | 1: a sampled request without a seed gets a new random one (off by default) |
+| `STRATA_SERVE_LOOP_SHAPE` | `STRATA_P3_SERVER_LOOP_SHAPE` | 1: the loop check also counts sentences that differ only in numbers (off by default) |
+| `STRATA_SERVE_MODELS_KEY` | `STRATA_P3_SERVER_MODELS_KEY` | 1: `/v1/models` also carries Codex's `"models"` list (off by default) |
+| `DS41_CACHE_SLOTS` | `STRATA_P3_SERVER_CACHE_SLOTS` | `Start DeepSeek.bat`: how many whole conversations to keep in RAM (default 16) |
 
 ---
 

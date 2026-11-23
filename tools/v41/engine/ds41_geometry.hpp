@@ -9,12 +9,19 @@
 // + the I32 type maps.
 //
 // Header-only; reads the header region only (GgufModel mmaps it), no tensor data except the two I32 type maps.
+//
+// Day-0 tolerance (R-1 / R-18): the architecture comes from general.architecture against a whitelist (deepseek41 +
+// DS41_ACCEPT_ARCH) and the keys are read under its prefix; every guard names the value it saw; a Ds41Issues sink
+// (test_ds41_geometry --report) collects every problem in one pass instead of stopping at the first; type ids this
+// engine has no layout for (ik_llama's 144+) and mainline ggml's plain F8_E4M3 under id 43 are refused by name.
 #pragma once
 
 #include "strata/artifact/gguf_reader.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include "ds41_sys.hpp"
 #include <map>
@@ -41,6 +48,7 @@ struct Ds41ExpertMap {
 struct Ds41Geometry {
     int64_t n_embd = 0, n_layer = 0, n_head = 0, d_head = 0, d_rope = 0, r_q = 0, o_lora = 0, o_groups = 0;
     int64_t n_swa = 0, n_expert = 0, n_used = 0, n_ff = 0, n_shared = 0;
+    int64_t n_used_model = 0;   ///< the model's own experts per token (n_used before STRATA_EXPERTS_USED; 0 = n_used)
     double weights_scale = 0;
     bool norm_topk = false;
     int64_t hc = 0, hc_iters = 0;
@@ -177,24 +185,141 @@ inline std::string ds41_read_int_array(const std::string & path, const std::stri
     return "missing " + key;
 }
 
+// ------------------------------------------------------------------ architecture, types and the report sink
+/// The architectures the deepseek41 code path reads: `deepseek41`, plus any listed in DS41_ACCEPT_ARCH (comma
+/// separated, e.g. DS41_ACCEPT_ARCH=deepseek42 to try a same-family checkpoint on day 0).  An accepted architecture
+/// only gets past the name check: its keys are read under its own prefix ("deepseek42.") and every key, shape and
+/// tensor check below still applies.
+inline std::vector<std::string> ds41_accepted_archs() {
+    std::vector<std::string> v{ "deepseek41" };
+    if (const char * env = std::getenv("DS41_ACCEPT_ARCH")) {
+        const std::string s(env);
+        size_t a = 0;
+        while (a <= s.size()) {
+            size_t b = s.find(',', a);
+            if (b == std::string::npos) b = s.size();
+            std::string x = s.substr(a, b - a);
+            while (!x.empty() && (x.back() == ' ' || x.back() == '\t')) x.pop_back();
+            while (!x.empty() && (x.front() == ' ' || x.front() == '\t')) x.erase(0, 1);
+            if (!x.empty() && std::find(v.begin(), v.end(), x) == v.end()) v.push_back(x);
+            a = b + 1;
+        }
+    }
+    return v;
+}
+inline bool ds41_arch_accepted(const std::string & arch) {
+    const std::vector<std::string> v = ds41_accepted_archs();
+    return !arch.empty() && std::find(v.begin(), v.end(), arch) != v.end();
+}
+/// The file's general.architecture ("" when it has none).
+inline std::string ds41_arch(const GgufFile & g) {
+    const MetaValue * a = g.get("general.architecture");
+    return a ? a->s : std::string();
+}
+/// The prefix of the model's own keys: "<general.architecture>." ("deepseek41." for every V4.1 file; also when the
+/// file names none, so a report on such a file still lists the keys it lacks).
+inline std::string ds41_prefix(const GgufFile & g) {
+    const std::string a = ds41_arch(g);
+    return (a.empty() ? std::string("deepseek41") : a) + ".";
+}
+
+namespace ty {
+/// The vendored ggml's GGML_TYPE_COUNT (Q2_0 = 42 is its last type).  A tensor the dense loader hands to ggml needs a
+/// type below it: mainline ggml's F8_E4M3 (43) and our PTQ1_0 (143) are past it.  (ds41_dense.cpp's load_weights also
+/// refuses any type >= the GGML_TYPE_COUNT it was built with, so a newer ggml cannot slip past this constant.)
+constexpr uint32_t kGgmlTypes = 43;
+/// Type 43 is two formats.  Unsloth's DeepSeek-V4.1 Engram tables ("MXFP8", the one block_geometry knows: one E8M0
+/// scale + 32 E4M3 bytes per 32 values, 33 bytes) and mainline ggml's GGML_TYPE_F8_E4M3 (ggml 0.29 / llama.cpp
+/// v0.9.0, 2026-11: one E4M3 byte a value, block size 1, no scale in the block).  The header does not say which.
+constexpr uint32_t FP8_43 = 43;
+}
+
+/// Whether this engine knows GGUF type id `t` (has its block layout): ggml's types up to Q2_0 (42) that have one here,
+/// type 43 (above) and PTQ1_0 (143).  Not known: Q8_K / F64 / TQ1_0 / TQ2_0 / Q1_0 and every id past 143 - ik_llama's
+/// IQK and trellis types sit at 144+ (an Agention file stores its trellis rows as ik's 144-149), so such a file is
+/// refused by name instead of read with a wrong block size.
+inline bool ds41_type_known(uint32_t t) {
+    int be = 0, bb = 0;
+    return block_geometry(t, be, bb);
+}
+/// "Q8_0 (8)", "MXFP8 / F8_E4M3 (43)", "unknown (150)" - for messages
+inline std::string ds41_type_label(uint32_t t) {
+    if (t == ty::FP8_43) return "MXFP8 / F8_E4M3 (43)";
+    const char * n = ggml_type_name(t);
+    return std::string(std::strcmp(n, "?") == 0 ? "unknown" : n) + " (" + std::to_string(t) + ")";
+}
+
+enum class Ds41Fp8Layout { Mxfp8, F8E4M3, Unknown };
+/// Which format a type-43 tensor `t` of shard `s` holds, from the room it has in the file (up to the next tensor's
+/// offset, or the end of the data): 33 bytes per 32 values -> Mxfp8; at least one byte a value but less -> F8E4M3;
+/// less than one byte a value -> Unknown (truncated).  A tensor so small that the two sizes differ by less than the
+/// alignment padding reads as Mxfp8 (what the engine has always read type 43 as).
+inline Ds41Fp8Layout ds41_type43_layout(const GgufModel & m, const TensorInfo & t, size_t s) {
+    const GgufFile & g = m.shard(s);
+    const uint64_t payload = g.file_size() - g.data_start();
+    if (t.offset > payload) return Ds41Fp8Layout::Unknown;
+    uint64_t end = payload;
+    for (const auto & o : g.tensors())
+        if (o.offset > t.offset && o.offset < end) end = o.offset;
+    const uint64_t room = end - t.offset, n = t.elements();
+    if (!t.shape.empty() && t.shape[0] % 32 == 0 && room >= n / 32 * 33) return Ds41Fp8Layout::Mxfp8;
+    if (room >= n) return Ds41Fp8Layout::F8E4M3;
+    return Ds41Fp8Layout::Unknown;
+}
+
+/// What the checks found.  nullptr (the default, every loader): the first problem ends the read and is returned, as
+/// always.  A Ds41Issues (test_ds41_geometry --report): every problem is appended to `items` and the read goes on, so
+/// one pass lists every missing key, bad value, missing / unexpected tensor and expert type; the functions then return
+/// "" and the caller reads `items`.  `seen` collects every metadata key the readers looked up (the report lists the
+/// model's keys the engine never reads).
+struct Ds41Issues {
+    std::vector<std::string> items;
+    std::set<std::string> seen;
+};
+
 // ------------------------------------------------------------------ key readers (missing key == error)
 namespace detail {
-inline std::string u64(const GgufFile & g, const std::string & k, int64_t & out) {
-    const MetaValue * v = g.get(k);
+/// e == "": nothing.  Otherwise the loader stops (true: return e); a report records e and goes on (false).
+inline bool halt(Ds41Issues * iss, const std::string & e) {
+    if (e.empty()) return false;
+    if (!iss) return true;
+    iss->items.push_back(e);
+    return false;
+}
+inline const MetaValue * get(const GgufFile & g, const std::string & k, Ds41Issues * iss) {
+    if (iss) iss->seen.insert(k);
+    return g.get(k);
+}
+/// a metadata value for a message: 4, 0.5, "text", [array of 43], (absent)
+inline std::string show(const MetaValue * v) {
+    if (!v) return "(absent)";
+    if (v->type == MetaType::STRING) return "\"" + v->s + "\"";
+    if (v->type == MetaType::ARRAY) return "[array of " + std::to_string(v->count) + "]";
+    char b[64];
+    std::snprintf(b, sizeof b, "%g", v->num());
+    return b;
+}
+inline std::string num(double x) {
+    char b[64];
+    std::snprintf(b, sizeof b, "%g", x);
+    return b;
+}
+inline std::string u64(const GgufFile & g, const std::string & k, int64_t & out, Ds41Issues * iss = nullptr) {
+    const MetaValue * v = get(g, k, iss);
     if (!v) return "missing " + k;
     if (!v->is_num()) return k + " is not a number";
     out = (int64_t) v->num();
     return {};
 }
-inline std::string f64(const GgufFile & g, const std::string & k, double & out) {
-    const MetaValue * v = g.get(k);
+inline std::string f64(const GgufFile & g, const std::string & k, double & out, Ds41Issues * iss = nullptr) {
+    const MetaValue * v = get(g, k, iss);
     if (!v) return "missing " + k;
     if (!v->is_num()) return k + " is not a number";
     out = v->num();
     return {};
 }
-inline std::string arr(const GgufFile & g, const std::string & k, std::vector<int64_t> & out) {
-    const MetaValue * v = g.get(k);
+inline std::string arr(const GgufFile & g, const std::string & k, std::vector<int64_t> & out, Ds41Issues * iss = nullptr) {
+    const MetaValue * v = get(g, k, iss);
     if (!v) return "missing " + k;
     if (v->type != MetaType::ARRAY) return k + " is not an array";
     if (v->count > v->items.size()) return k + ": longer than the reader's sample (use ds41_read_int_array)";
@@ -214,9 +339,10 @@ inline std::string json_num(const std::string & js, const std::string & key, dou
 
 /// A `deepseek41` GGUF in the llama.cpp convention (llama.cpp PR #30817's converter; ISTA-DASLab's GSQ-RCO GGUFs):
 /// llama.cpp key names, the Engram hash arrays as I32/I64 tensors, its tables in a separate file.  Ours has
-/// `deepseek41.config`.
+/// `deepseek41.config`.  (Keys under the file's own architecture prefix: ds41_prefix.)
 inline bool ds41_is_llamacpp_gguf(const GgufModel & model) {
-    return model.meta().get("deepseek41.config") == nullptr && model.meta().get("deepseek41.embedding_length") != nullptr;
+    const std::string P = ds41_prefix(model.meta());
+    return model.meta().get(P + "config") == nullptr && model.meta().get(P + "embedding_length") != nullptr;
 }
 
 /// llama.cpp mainline's convention (src/models/deepseek41.cpp; Unsloth's GGUFs) - a llama.cpp-convention file whose
@@ -224,7 +350,7 @@ inline bool ds41_is_llamacpp_gguf(const GgufModel & model) {
 /// ple.head_vocab_sizes = the primes, ple.head_offsets), both Engram tables in ONE IQ4_NL tensor per_layer_token_embd
 /// [256, rows(layer 1) + rows(layer 14)], and the two Engram RMSNorm weights stored as their product (engram_gate).
 inline bool ds41_is_mainline_gguf(const GgufModel & model) {
-    return ds41_is_llamacpp_gguf(model) && model.meta().get("deepseek41.ple.layers") != nullptr;
+    return ds41_is_llamacpp_gguf(model) && model.meta().get(ds41_prefix(model.meta()) + "ple.layers") != nullptr;
 }
 
 namespace detail {
@@ -250,10 +376,10 @@ inline std::string int_tensor(const GgufModel & m, const std::string & n, std::v
 /// ds41_read_geometry for the llama.cpp convention: the same Ds41Geometry from its key names (every key still
 /// required).  The routing, attention and Engram hash constants are DeepSeek's either way - only where they live
 /// differs (checked on ISTA's IQ2_XXS: token map, primes and multipliers byte-equal to ours).
-inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geometry & G) {
+inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geometry & G, Ds41Issues * iss = nullptr) {
     const GgufFile & g = model.meta();
     std::string e;
-    const std::string P = "deepseek41.";
+    const std::string P = ds41_prefix(g);
     const bool ml = ds41_is_mainline_gguf(model);   // mainline's key names where they differ from #30817's
     struct U { const char * k; int64_t * v; };
     for (const U & u : std::initializer_list<U>{
@@ -274,7 +400,7 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
              { ml ? "ple.ngram_size" : "engram_max_ngram_size", &G.engram_ngram },
              { ml ? "engram.pad_token_id" : "engram_pad_token_id", &G.engram_pad },
              { ml ? "engram.compressed_vocab_size" : "engram_compressed_vocab_size", &G.engram_cvocab } })
-        if (!(ml && u.v == &G.engram_cvocab && !g.get(P + u.k)) && !(e = detail::u64(g, P + u.k, *u.v)).empty()) return e;   // (ISTA's GSQ-RCO files leave that key out: the token map gives it)
+        if (!(ml && u.v == &G.engram_cvocab && !detail::get(g, P + u.k, iss)) && detail::halt(iss, e = detail::u64(g, P + u.k, *u.v, iss))) return e;   // (ISTA's GSQ-RCO files leave that key out: the token map gives it)
     struct F { const char * k; double * v; };
     for (const F & f : std::initializer_list<F>{
              { "expert_weights_scale", &G.weights_scale }, { "hyper_connection.epsilon", &G.hc_eps },
@@ -282,52 +408,78 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
              { "attention.compress_rope_freq_base", &G.compress_rope_base }, { "rope.scaling.factor", &G.rope_factor },
              { "rope.scaling.yarn_beta_fast", &G.beta_fast }, { "rope.scaling.yarn_beta_slow", &G.beta_slow },
              { "rope.scaling.original_context_length", &G.orig_ctx } })
-        if (!(e = detail::f64(g, P + f.k, *f.v)).empty()) return e;
+        if (detail::halt(iss, e = detail::f64(g, P + f.k, *f.v, iss))) return e;
     {
-        const MetaValue * v = g.get(P + "expert_weights_norm");
-        if (!v) return "missing deepseek41.expert_weights_norm";
-        G.norm_topk = v->u != 0;
+        const MetaValue * v = detail::get(g, P + "expert_weights_norm", iss);
+        if (!v) { if (detail::halt(iss, e = "missing " + P + "expert_weights_norm")) return e; }
+        else G.norm_topk = v->u != 0;
         if (ml) {   // llama.cpp's enum: LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS = 4
-            const MetaValue * gf = g.get(P + "expert_gating_func");
-            if (!gf || !gf->is_num() || (int64_t) gf->num() != 4) return "expert_gating_func is not sqrt-softplus (4)";
+            const MetaValue * gf = detail::get(g, P + "expert_gating_func", iss);
+            if ((!gf || !gf->is_num() || (int64_t) gf->num() != 4) &&
+                detail::halt(iss, e = P + "expert_gating_func is " + detail::show(gf) + ", not sqrt-softplus (4)")) return e;
         } else {
-            const MetaValue * sf = g.get(P + "expert_scoring_func");
-            if (!sf || sf->s != "sqrtsoftplus") return "expert_scoring_func is not sqrtsoftplus";
+            const MetaValue * sf = detail::get(g, P + "expert_scoring_func", iss);
+            if ((!sf || sf->s != "sqrtsoftplus") &&
+                detail::halt(iss, e = P + "expert_scoring_func is " + detail::show(sf) + ", not \"sqrtsoftplus\"")) return e;
         }
         // one SwiGLU clamp for every layer (DeepSeek's swiglu_limit); a per-layer array of equal values here
-        const MetaValue * sl = g.get(P + "swiglu_clamp_exp");
-        if (!sl || sl->type != MetaType::ARRAY || sl->items.empty()) return "missing deepseek41.swiglu_clamp_exp";
-        G.swiglu_limit = sl->items[0].num();
-        for (const auto & it : sl->items)
-            if (it.num() != G.swiglu_limit) return "swiglu_clamp_exp differs between layers (one limit supported)";
+        const MetaValue * sl = detail::get(g, P + "swiglu_clamp_exp", iss);
+        if (!sl || sl->type != MetaType::ARRAY || sl->items.empty()) {
+            if (detail::halt(iss, e = "missing " + P + "swiglu_clamp_exp")) return e;
+        } else {
+            G.swiglu_limit = sl->items[0].num();
+            for (size_t i = 0; i < sl->items.size(); ++i)
+                if (sl->items[i].num() != G.swiglu_limit) {
+                    if (detail::halt(iss, e = P + "swiglu_clamp_exp differs between layers: [" + std::to_string(i) + "] is " +
+                                              detail::num(sl->items[i].num()) + ", [0] is " + detail::num(G.swiglu_limit) +
+                                              " (one limit supported)")) return e;
+                    break;   // (one line in a report)
+                }
+        }
     }
-    if (!(e = detail::arr(g, P + "attention.compress_ratios", G.ratio)).empty()) return e;
-    if ((int64_t) G.ratio.size() > G.n_layer) G.ratio.resize((size_t) G.n_layer);   // (+ the 3 MTP blocks' entries)
-    if (!(e = detail::arr(g, P + (ml ? "attention.kv_source_layers" : "kv_source_layer_ids"), G.kv_sources)).empty()) return e;
-    if (!(e = detail::arr(g, P + (ml ? "attention.indexer.source_layers" : "index_source_layer_ids"), G.index_sources)).empty()) return e;
-    if (!(e = detail::arr(g, P + (ml ? "ple.layers" : "engram.layer_ids"), G.engram_layers)).empty()) return e;
+    if (detail::halt(iss, e = detail::arr(g, P + "attention.compress_ratios", G.ratio, iss))) return e;
+    if (G.n_layer >= 0 && (int64_t) G.ratio.size() > G.n_layer) G.ratio.resize((size_t) G.n_layer);   // (+ the 3 MTP blocks' entries)
+    if (detail::halt(iss, e = detail::arr(g, P + (ml ? "attention.kv_source_layers" : "kv_source_layer_ids"), G.kv_sources, iss))) return e;
+    if (detail::halt(iss, e = detail::arr(g, P + (ml ? "attention.indexer.source_layers" : "index_source_layer_ids"), G.index_sources, iss))) return e;
+    if (detail::halt(iss, e = detail::arr(g, P + (ml ? "ple.layers" : "engram.layer_ids"), G.engram_layers, iss))) return e;
     const TensorInfo * te = model.find("token_embd.weight");
-    if (!te || te->shape.size() != 2) return "missing token_embd.weight";
-    G.vocab = (int64_t) te->shape[1];
+    if (!te || te->shape.size() != 2) { if (detail::halt(iss, e = "missing token_embd.weight")) return e; }
+    else G.vocab = (int64_t) te->shape[1];
     std::vector<int64_t> tm, pr;
+    const std::string & path = g.path();
+    auto whole = [&](const std::string & k, std::vector<int64_t> & out) {   // a metadata array, whole
+        if (iss) iss->seen.insert(k);
+        return ds41_read_int_array(path, k, out);
+    };
     if (ml) {
         // the token map, primes and multipliers from the metadata (read whole); a layer's rows = the sum of its primes,
         // and its head offsets must run on from the previous layer's (one table, layer after layer: the Engram reader
         // takes layer e's rows from the sum of the earlier layers' rows)
-        const std::string & path = g.path();
         std::vector<int64_t> offs;
-        if (!(e = ds41_read_int_array(path, P + "engram.token_map", tm)).empty()) return e;
-        if (!(e = ds41_read_int_array(path, P + "ple.head_vocab_sizes", pr)).empty()) return e;
-        if (!(e = ds41_read_int_array(path, P + "ple.layer_multipliers", G.engram_mult)).empty()) return e;
-        if (!(e = ds41_read_int_array(path, P + "ple.head_offsets", offs)).empty()) return e;
-        if ((int64_t) tm.size() != G.vocab) return "engram.token_map size"; if (!G.engram_cvocab) G.engram_cvocab = *std::max_element(tm.begin(), tm.end()) + 1;
-        if (offs.size() != pr.size()) return "ple.head_offsets / ple.head_vocab_sizes differ in length";
+        if (detail::halt(iss, e = whole(P + "engram.token_map", tm))) return e;
+        if (detail::halt(iss, e = whole(P + "ple.head_vocab_sizes", pr))) return e;
+        if (detail::halt(iss, e = whole(P + "ple.layer_multipliers", G.engram_mult))) return e;
+        if (detail::halt(iss, e = whole(P + "ple.head_offsets", offs))) return e;
+        if ((int64_t) tm.size() != G.vocab &&
+            detail::halt(iss, e = "engram.token_map has " + std::to_string(tm.size()) + " entries, the vocabulary (token_embd) " +
+                                  std::to_string(G.vocab))) return e;
+        if (!G.engram_cvocab && !tm.empty()) G.engram_cvocab = *std::max_element(tm.begin(), tm.end()) + 1;
+        if (offs.size() != pr.size() &&
+            detail::halt(iss, e = "ple.head_offsets (" + std::to_string(offs.size()) + ") / ple.head_vocab_sizes (" +
+                                  std::to_string(pr.size()) + ") differ in length")) return e;
         const int64_t nel = (int64_t) G.engram_layers.size(), nc = (G.engram_ngram - 1) * G.engram_heads;
-        if ((int64_t) pr.size() != nel * nc) return "ple.head_vocab_sizes does not match its shape";
+        if ((int64_t) pr.size() != nel * nc &&
+            detail::halt(iss, e = "ple.head_vocab_sizes has " + std::to_string(pr.size()) + " entries, its shape needs " +
+                                  std::to_string(nel * nc) + " (layers x (ngram - 1) x heads)")) return e;
         int64_t acc = 0;
-        G.engram_rows.assign((size_t) nel, 0);
-        for (int64_t i = 0; i < nel * nc; ++i) {
-            if (offs[(size_t) i] != acc) return "ple.head_offsets are not the running sum of the primes (unsupported layout)";
+        G.engram_rows.assign((size_t) (nel > 0 ? nel : 0), 0);
+        const bool shaped = nc > 0 && (int64_t) pr.size() == nel * nc && offs.size() == pr.size();
+        for (int64_t i = 0; shaped && i < nel * nc; ++i) {
+            if (offs[(size_t) i] != acc) {
+                if (detail::halt(iss, e = "ple.head_offsets[" + std::to_string(i) + "] is " + std::to_string(offs[(size_t) i]) +
+                                          ", not the running sum of the primes " + std::to_string(acc) + " (unsupported layout)")) return e;
+                break;
+            }
             acc += pr[(size_t) i];
             G.engram_rows[(size_t) (i / nc)] += pr[(size_t) i];
         }
@@ -337,11 +489,13 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
         detail::u64(g, "tokenizer.ggml.eos_token_id", G.eos);
         return {};
     }
-    if (!(e = detail::arr(g, P + "engram.num_embeddings", G.engram_rows)).empty()) return e;
-    if (!(e = detail::int_tensor(model, "engram_token_map.weight", tm)).empty()) return e;
-    if (!(e = detail::int_tensor(model, "engram_primes.weight", pr)).empty()) return e;
-    if (!(e = detail::int_tensor(model, "engram_multipliers.weight", G.engram_mult)).empty()) return e;
-    if ((int64_t) tm.size() != G.vocab) return "engram_token_map size";
+    if (detail::halt(iss, e = detail::arr(g, P + "engram.num_embeddings", G.engram_rows, iss))) return e;
+    if (detail::halt(iss, e = detail::int_tensor(model, "engram_token_map.weight", tm))) return e;
+    if (detail::halt(iss, e = detail::int_tensor(model, "engram_primes.weight", pr))) return e;
+    if (detail::halt(iss, e = detail::int_tensor(model, "engram_multipliers.weight", G.engram_mult))) return e;
+    if ((int64_t) tm.size() != G.vocab &&
+        detail::halt(iss, e = "engram_token_map has " + std::to_string(tm.size()) + " entries, the vocabulary (token_embd) " +
+                              std::to_string(G.vocab))) return e;
     G.engram_token_map.assign(tm.begin(), tm.end());
     G.engram_primes.assign(pr.begin(), pr.end());
     detail::u64(g, "tokenizer.ggml.bos_token_id", G.bos);
@@ -349,39 +503,113 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
     return {};
 }
 
-/// the checks both conventions share (after the keys are read)
-inline std::string ds41_check_geometry(Ds41Geometry & G) {
-    if ((int64_t) G.ratio.size() != G.n_layer) return "compress_ratios has " + std::to_string(G.ratio.size()) + " entries";
-    for (int64_t r : G.ratio) if (r != 0 && r != 1 && r != 2) return "compress ratio " + std::to_string(r) + " (V4.1 has 0/1/2)";
-    for (int64_t l : G.kv_sources) if (l < 0 || l >= G.n_layer || G.ratio[(size_t) l] == 0) return "bad kv source";
-    for (int64_t l : G.index_sources) if (l < 0 || l >= G.n_layer || G.ratio[(size_t) l] == 0) return "bad index source";
-    for (int64_t l = 0; l < G.n_layer; ++l)
-        if (G.ratio[(size_t) l] && (G.kv_src(l) < 0 || G.idx_src(l) < 0 || G.ratio[(size_t) G.kv_src(l)] != G.ratio[(size_t) l]))
-            return "layer " + std::to_string(l) + " has no kv/index source of its ratio";
-    if (G.n_shared != 1 || G.hc < 1 || G.d_head <= G.d_rope || (G.n_head * G.d_head) % G.o_groups) return "unsupported shape";
-    const int64_t nel = (int64_t) G.engram_layers.size();
-    if ((int64_t) G.engram_primes.size() != nel * (G.engram_ngram - 1) * G.engram_heads ||
-        (int64_t) G.engram_mult.size() != nel * G.engram_ngram || (int64_t) G.engram_rows.size() != nel)
-        return "engram arrays do not match its shape";
-    for (int64_t i = 0; i < nel; ++i) {   // the bucket ranges tile the table exactly (v41_gguf_meta checks the same)
+/// the checks both conventions share (after the keys are read).  Each guard names the value it found.
+inline std::string ds41_check_geometry(Ds41Geometry & G, Ds41Issues * iss = nullptr) {
+    std::string e;
+    const bool sized = (int64_t) G.ratio.size() == G.n_layer;
+    if (!sized && detail::halt(iss, e = "compress_ratios has " + std::to_string(G.ratio.size()) + " entries, block_count is " +
+                                        std::to_string(G.n_layer))) return e;
+    for (size_t l = 0; l < G.ratio.size(); ++l) {
+        const int64_t r = G.ratio[l];
+        if (r != 0 && r != 1 && r != 2 &&
+            detail::halt(iss, e = "layer " + std::to_string(l) + ": compress ratio " + std::to_string(r) + " (V4.1 has 0/1/2)")) return e;
+    }
+    bool sources_ok = true;
+    for (int k = 0; k < 2; ++k)
+        for (int64_t l : k ? G.index_sources : G.kv_sources) {
+            const bool range = l >= 0 && l < G.n_layer && (size_t) l < G.ratio.size();
+            if (range && G.ratio[(size_t) l] != 0) continue;
+            sources_ok = false;
+            if (detail::halt(iss, e = std::string(k ? "index" : "kv") + " source layer " + std::to_string(l) +
+                                      (range ? " has compress ratio 0" : " is outside block_count " + std::to_string(G.n_layer)))) return e;
+        }
+    for (int64_t l = 0; sized && sources_ok && l < G.n_layer; ++l) {
+        if (!G.ratio[(size_t) l]) continue;
+        const int64_t ks = G.kv_src(l), is = G.idx_src(l);
+        if ((ks < 0 || is < 0 || G.ratio[(size_t) ks] != G.ratio[(size_t) l]) &&
+            detail::halt(iss, e = "layer " + std::to_string(l) + " has no kv/index source of its ratio (ratio " +
+                                  std::to_string(G.ratio[(size_t) l]) + ", kv source " + std::to_string(ks) + ", index source " +
+                                  std::to_string(is) + ")")) return e;
+    }
+    if (G.n_shared != 1 &&
+        detail::halt(iss, e = "unsupported shape: " + std::to_string(G.n_shared) + " shared experts (one supported)")) return e;
+    if (G.hc < 1 && detail::halt(iss, e = "unsupported shape: hyper-connection count " + std::to_string(G.hc) + " (>= 1 needed)")) return e;
+    if (G.d_head <= G.d_rope &&
+        detail::halt(iss, e = "unsupported shape: head dim " + std::to_string(G.d_head) + " <= rope dim " + std::to_string(G.d_rope))) return e;
+    if ((G.o_groups <= 0 || (G.n_head * G.d_head) % G.o_groups) &&
+        detail::halt(iss, e = "unsupported shape: heads x head dim " + std::to_string(G.n_head * G.d_head) +
+                              " is not a multiple of the output groups " + std::to_string(G.o_groups))) return e;
+    const int64_t nel = (int64_t) G.engram_layers.size(), nb = (G.engram_ngram - 1) * G.engram_heads;
+    const bool eshape = (int64_t) G.engram_primes.size() == nel * nb && (int64_t) G.engram_mult.size() == nel * G.engram_ngram &&
+                        (int64_t) G.engram_rows.size() == nel;
+    if (!eshape &&
+        detail::halt(iss, e = "engram arrays do not match its shape: " + std::to_string(nel) + " layers, ngram " +
+                              std::to_string(G.engram_ngram) + ", " + std::to_string(G.engram_heads) + " heads; primes " +
+                              std::to_string(G.engram_primes.size()) + ", multipliers " + std::to_string(G.engram_mult.size()) +
+                              ", rows " + std::to_string(G.engram_rows.size()))) return e;
+    for (int64_t i = 0; eshape && i < nel; ++i) {   // the bucket ranges tile the table exactly (v41_gguf_meta checks the same)
         uint64_t s = 0;
-        for (int64_t j = 0; j < (G.engram_ngram - 1) * G.engram_heads; ++j)
-            s += G.engram_primes[(size_t) (i * (G.engram_ngram - 1) * G.engram_heads + j)];
-        if ((int64_t) s != G.engram_rows[(size_t) i]) return "engram primes do not tile the table";
+        for (int64_t j = 0; j < nb; ++j) s += G.engram_primes[(size_t) (i * nb + j)];
+        if ((int64_t) s != G.engram_rows[(size_t) i] &&
+            detail::halt(iss, e = "engram primes do not tile the table: Engram layer " + std::to_string(G.engram_layers[(size_t) i]) +
+                                  "'s primes sum to " + std::to_string(s) + ", its table has " +
+                                  std::to_string(G.engram_rows[(size_t) i]) + " rows")) return e;
     }
     return {};
 }
 
-inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G) {
-    const GgufFile & g = model.meta();
-    const MetaValue * arch = g.get("general.architecture");
-    if (!arch || arch->s != "deepseek41") return "not a deepseek41 GGUF";
-    if (ds41_is_llamacpp_gguf(model)) {
-        const std::string e = ds41_read_geometry_llamacpp(model, G);
-        return e.empty() ? ds41_check_geometry(G) : e;
+/// STRATA_EXPERTS_USED=k / STRATA_EXPERTS_USED_DECODE=k ("fewer experts per token", upstream Strata's "Faster" mode:
+/// 5 of 6): route each token to its k highest-scoring experts (the model's own selection score: sqrt(softplus) + the
+/// exp_probs_b bias + the route bias) instead of n_used.  The weights are those of the model's gate with top-k = k:
+/// the k kept raw scores divided by THEIR sum (when the GGUF's expert_weights_norm / norm_topk_prob is set - V4.1:
+/// true) times expert_weights_scale (routed_scaling_factor, 1.5) - so the routed sum keeps its magnitude next to the
+/// shared expert and the residual instead of shrinking by the dropped expert's share.  The shared expert always runs.
+/// Unset, empty or out of 1..n_used: n_used (said once on stderr when out of range) - exactly the old behaviour.
+inline int64_t ds41_experts_used_env(const char * name, int64_t n_used, bool & said) {
+    const char * v = std::getenv(name);
+    if (!v || !*v || n_used < 1) return n_used;
+    char * end = nullptr;
+    const long k = std::strtol(v, &end, 10);
+    if (end == v || *end != '\0' || k < 1 || k > n_used) {
+        if (!said) std::fprintf(stderr, "%s=%s ignored: experts per token must be 1..%lld\n", name, v, (long long) n_used);
+        said = true;
+        return n_used;
     }
+    if (!said && k < n_used)
+        std::fprintf(stderr, "experts: %s=%ld - %ld of %lld routed experts per token (weights renormalised over the %ld)\n",
+                     name, k, k, (long long) n_used, k);
+    said = true;
+    return (int64_t) k;
+}
+/// STRATA_EXPERTS_USED: every pass (prompt, decode, verify).  Applied by ds41_read_geometry to G.n_used, so the router,
+/// the routed-expert tier and every ids/weights stride follow it; G.n_used_model keeps the file's value.
+inline int64_t ds41_experts_used(int64_t n_used) {
+    static bool said = false;
+    return ds41_experts_used_env("STRATA_EXPERTS_USED", n_used, said);
+}
+/// STRATA_EXPERTS_USED_DECODE: the decode / verify passes only (the prompt keeps n_used); ds41_generate.cpp applies it.
+inline int64_t ds41_experts_used_decode(int64_t n_used) {
+    static bool said = false;
+    return ds41_experts_used_env("STRATA_EXPERTS_USED_DECODE", n_used, said);
+}
+
+/// The file's geometry as it is (ds41_read_geometry = this + STRATA_EXPERTS_USED).
+inline std::string ds41_read_geometry_file(const GgufModel & model, Ds41Geometry & G, Ds41Issues * iss = nullptr) {
+    const GgufFile & g = model.meta();
     std::string e;
-    const std::string P = "deepseek41.";
+    const std::string arch = ds41_arch(g);
+    if (!ds41_arch_accepted(arch)) {
+        std::string acc;
+        for (const auto & a : ds41_accepted_archs()) acc += (acc.empty() ? "" : ", ") + a;
+        if (detail::halt(iss, e = arch.empty() ? "not a deepseek41 GGUF (no general.architecture)"
+                                               : "not a deepseek41 GGUF: general.architecture is \"" + arch + "\" (accepted: " + acc +
+                                                     "; DS41_ACCEPT_ARCH=" + arch + " reads it as deepseek41, every check still on)")) return e;
+    }
+    if (ds41_is_llamacpp_gguf(model)) {
+        e = ds41_read_geometry_llamacpp(model, G, iss);
+        return e.empty() ? ds41_check_geometry(G, iss) : e;
+    }
+    const std::string P = ds41_prefix(g);
     struct U { const char * k; int64_t * v; };
     for (const U & u : std::initializer_list<U>{
              { "hidden_size", &G.n_embd }, { "num_hidden_layers", &G.n_layer }, { "num_attention_heads", &G.n_head },
@@ -393,7 +621,7 @@ inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G)
              { "index_topk", &G.idx_topk }, { "candidate_source_layer_id", &G.cand_layer },
              { "candidate_topk_blocks", &G.cand_blocks }, { "candidate_block_size", &G.cand_bsize },
              { "vocab_size", &G.vocab }, { "max_position_embeddings", &G.ctx_len } })
-        if (!(e = detail::u64(g, P + u.k, *u.v)).empty()) return e;
+        if (detail::halt(iss, e = detail::u64(g, P + u.k, *u.v, iss))) return e;
     struct F { const char * k; double * v; };
     for (const F & f : std::initializer_list<F>{
              { "routed_scaling_factor", &G.weights_scale }, { "hc_eps", &G.hc_eps }, { "rms_norm_eps", &G.rms_eps },
@@ -401,65 +629,72 @@ inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G)
              { "rope_scaling.factor", &G.rope_factor }, { "rope_scaling.beta_fast", &G.beta_fast },
              { "rope_scaling.beta_slow", &G.beta_slow }, { "rope_scaling.original_max_position_embeddings", &G.orig_ctx },
              { "swiglu_limit", &G.swiglu_limit } })
-        if (!(e = detail::f64(g, P + f.k, *f.v)).empty()) return e;
+        if (detail::halt(iss, e = detail::f64(g, P + f.k, *f.v, iss))) return e;
     {
-        const MetaValue * v = g.get(P + "norm_topk_prob");
-        if (!v) return "missing deepseek41.norm_topk_prob";
-        G.norm_topk = v->u != 0;
-        const MetaValue * sf = g.get(P + "scoring_func");
-        if (!sf || sf->s != "sqrtsoftplus") return "scoring_func is not sqrtsoftplus";
+        const MetaValue * v = detail::get(g, P + "norm_topk_prob", iss);
+        if (!v) { if (detail::halt(iss, e = "missing " + P + "norm_topk_prob")) return e; }
+        else G.norm_topk = v->u != 0;
+        const MetaValue * sf = detail::get(g, P + "scoring_func", iss);
+        if ((!sf || sf->s != "sqrtsoftplus") &&
+            detail::halt(iss, e = P + "scoring_func is " + detail::show(sf) + ", not \"sqrtsoftplus\"")) return e;
     }
-    if (!(e = detail::arr(g, P + "compress_ratios", G.ratio)).empty()) return e;
-    if (!(e = detail::arr(g, P + "kv_source_layer_ids", G.kv_sources)).empty()) return e;
-    if (!(e = detail::arr(g, P + "index_source_layer_ids", G.index_sources)).empty()) return e;
-    if ((int64_t) G.ratio.size() != G.n_layer) return "compress_ratios has " + std::to_string(G.ratio.size()) + " entries";
-    for (int64_t r : G.ratio) if (r != 0 && r != 1 && r != 2) return "compress ratio " + std::to_string(r) + " (V4.1 has 0/1/2)";
-    for (int64_t l : G.kv_sources) if (l < 0 || l >= G.n_layer || G.ratio[(size_t) l] == 0) return "bad kv source";
-    for (int64_t l : G.index_sources) if (l < 0 || l >= G.n_layer || G.ratio[(size_t) l] == 0) return "bad index source";
-    for (int64_t l = 0; l < G.n_layer; ++l)
-        if (G.ratio[(size_t) l] && (G.kv_src(l) < 0 || G.idx_src(l) < 0 || G.ratio[(size_t) G.kv_src(l)] != G.ratio[(size_t) l]))
-            return "layer " + std::to_string(l) + " has no kv/index source of its ratio";
-    if (G.n_shared != 1 || G.hc < 1 || G.d_head <= G.d_rope || (G.n_head * G.d_head) % G.o_groups) return "unsupported shape";
+    if (detail::halt(iss, e = detail::arr(g, P + "compress_ratios", G.ratio, iss))) return e;
+    if (detail::halt(iss, e = detail::arr(g, P + "kv_source_layer_ids", G.kv_sources, iss))) return e;
+    if (detail::halt(iss, e = detail::arr(g, P + "index_source_layer_ids", G.index_sources, iss))) return e;
     // Engram: arrays (full, not the reader's sample) + the shape from the config JSON
-    const MetaValue * cfg = g.get(P + "config");
-    if (!cfg) return "missing deepseek41.config";
-    double d = 0;
-    if (!(e = detail::json_num(cfg->s, "engram_n_heads", d)).empty()) return e;
-    G.engram_heads = (int64_t) d;
-    if (!(e = detail::json_num(cfg->s, "engram_head_dim", d)).empty()) return e;
-    G.engram_dim = (int64_t) d;
-    if (!(e = detail::json_num(cfg->s, "engram_max_ngram_size", d)).empty()) return e;
-    G.engram_ngram = (int64_t) d;
-    if (!(e = detail::u64(g, P + "engram.pad_id", G.engram_pad)).empty()) return e;
-    if (!(e = detail::u64(g, P + "engram.compressed_vocab_size", G.engram_cvocab)).empty()) return e;
-    if (!(e = detail::arr(g, P + "engram.layer_ids", G.engram_layers)).empty()) return e;
-    if (!(e = detail::arr(g, P + "engram.rows", G.engram_rows)).empty()) return e;
+    const MetaValue * cfg = detail::get(g, P + "config", iss);
+    if (!cfg) { if (detail::halt(iss, e = "missing " + P + "config")) return e; }
+    else {
+        double d = 0;
+        if (detail::halt(iss, e = detail::json_num(cfg->s, "engram_n_heads", d))) return e;
+        G.engram_heads = (int64_t) d;
+        d = 0;
+        if (detail::halt(iss, e = detail::json_num(cfg->s, "engram_head_dim", d))) return e;
+        G.engram_dim = (int64_t) d;
+        d = 0;
+        if (detail::halt(iss, e = detail::json_num(cfg->s, "engram_max_ngram_size", d))) return e;
+        G.engram_ngram = (int64_t) d;
+    }
+    if (detail::halt(iss, e = detail::u64(g, P + "engram.pad_id", G.engram_pad, iss))) return e;
+    if (detail::halt(iss, e = detail::u64(g, P + "engram.compressed_vocab_size", G.engram_cvocab, iss))) return e;
+    if (detail::halt(iss, e = detail::arr(g, P + "engram.layer_ids", G.engram_layers, iss))) return e;
+    if (detail::halt(iss, e = detail::arr(g, P + "engram.rows", G.engram_rows, iss))) return e;
     const std::string & path = g.path();
+    auto whole = [&](const std::string & k, std::vector<int64_t> & out) {   // a metadata array, whole
+        if (iss) iss->seen.insert(k);
+        return ds41_read_int_array(path, k, out);
+    };
     std::vector<int64_t> tm, pr;
-    if (!(e = ds41_read_int_array(path, P + "engram.token_map", tm)).empty()) return e;
-    if (!(e = ds41_read_int_array(path, P + "engram.primes", pr)).empty()) return e;
-    if (!(e = ds41_read_int_array(path, P + "engram.multipliers", G.engram_mult)).empty()) return e;
-    if ((int64_t) tm.size() != G.vocab) return "engram.token_map size";
+    if (detail::halt(iss, e = whole(P + "engram.token_map", tm))) return e;
+    if (detail::halt(iss, e = whole(P + "engram.primes", pr))) return e;
+    if (detail::halt(iss, e = whole(P + "engram.multipliers", G.engram_mult))) return e;
+    if ((int64_t) tm.size() != G.vocab &&
+        detail::halt(iss, e = "engram.token_map has " + std::to_string(tm.size()) + " entries, vocab_size is " +
+                              std::to_string(G.vocab))) return e;
     G.engram_token_map.assign(tm.begin(), tm.end());
     G.engram_primes.assign(pr.begin(), pr.end());
-    const int64_t nel = (int64_t) G.engram_layers.size();
-    if ((int64_t) G.engram_primes.size() != nel * (G.engram_ngram - 1) * G.engram_heads ||
-        (int64_t) G.engram_mult.size() != nel * G.engram_ngram || (int64_t) G.engram_rows.size() != nel)
-        return "engram arrays do not match its shape";
-    for (int64_t i = 0; i < nel; ++i) {   // the bucket ranges tile the table exactly (v41_gguf_meta checks the same)
-        uint64_t s = 0;
-        for (int64_t j = 0; j < (G.engram_ngram - 1) * G.engram_heads; ++j)
-            s += G.engram_primes[(size_t) (i * (G.engram_ngram - 1) * G.engram_heads + j)];
-        if ((int64_t) s != G.engram_rows[(size_t) i]) return "engram primes do not tile the table";
-    }
     detail::u64(g, "tokenizer.ggml.bos_token_id", G.bos);
     detail::u64(g, "tokenizer.ggml.eos_token_id", G.eos);
-    return {};
+    return ds41_check_geometry(G, iss);   // (ratios, sources, shape, Engram tiling: the checks both conventions share)
+}
+
+inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G, Ds41Issues * iss = nullptr) {
+    std::string e = ds41_read_geometry_file(model, G, iss);
+    G.n_used_model = G.n_used;
+    G.n_used = ds41_experts_used(G.n_used);   // STRATA_EXPERTS_USED (unset: unchanged)
+    return e;
+}
+
+/// Whether the engine reads tensor `n` as a routed expert (its own blob reader, never ggml) - ds41_dense.cpp is_routed.
+inline bool ds41_is_routed_name(const std::string & n) {
+    return n.find("_exps.") != std::string::npos || n.find("ffn_exps_") != std::string::npos;
 }
 
 /// The full tensor map + per-layer expert tiers.  `layers`: the blocks the file must hold (a partial test file
 /// holds a subset - pass them; the real file holds 0..n_layer-1).
-inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, const std::vector<int64_t> & layers) {
+inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, const std::vector<int64_t> & layers,
+                                      Ds41Issues * iss = nullptr) {
+    std::string e;
     std::map<std::string, std::pair<std::vector<uint64_t>, uint32_t>> want;   // name -> (shape GGUF order, type; ~0 = any)
     const uint32_t ANY = ~0u;
     // the llama.cpp convention (ISTA-DASLab's GGUFs): the same tensors and shapes, but dense types of the quantizer's
@@ -477,8 +712,12 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
     add("token_embd.weight", { D, (uint64_t) G.vocab }, ty::F16);
     add("output_norm.weight", { D }, ty::F32);
     add("output.weight", { D, (uint64_t) G.vocab }, ty::Q8_0);
-    G.experts.assign((size_t) G.n_layer, {});
+    G.experts.assign((size_t) (G.n_layer > 0 ? G.n_layer : 0), {});
     for (int64_t l : layers) {
+        if (l < 0 || l >= G.n_layer) {
+            if (detail::halt(iss, e = "layer " + std::to_string(l) + " is outside block_count " + std::to_string(G.n_layer))) return e;
+            continue;
+        }
         const std::string b = "blk." + std::to_string(l) + ".";
         for (const char * site : { "attn", "ffn" }) {
             add(b + "hc_" + site + "_fn.weight", { HC * D, MIX }, ty::F16);
@@ -500,7 +739,7 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
             add(b + "attn_compressor_norm.weight", { DH }, ty::F32);
             add(b + "indexer.attn_k.weight", { DH, ID }, ty::F16);
             add(b + "indexer.k_norm.weight", { ID }, ty::F32);
-            if (G.ratio[(size_t) l] > 1) add(b + "attn_compressor_gate.weight", { D, DH }, ty::F16);
+            if ((size_t) l < G.ratio.size() && G.ratio[(size_t) l] > 1) add(b + "attn_compressor_gate.weight", { D, DH }, ty::F16);
         }
         if (G.is_index_source(l)) {
             add(b + "indexer.attn_q_b.weight", { RQ, IH * ID }, ty::F16);
@@ -533,8 +772,11 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
             const TensorInfo * tm = m.find(mapn, &si);
             if (!tm) {   // uniform: one stacked tensor per role
                 const TensorInfo * t0 = m.find(b + "ffn_" + roles[0] + "_exps.weight");
-                if (!t0) return "missing " + b + "ffn_" + roles[0] + "_exps.weight (and no " + mapn + ")";
-                for (uint64_t e = 0; e < NE; ++e) { tv[e] = (int) t0->type; sv[e] = (int) e; }
+                if (!t0) {
+                    if (detail::halt(iss, e = "missing " + b + "ffn_" + roles[0] + "_exps.weight (and no " + mapn + ")")) return e;
+                    continue;
+                }
+                for (uint64_t x = 0; x < NE; ++x) { tv[x] = (int) t0->type; sv[x] = (int) x; }
                 for (const char * r : roles) {
                     if (!r) continue;
                     const std::string n = b + "ffn_" + r + "_exps.weight";
@@ -544,13 +786,18 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
                 continue;
             }
             add(mapn, { NE }, ty::I32);
-            if (tm->type != ty::I32 || tm->shape.size() != 1 || tm->shape[0] != NE) return mapn + ": bad shape/type";
+            if (tm->type != ty::I32 || tm->shape.size() != 1 || tm->shape[0] != NE || !m.in_bounds(*tm, si)) {
+                if (detail::halt(iss, e = mapn + ": bad shape/type")) return e;
+                continue;
+            }
             const int32_t * mv = reinterpret_cast<const int32_t *>(m.shard(si).tensor_data(*tm));
             std::map<int, int> count;
-            for (uint64_t e = 0; e < NE; ++e) { tv[e] = mv[e]; sv[e] = count[mv[e]]++; }
+            for (uint64_t x = 0; x < NE; ++x) { tv[x] = mv[x]; sv[x] = count[mv[x]]++; }
             for (const auto & [t, n] : count) {
-                if (t != (int) ty::Q2_0 && t != (int) ty::Q3_K && t != (int) ty::PTQ1_0)
-                    return mapn + ": type " + std::to_string(t) + " is not an expert tier";
+                if (t != (int) ty::Q2_0 && t != (int) ty::Q3_K && t != (int) ty::PTQ1_0) {
+                    if (detail::halt(iss, e = mapn + ": type " + std::to_string(t) + " is not an expert tier")) return e;
+                    continue;
+                }
                 std::string tn = ggml_type_name((uint32_t) t);
                 for (char & c : tn) c = (char) std::tolower((unsigned char) c);
                 for (const char * r : roles) {
@@ -578,16 +825,39 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
     for (const auto & [n, st] : want) {
         size_t s = 0;
         const TensorInfo * t = m.find(n, &s);
-        if (!t) return "missing tensor " + n;
+        if (!t) {
+            if (detail::halt(iss, e = "missing tensor " + n)) return e;
+            continue;
+        }
         if (t->shape != st.first) {
             std::string a, w;
             for (auto x : t->shape) a += std::to_string(x) + " ";
             for (auto x : st.first) w += std::to_string(x) + " ";
-            return n + ": shape [" + a + "] expected [" + w + "]";
+            if (detail::halt(iss, e = n + ": shape [" + a + "] expected [" + w + "]")) return e;
+            continue;
         }
-        if (st.second != ANY && t->type != st.second)
-            return n + ": type " + std::string(ggml_type_name(t->type)) + " expected " + ggml_type_name(st.second);
-        if (!m.in_bounds(*t, s)) return n + ": out of bounds";
+        if (st.second != ANY && t->type != st.second) {
+            if (detail::halt(iss, e = n + ": type " + std::string(ggml_type_name(t->type)) + " expected " + ggml_type_name(st.second))) return e;
+            continue;
+        }
+        // a type id this engine has no block layout for (ik_llama's 144+, a newer ggml's): refused by name, never read
+        if (!ds41_type_known(t->type)) {
+            if (detail::halt(iss, e = n + ": GGUF type " + ds41_type_label(t->type) + " is not a type this engine reads")) return e;
+            continue;
+        }
+        // type 43 here is either Unsloth's MXFP8 Engram table (read by Ds41Engram) or mainline ggml's F8_E4M3; neither
+        // reaches this build's ggml, so a dense tensor of it (or of PTQ1_0) is refused here instead of in ggml_new_tensor
+        if (t->type == ty::FP8_43 && ds41_type43_layout(m, *t, s) == Ds41Fp8Layout::F8E4M3) {
+            if (detail::halt(iss, e = n + ": type 43 holds one byte a value here (ggml's F8_E4M3, llama.cpp v0.9.0+), not the "
+                                          "33-byte MXFP8 blocks this engine reads as type 43")) return e;
+            continue;
+        }
+        if (t->type >= ty::kGgmlTypes && !ds41_is_routed_name(n) && n != "per_layer_token_embd.weight") {
+            if (detail::halt(iss, e = n + ": type " + ds41_type_label(t->type) + " on a dense tensor (the dense loader reads ggml's types up "
+                                      "to Q2_0 = 42; FP8 dense rows are not read yet)")) return e;
+            continue;
+        }
+        if (!m.in_bounds(*t, s) && detail::halt(iss, e = n + ": out of bounds")) return e;
     }
     for (size_t s = 0; s < m.size(); ++s)
         for (const auto & t : m.shard(s).tensors())
@@ -595,7 +865,7 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
                 // a DwarfStar (antirez/ds4) single-file GGUF carries the Engram tables inline as blk.L.engram_embd.weight;
                 // this engine reads Engram from --engram (the HF shards), so those tensors are simply not used
                 if (t.name.rfind("blk.", 0) == 0 && t.name.size() > 19 && t.name.compare(t.name.size() - 19, 19, ".engram_embd.weight") == 0) continue;
-                return "unexpected tensor " + t.name;
+                if (detail::halt(iss, e = "unexpected tensor " + t.name + (iss ? " (" + ds41_type_label(t.type) + ")" : std::string()))) return e;
             }
     return {};
 }

@@ -26,7 +26,7 @@
     "--prompt-batch",
     "16384",
     "--rank",
-    "${XO_ROOT}/data/ds41/rank-1017-share.bin",
+    "${DS41_RANK}",
     "--pf-b",
     "0.7",
     "--pcie",

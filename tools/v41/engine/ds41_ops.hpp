@@ -20,6 +20,7 @@
 #include "ggml.h"
 
 #include <cmath>
+#include <cstdlib>
 
 namespace strata::v41 {
 
@@ -64,6 +65,34 @@ inline ggml_tensor * ds41_fake_quant(ggml_context * c, ggml_tensor * x, Ds41Quan
     ggml_tensor * v = ggml_clamp(c, ggml_div(c, x2, s), -maxv, maxv);
     ggml_tensor * q = fp8 ? ds41_round_fmt(c, v, 3, 0x1p-6f) : ds41_round_fmt(c, v, 1, 1.0f);
     return ggml_reshape(c, ggml_mul(c, q, s), x);
+}
+
+/// STRATA_FOLDS=1 (default off): small exact folds of
+/// a stock op into the kernel next to it, CUDA only (the callers check the backend):
+///   1. the residual add in front of hc_post (finish: shexp + routed; the DSpark drafter: routed + shared) inside the
+///      hc_post kernel (ds41_hc_post_add below) - one add kernel fewer per layer-pass;
+///   2. the DSpark drafter's clamp / clamp / swiglu_split chains (routed and shared experts) as GGML_GLU_OP_SWIGLU_CLAMP,
+///      the STRATA_FUSE shared-expert form - 3 kernels -> 1, and ggml-cuda's MMVQ GLU fusion where it applies.
+/// Both are the same F32 steps in the same order (test_ds41_fuse --cuda --folds).
+inline bool ds41_folds_on() {
+    static const bool on = [] {
+        const char * e = std::getenv("STRATA_FOLDS");
+        return e && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+/// hc_post(a + b, residual, post, comb) as ONE op: the hc_post node with b in src[4] - xolotl-ggml.patch's
+/// dsv4_hc_post kernel (CUDA) and CPU op then read x as a + b, the same single F32 add the separate ggml_add did (IEEE
+/// addition is commutative bit for bit).  No ggml API change (src[4] of the existing op), so a ggml tree without the
+/// patch would ignore b: the patch stamp in build-ds41.bat keeps tree and patch together.
+inline ggml_tensor * ds41_hc_post_add(ggml_context * c, ggml_tensor * a, ggml_tensor * b, ggml_tensor * residual,
+                                      ggml_tensor * post, ggml_tensor * comb) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && ggml_are_same_shape(a, b));
+    ggml_tensor * t = ggml_dsv4_hc_post(c, a, residual, post, comb);
+    GGML_ASSERT(t->src[4] == nullptr);
+    t->src[4] = b;
+    return t;
 }
 
 }  // namespace strata::v41

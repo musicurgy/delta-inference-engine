@@ -1489,6 +1489,19 @@ class ClientShapes(unittest.TestCase):
             with self.subTest(calls=calls), self.assertRaisesRegex(ValueError, "tool_calls must be a list of objects"):
                 openai_to_messages({"messages": [{"role": "assistant", "content": "", "tool_calls": calls}]})
 
+    def test_tool_call_without_name_is_invalid(self):
+        """0.95 (SGLang #49475): an assistant tool call whose function name is missing / None / not text is the
+        request's fault (ValueError -> 400), not a crash in the template; a named call reads as before."""
+        from serve.frontend import openai_to_messages
+        for fn in ({"arguments": "{}"}, {"name": None, "arguments": "{}"}, {"name": 5, "arguments": "{}"}):
+            calls = [{"id": "c1", "type": "function", "function": fn}]
+            with self.subTest(fn=fn), self.assertRaisesRegex(ValueError, r"tool_calls\[0\]\.function\.name"):
+                openai_to_messages({"messages": [{"role": "user", "content": "u"},
+                                                 {"role": "assistant", "content": "", "tool_calls": calls}]})
+        msgs = openai_to_messages({"messages": [{"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}]})[0]
+        self.assertEqual(msgs[0]["tool_calls"], [{"function": {"name": "f", "arguments": {}}}])
+
     def test_tool_call_malformed_arguments_fallback(self):
         from serve.frontend import openai_to_messages
         bad_call = [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{malformed_json"}}]
@@ -1636,6 +1649,63 @@ class SharedPrefix(unittest.TestCase):
         self.assertEqual(ids, self.svc.prepare(self.MSGS, None, {}, 16)[0])
 
 
+class SystemEndKey(unittest.TestCase):
+    """#59 (STRATA_SHARED_PREFIX): with SHARED_PREFIX on, prepare() names where the system + tools block ends
+    (strata_sys_end) and the engine gets sys_end=N; off (the default), nothing is added or sent."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.tok = tok
+
+    SYS = {"role": "system", "content": "You are a careful agent. " * 8}
+    TOOLS = [{"name": "read_file", "description": "Read a file",
+              "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}]
+
+    def keys(self, **sampling):
+        return StrataEngine.sampling_keys(sampling).split()
+
+    def test_off_by_default(self):
+        import serve.server as S
+        self.assertFalse(S.SHARED_PREFIX)
+        req = {"temperature": 0}
+        self.svc.prepare([self.SYS, {"role": "user", "content": "hi"}], None, {}, 16, req=req)
+        self.assertEqual(req, {"temperature": 0})
+        self.assertFalse([k for k in self.keys(strata_sys_end=100) if k.startswith("sys_end=")])
+
+    def test_on_names_the_block_end(self):
+        import serve.server as S
+        with mock.patch.object(S, "SHARED_PREFIX", True):
+            ends = []
+            for q in ("hi", "a different question entirely"):
+                req = {"strata_sys_end": 3}                       # a client's own value is not kept
+                ids, _, _ = self.svc.prepare([self.SYS, {"role": "user", "content": q}], None, {}, 16, req=req)
+                n = req["strata_sys_end"]
+                text = self.tok.decode(ids[:n])
+                self.assertTrue(text.endswith("You are a careful agent.<|im_end|>\n"), text[-60:])
+                self.assertEqual(self.tok.decode(ids[n:n + 1]), "<|im_start|>")
+                ends.append(n)
+                self.assertIn(f"sys_end={n}", self.keys(**req))
+            self.assertEqual(ends[0], ends[1])                    # the same block, the same end, whatever follows
+            # the tools are part of the block; a template that will not render the block alone (this one refuses no
+            # messages: tools without a system message) leaves the key out, as does a prompt with no block at all
+            req = {}
+            ids, _, _ = self.svc.prepare([self.SYS, {"role": "user", "content": "hi"}], self.TOOLS, {}, 16, req=req)
+            self.assertIn("read_file", self.tok.decode(ids[:req["strata_sys_end"]]))
+            self.assertTrue(self.tok.decode(ids[req["strata_sys_end"]:]).startswith("<|im_start|>user"))
+            for tools in (self.TOOLS, None):
+                req = {"strata_sys_end": 7}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.svc.prepare([{"role": "user", "content": "hi"}], tools, {}, 16, req=req)
+                self.assertNotIn("strata_sys_end", req)
+            req = {"strata_sys_end": 7}
+            self.svc.prepare([{"role": "user", "content": "hi"}], None, {}, 16, req=req)
+            self.assertNotIn("strata_sys_end", req)
+            for bad in (0, -5, True, "12", 1.5):
+                self.assertFalse([k for k in self.keys(strata_sys_end=bad) if k.startswith("sys_end=")], bad)
+
+
 class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
@@ -1717,6 +1787,110 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(child_env({"backend": "hip", "gpu": 0, "hip_ordinal": "x"})["HIP_VISIBLE_DEVICES"], "0")
         plain = child_env({"backend": "hip"})
         self.assertEqual(plain.get("HIP_VISIBLE_DEVICES"), os.environ.get("HIP_VISIBLE_DEVICES"))
+
+
+class TokenLimitWholeNumber(unittest.TestCase):
+    """0.95 (Niko1221/Strata 0bf27a4be): a reply's token limit is a whole number on Chat (max_tokens,
+    max_completion_tokens) and Messages (max_tokens).  int() turned true into 1 and 2.5 into 2 without a word, and
+    Infinity raised OverflowError; those are a 400 now.  Whole numbers - also 3.0 and "3", 0, -1 and other negatives
+    (the default) - are taken as before."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "</think>\n\nanswer is long enough", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, path, raw: bytes):
+        req = urllib.request.Request(self.base + path, data=raw, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def body(self, path, field, value: str) -> bytes:
+        msgs = '[{"role": "user", "content": "hi"}]'
+        return f'{{"model": "m", "messages": {msgs}, "{field}": {value}}}'.encode()
+
+    def test_not_a_whole_number_is_a_400(self):
+        for path, fields in (("/v1/chat/completions", ("max_tokens", "max_completion_tokens")), ("/v1/messages", ("max_tokens",))):
+            for field in fields:
+                for value in ("true", "2.5", '"2.5"', '"abc"', "[3]", '{"n": 3}', "Infinity", "NaN"):
+                    with self.subTest(path=path, field=field, value=value):
+                        code, body = self.post(path, self.body(path, field, value))
+                        self.assertEqual(code, 400, body)
+                        self.assertIn(field, json.dumps(body))
+
+    def test_whole_numbers_as_before(self):
+        def used(path, field, value):
+            code, body = self.post(path, self.body(path, field, value))
+            self.assertEqual(code, 200, (path, field, value, body))
+            u = body["usage"]
+            return u.get("completion_tokens", u.get("output_tokens"))
+        for path, fields in (("/v1/chat/completions", ("max_tokens", "max_completion_tokens")), ("/v1/messages", ("max_tokens",))):
+            for field in fields:
+                with self.subTest(path=path, field=field):
+                    self.assertEqual([used(path, field, v) for v in ("3", "3.0", '"3"', '"+3"')], [3] * 4)
+                    unlimited = used(path, field, "0") if path != "/v1/messages" else used(path, field, "-1")
+                    self.assertGreater(unlimited, 3)
+                    self.assertEqual(used(path, field, "-5"), unlimited)
+
+
+class StreamUsageChunk(unittest.TestCase):
+    """0.95 (Niko1221/Strata 517e0baa5): OpenAI's streaming contract - with "stream_options": {"include_usage": true}
+    the usage rides in its own last chunk, "choices": [] (LiteLLM, the AI SDK read it there).  Without the option the
+    usage stays on the finish_reason chunk, as before."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "</think>\n\nanswer", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def stream(self, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64, "stream": True, **extra}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            lines = r.read().decode().split("\n\n")
+        data = [x[len("data: "):] for x in lines if x.startswith("data: ")]
+        self.assertEqual(data[-1], "[DONE]")
+        return [json.loads(x) for x in data[:-1]]
+
+    def test_usage_in_its_own_last_chunk(self):
+        chunks = self.stream(stream_options={"include_usage": True})
+        last, finish = chunks[-1], chunks[-2]
+        self.assertEqual(last["choices"], [])
+        self.assertGreater(last["usage"]["completion_tokens"], 0)
+        self.assertEqual(last["usage"]["total_tokens"], last["usage"]["prompt_tokens"] + last["usage"]["completion_tokens"])
+        self.assertIn("cached_tokens", last["usage"]["prompt_tokens_details"])
+        self.assertEqual((last["id"], last["model"], last["created"]), (finish["id"], finish["model"], finish["created"]))
+        self.assertEqual(finish["choices"][0]["finish_reason"], "stop")
+        self.assertNotIn("usage", finish)
+        self.assertEqual(sum(1 for c in chunks if "usage" in c), 1)
+
+    def test_without_the_option_the_stream_is_unchanged(self):
+        for extra in ({}, {"stream_options": {"include_usage": False}}, {"stream_options": None},
+                      {"stream_options": "yes"}, {"stream_options": [1]}):
+            chunks = self.stream(**extra)
+            self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop", extra)
+            self.assertGreater(chunks[-1]["usage"]["completion_tokens"], 0, extra)
+            self.assertTrue(all(c["choices"] for c in chunks), extra)
 
 
 class HipEnvGuard(unittest.TestCase):
@@ -2925,6 +3099,79 @@ class SharedSettings(unittest.TestCase):
         self.assertEqual(self.svc.with_shared({"reasoning_effort": "high"}, "openai")["reasoning_effort"], "high")
         self.assertEqual(self.svc.with_shared({}, "anthropic")["output_config"], {"effort": "low"})
 
+    def test_a_new_seed_for_each_sampled_request_without_one(self):
+        """C2: with STRATA_SERVE_SEED=1 (the launcher sets it; the server's default is 0), no seed from the request,
+        the config or the shared settings: every SAMPLED request gets a new one (the engine's generator, seeded once at
+        its start, made the first sampled reply after each start the same); a request's own seed and the shared
+        settings' seed win; a greedy request gets no seed key (its engine line is unchanged).  Unset or 0: the old
+        behaviour, no seed sent."""
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"STRATA_SERVE_SEED": "1"}):
+            seeds = []
+            for _ in range(3):
+                code, _ = self.chat(temperature=0.8)
+                self.assertEqual(code, 200)
+                s = self.engine.last_sampling.get("seed")
+                self.assertIsInstance(s, int)
+                self.assertTrue(0 < s < 2 ** 31, s)
+                seeds.append(s)
+            self.assertEqual(len(set(seeds)), 3, seeds)                    # one fixed seed would repeat
+            code, _ = self.chat(temperature=0.8, seed=12345)
+            self.assertEqual(code, 200)
+            self.assertEqual(self.engine.last_sampling["seed"], 12345)
+            code, _ = self.chat(temperature=0.8, seed=None)                # null = not given
+            self.assertEqual(code, 200)
+            self.assertNotEqual(self.engine.last_sampling["seed"], 12345)
+            for greedy in ({"temperature": 0}, {}):                        # greedy: nothing added
+                code, _ = self.chat(**greedy)
+                self.assertEqual(code, 200)
+                self.assertNotIn("seed", self.engine.last_sampling)
+            self.req("/settings", {"defaults": {"temperature": 0.5, "seed": 9}})
+            self.chat()
+            self.assertEqual(self.engine.last_sampling["seed"], 9)         # the shared seed wins
+            self.svc.set_shared(None)
+        for off in ({"STRATA_SERVE_SEED": "0"}, {}):
+            with mock.patch.dict(os.environ, off):
+                if not off:                                                 # unset: the server default
+                    os.environ.pop("STRATA_SERVE_SEED", None)
+                self.chat(temperature=0.8)
+                self.assertNotIn("seed", self.engine.last_sampling)
+
+    def test_the_seed_key_reaches_the_engine_line_only_when_sampled(self):
+        from unittest import mock
+        from serve.server import with_request_seed
+        with mock.patch.dict(os.environ, {"STRATA_SERVE_SEED": "1"}):
+            self.assertEqual(StrataEngine.sampling_keys(with_request_seed({"temperature": 0})), "")
+            self.assertEqual(StrataEngine.sampling_keys(with_request_seed({"temperature": 1.0, "top_p": 0.95,
+                                                                           "seed": 1000})),
+                             " temperature=1.0 top_p=0.95 seed=1000")
+            self.assertRegex(StrataEngine.sampling_keys(with_request_seed({"temperature": 1.0})),
+                             r"^ temperature=1\.0 seed=\d+$")
+            self.assertIsNone(with_request_seed(None))
+        with mock.patch.dict(os.environ, {"STRATA_SERVE_SEED": "0"}):
+            self.assertEqual(with_request_seed({"temperature": 1.0}), {"temperature": 1.0})
+
+    def test_renamed_switches_read_their_old_names(self):
+        """The 0.95-rc names (STRATA_P3_SERVER_*) still work when the new name is unset; the new name wins."""
+        from unittest import mock
+        from serve import server as S
+        new_old = (("STRATA_SERVE_SEED", "STRATA_P3_SERVER_SEED", S.seed_switch_on),
+                   ("STRATA_SERVE_LOOP_SHAPE", "STRATA_P3_SERVER_LOOP_SHAPE", S.loop_shape_switch_on))
+        for new, old, on in new_old:
+            with mock.patch.dict(os.environ, {old: "1"}):
+                os.environ.pop(new, None)
+                self.assertTrue(on(), old)
+            with mock.patch.dict(os.environ, {old: "1", new: "0"}):
+                self.assertFalse(on(), new)
+            with mock.patch.dict(os.environ, {old: "0", new: "1"}):
+                self.assertTrue(on(), new)
+            with mock.patch.dict(os.environ, {}):
+                os.environ.pop(new, None)
+                os.environ.pop(old, None)
+                self.assertFalse(on(), "default off")
+            with mock.patch.dict(os.environ, {new: ""}):
+                self.assertFalse(on(), "an empty value is off")
+
     def test_off_again(self):
         self.req("/settings", {"defaults": {"temperature": 0.3}})
         code, b = self.req("/settings", {"defaults": None})
@@ -3946,8 +4193,8 @@ class CallingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.prompts.append(list(ids))
         prompt = self.tok.decode(ids)
-        if prompt.endswith("<function="):
-            text = "search>\n" + self.ARGS
+        if prompt.endswith("<tool_call>\n"):       # f096 (Strata 0.2.12): "required" opens only the wrapper
+            text = "<function=search>\n" + self.ARGS
         elif prompt.endswith("<function=search>\n"):
             text = self.ARGS
         elif prompt.endswith("</think>\n\n"):
@@ -4023,7 +4270,7 @@ class ForcedToolChoice(unittest.TestCase):
                     self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
                     self.assertEqual(reasoning, CallingEngine.THOUGHT)
                     first, second = self.engine.prompts
-                    opening = "<tool_call>\n<function=" + ("search>\n" if choice == self.NAMED else "")
+                    opening = "<tool_call>\n" + ("<function=search>\n" if choice == self.NAMED else "")
                     # where the thinking ended, after the blank line the template puts before a call
                     self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT + "</think>\n\n" + opening))
 
@@ -4032,7 +4279,7 @@ class ForcedToolChoice(unittest.TestCase):
         thought, calling = 'I will search for "2+2"', self.engine.generate
 
         def generate(ids, max_new, sampling, cancel, embeddings=None):
-            if self.tok.decode(ids).endswith(("<function=", "<function=search>\n")):
+            if self.tok.decode(ids).endswith(("<tool_call>\n", "<function=search>\n")):
                 yield from calling(ids, max_new, sampling, cancel)
                 return
             self.engine.prompts.append(list(ids))
@@ -4045,7 +4292,7 @@ class ForcedToolChoice(unittest.TestCase):
                 finish, calls, reasoning = self.call_of(code, b, stream)
                 self.assertEqual((finish, calls, reasoning), ("tool_calls", [("search", {"q": "2+2"})], thought))
                 first, second = self.engine.prompts
-                self.assertEqual(second, first + self.tok.encode(thought + "</think>\n\n<tool_call>\n<function="))
+                self.assertEqual(second, first + self.tok.encode(thought + "</think>\n\n<tool_call>\n"))
 
     def test_without_thinking_the_prompt_ends_with_the_opening(self):
         for choice in ("required", self.NAMED):
@@ -4056,7 +4303,7 @@ class ForcedToolChoice(unittest.TestCase):
                     finish, calls, reasoning = self.call_of(code, b, stream)
                     self.assertEqual((finish, calls, reasoning), ("tool_calls", [("search", {"q": "2+2"})], ""))
                     self.assertEqual(len(self.engine.prompts), 1)
-                    opening = "<tool_call>\n<function=" + ("search>\n" if choice == self.NAMED else "")
+                    opening = "<tool_call>\n" + ("<function=search>\n" if choice == self.NAMED else "")
                     self.assertTrue(self.tok.decode(self.engine.prompts[0]).endswith("</think>\n\n" + opening))
 
     def test_the_budget_wrap_up_opens_the_call(self):
@@ -4066,7 +4313,7 @@ class ForcedToolChoice(unittest.TestCase):
         self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
         self.assertEqual(reasoning, CallingEngine.THOUGHT[:20] + REASONING_WRAP_UP.split("</think>")[0])
         first, second = self.engine.prompts
-        extra = self.tok.encode(REASONING_WRAP_UP + "<tool_call>\n<function=", parse_special=True)
+        extra = self.tok.encode(REASONING_WRAP_UP + "<tool_call>\n", parse_special=True)
         self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT[:20]) + extra)
 
     def test_auto_absent_and_none_leave_the_tools_to_the_model(self):
@@ -4397,6 +4644,24 @@ class ModelAliases(unittest.TestCase):
         self.assertEqual(data[0]["aliases"], ["qwen", "local-model"])
         self.assertEqual(data[1]["alias_of"], "qwen3.8-flash-next-iq3_xxs")
         self.assertEqual(self.get("/props?model=local-model")["model_alias"], "qwen3.8-flash-next-iq3_xxs")
+
+    def test_one_model_by_id(self):
+        """0.95 (Strata 0.2.17): GET /v1/models/{id} returns the listing's entry - the model or an alias, with the
+        context fields agents read - and OpenAI's 404 (model_not_found) for an id the server does not list."""
+        listed = {m["id"]: m for m in self.get("/v1/models")["data"]}
+        for mid in ("qwen3.8-flash-next-iq3_xxs", "qwen", "local-model"):
+            for prefix in ("/v1/models/", "/models/"):
+                with self.subTest(mid=mid, prefix=prefix):
+                    one = self.get(prefix + mid)
+                    self.assertEqual(one, listed[mid])
+                    self.assertEqual(one["max_model_len"], one["context_length"])
+        for mid in ("gpt-4o", "qwen%2Fother"):
+            with self.subTest(mid=mid), self.assertRaises(urllib.error.HTTPError) as cm:
+                self.get("/v1/models/" + mid)
+            with cm.exception as e:
+                self.assertEqual(e.code, 404)
+                err = json.loads(e.read())["error"]
+                self.assertEqual((err["code"], err["type"]), ("model_not_found", "invalid_request_error"))
 
     def test_requests_are_answered_under_the_alias(self):
         msgs = [{"role": "user", "content": "hi"}]
@@ -5219,7 +5484,7 @@ class VisionArgs(unittest.TestCase):
             seen.append(args)
             return Proc()
 
-        with mock.patch.object(server.subprocess, "Popen", popen), mock.patch.object(server, "contain"):
+        with mock.patch.object(server.subprocess, "Popen", popen), mock.patch("serve.winjob.contain"):
             server.Vision({"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf", **cfg})
         return seen[0]
 
@@ -5335,7 +5600,7 @@ class LazyVision(unittest.TestCase):
             started.append(p)
             return p
 
-        with mock.patch.object(server, "popen", popen), mock.patch.object(server, "contain"):
+        with mock.patch.object(server, "popen", popen), mock.patch("serve.winjob.contain"):
             v = server.Vision({"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf"}, lazy=True)
             self.addCleanup(lambda: shutil.rmtree(v.dir, ignore_errors=True))
             return v, started, popen
@@ -5348,7 +5613,7 @@ class LazyVision(unittest.TestCase):
     def test_restart_starts_it_and_close_ends_it(self):
         import serve.server as server
         v, started, popen = self.make()
-        with mock.patch.object(server, "popen", popen), mock.patch.object(server, "contain"):
+        with mock.patch.object(server, "popen", popen), mock.patch("serve.winjob.contain"):
             v.restart()
         self.assertTrue(v.alive())
         self.assertEqual(len(started), 1)
@@ -5370,7 +5635,7 @@ class LazyVision(unittest.TestCase):
                     return 0
             started.append(P)
             return P()
-        with mock.patch.object(server, "popen", popen), mock.patch.object(server, "contain"):
+        with mock.patch.object(server, "popen", popen), mock.patch("serve.winjob.contain"):
             with self.assertRaises(RuntimeError):
                 v.restart()
         self.assertTrue(started[-1].killed)
@@ -5578,7 +5843,7 @@ class UntimedReads(unittest.TestCase):
         v.spawn = (["strata-vision"], None, None)
         v.dir = Path(tempfile.mkdtemp(prefix="strata-vision-test-"))
         try:
-            with mock.patch.object(server, "popen", lambda *a, **k: proc), mock.patch.object(server, "contain"),                     mock.patch.object(server, "VISION_READY_S", 0.3):
+            with mock.patch.object(server, "popen", lambda *a, **k: proc), mock.patch("serve.winjob.contain"),                     mock.patch.object(server, "VISION_READY_S", 0.3):
                 with self.assertRaises(RuntimeError) as cm:
                     v._start()
             self.assertIn("did not start", str(cm.exception))

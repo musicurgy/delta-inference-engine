@@ -43,14 +43,38 @@ set /a VRAMN=VRAM_MIB+0 2>nul
 if defined VRAM_MIB if %VRAMN% LSS 14000 set "DS41_NO_DRAFTER=1"
 rem stop before a download fills the drive (the downloader only warns): what is still to do vs the free space
 "%PY%" tools\v41\setup_space.py "%M%" || exit /b 1
-set "DS=deepseek-ai/DeepSeek-V4.1-Flash-1017"
-set "Q2=DeepSeek-V4.1-Flash-1017-Q2.gguf"
+rem the checkpoint's repositories and file names: data\ds41\checkpoints.json, its "default" row unless DS41_CHECKPOINT
+rem names another (tools\v41\ckpt.py bat).  The defaults below are 1017's, kept if the table cannot be read.  An empty
+rem value: the checkpoint has no such file (yet).
+set "CK_ID=1017"
+set "CK_LABEL=DeepSeek V4.1 Flash 1017"
+set "CK_DS=deepseek-ai/DeepSeek-V4.1-Flash-1017"
+set "CK_SMALL_DIR=deepseek"
+set "CK_MTP_HINT=model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors"
+set "CK_Q2=DeepSeek-V4.1-Flash-1017-Q2.gguf"
+set "CK_Q2_REPO=nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF"
+set "CK_DRAFT_SRC=V41-1017-MTP.gguf"
+set "CK_DRAFT_UNI=V41-1017-MTP-iq2xxs.gguf"
+set "CK_DRAFT_IMX=V41-1017-MTP-iq2xxs-imx.gguf"
+set "CK_VISION=DeepSeek-V4.1-Flash-1017-Vision.gguf"
+set "CK_VISION_REPO=nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF"
+set "CK_TOKENIZER=tokenizer"
+set "CK_IMATRIX=tools\v41\serve\drafter-imatrix.bin"
+for /f "usebackq tokens=1,* delims==" %%a in (`""%PY%" tools\v41\ckpt.py bat"`) do set "%%a=%%b"
+rem a DS41_CHECKPOINT the table does not have: stop here, never fall back to 1017's files
+if defined DS41_CHECKPOINT if /i not "%DS41_CHECKPOINT%"=="%CK_ID%" echo DS41_CHECKPOINT=%DS41_CHECKPOINT% is not a row of data\ds41\checkpoints.json - nothing was done.
+if defined DS41_CHECKPOINT if /i not "%DS41_CHECKPOINT%"=="%CK_ID%" exit /b 1
+set "DS=%CK_DS%"
+set "Q2=%CK_Q2%"
 
 rem 1. Is the main model needed?  It is downloaded LAST (step 7), so a problem in the small steps shows before hours of
 rem    download.  An install from before 2026-10-27 has ds4-q2-slim.gguf + DeepSeek's Engram shards in engram\ instead
 rem    of the GGUF: it keeps working as it is.  A model Choose Model.bat picked and that is there (an Unsloth GGUF
 rem    carries its own Engram) stands for the default.
 set "SKIPMAIN="
+rem a checkpoint without a ds4 Q2 GGUF: nothing to download here - a model is picked with Choose Model.bat
+if not defined Q2 set "SKIPMAIN=1"
+if not defined Q2 echo %CK_LABEL% has no ds4 Q2 GGUF: pick its model with Choose Model.bat.
 if exist "%M%\ds4-q2-slim.gguf" if exist "%M%\engram\model-00048-of-00048.safetensors" set "SKIPMAIN=1"
 set "PICK="
 if exist "%~dp0model-choice.txt" set /p PICK=<"%~dp0model-choice.txt"
@@ -64,8 +88,9 @@ if not defined SKIPMAIN if not exist "%M%\%Q2%" if exist "%M%\download\%Q2%" (
 )
 if exist "%M%\%Q2%.ok" set "SKIPMAIN=1"
 rem 2. DeepSeek's small files: the tokenizer, the config and the shard index (the drafter step reads them too)
-set "D=%M%\deepseek"
-if exist "%M%\engram\tokenizer.json" set "D=%M%\engram"
+set "D=%M%\%CK_SMALL_DIR%"
+rem (an install from before 2026-10-27 has 1017's small files in engram\)
+if /i "%CK_SMALL_DIR%"=="deepseek" if exist "%M%\engram\tokenizer.json" set "D=%M%\engram"
 set "GET="
 for %%f in (model.safetensors.index.json config.json tokenizer.json tokenizer_config.json) do if not exist "%D%\%%f" set "GET=1"
 if defined GET (
@@ -73,8 +98,9 @@ if defined GET (
 )
 
 rem 3. The tokenizer tables the server reads
-if not exist "%M%\tokenizer\vocab.json" (
-  "%PY%" tools\v41\serve\export_tokenizer.py "%D%" "%M%\tokenizer" || exit /b 1
+if not exist "%M%\%CK_TOKENIZER%\vocab.json" (
+  "%PY%" tools\v41\serve\export_tokenizer.py "%D%" "%M%\%CK_TOKENIZER%" || exit /b 1
+  "%PY%" tools\v41\ckpt.py stamp "%M%\%CK_TOKENIZER%" --role tokenizer --id %CK_ID% --from %DS% >nul
 )
 
 rem 4. The DSpark drafter (speculative decoding: the biggest single speed-up; the main model checks every drafted token,
@@ -90,32 +116,42 @@ rem    one - 7.9 GB of download is a poor trade for ~0.3% speed - unless the ful
 rem    one is made from it, no download) or "setup-ds41-models.bat drafter-imx" / DS41_DRAFTER_IMX=1 asks for it.  The
 rem    launcher uses whichever is there, the new one first.
 if defined DS41_NO_DRAFTER goto main
-if exist "%M%\V41-1017-MTP-iq2xxs-imx.gguf" goto drafter_done
+if not defined CK_DRAFT_IMX goto main
+if exist "%M%\%CK_DRAFT_IMX%" goto drafter_done
 rem the engine build this CPU runs (cpu_level.py: this PC's own build, else the portable or an older-CPU one)
 set "REQ="
 for /f "usebackq delims=" %%b in (`""%PY%" tools\v41\serve\cpu_level.py --pick-build"`) do set "REQ=%%b\v41_sidecar_requant.exe"
 if not defined REQ set "REQ=build-ds41\v41_sidecar_requant.exe"
+rem the checkpoint's own importance matrix (its row's derived.drafter_imatrix; 1017: drafter-imatrix.bin), beside the
+rem engine build or at its place in a source checkout.  A checkpoint without one (CK_IMATRIX empty: a new checkpoint
+rem until its own is made) gets the uniform requant - never another checkpoint's matrix (ckpt.py imatrix-ok: its stamp
+rem or name)
 set "IMX="
-for %%r in ("%REQ%") do if exist "%%~dprdrafter-imatrix.bin" set "IMX=%%~dprdrafter-imatrix.bin"
-if not defined IMX if exist "tools\v41\serve\drafter-imatrix.bin" set "IMX=tools\v41\serve\drafter-imatrix.bin"
+if defined CK_IMATRIX for %%i in ("%CK_IMATRIX%") do for %%r in ("%REQ%") do if exist "%%~dpr%%~nxi" set "IMX=%%~dpr%%~nxi"
+if defined CK_IMATRIX if not defined IMX if exist "%CK_IMATRIX%" set "IMX=%CK_IMATRIX%"
+if defined IMX "%PY%" tools\v41\ckpt.py imatrix-ok "%IMX%" --id %CK_ID% || set "IMX="
 rem an engine build from before 0.94 does not know --imatrix (it answers "unknown arg"; a 0.94 one prints its usage):
 rem keep the uniform drafter then, instead of downloading the shards again on every run
 if defined IMX if exist "%REQ%" "%REQ%" --imatrix probe 2>&1 | findstr /c:"unknown arg" >nul && set "IMX="
 rem no importance matrix (an engine from before 0.94, no source copy) and the uniform drafter is there: keep it as it is
-if not defined IMX if exist "%M%\V41-1017-MTP-iq2xxs.gguf" goto main
-if exist "%M%\V41-1017-MTP.gguf" goto requant
+if not defined IMX if exist "%M%\%CK_DRAFT_UNI%" goto main
+if exist "%M%\%CK_DRAFT_SRC%" goto requant
 rem 0.93's drafter is there, the full-size one is not: no download unless asked (drafter-imx / DS41_DRAFTER_IMX=1)
-if exist "%M%\V41-1017-MTP-iq2xxs.gguf" if not "%DS41_DRAFTER_IMX%"=="1" echo Drafter: 0.93's.  A slightly better one is optional: setup-ds41-models.bat drafter-imx ^(downloads 7.9 GB once^).
-if exist "%M%\V41-1017-MTP-iq2xxs.gguf" if not "%DS41_DRAFTER_IMX%"=="1" goto main
-if exist "%M%\V41-1017-MTP-iq2xxs.gguf" echo Making the 0.94 drafter: the drafter's 7.9 GB of official shards are downloaded again ^(the old drafter keeps working until it is done^).
-"%PY%" tools\v41\serve\hf_get.py %DS% model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors --local-dir "%D%" || exit /b 1
-"%PY%" tools\v41\hf_verify.py --repo %DS% --dir "%D%" model-00044-of-00048.safetensors model-00045-of-00048.safetensors model-00046-of-00048.safetensors || exit /b 1
+if exist "%M%\%CK_DRAFT_UNI%" if not "%DS41_DRAFTER_IMX%"=="1" echo Drafter: 0.93's.  A slightly better one is optional: setup-ds41-models.bat drafter-imx ^(downloads 7.9 GB once^).
+if exist "%M%\%CK_DRAFT_UNI%" if not "%DS41_DRAFTER_IMX%"=="1" goto main
+if exist "%M%\%CK_DRAFT_UNI%" echo Making the 0.94 drafter: the drafter's 7.9 GB of official shards are downloaded again ^(the old drafter keeps working until it is done^).
+rem the shards that hold the MTP blocks, from the checkpoint's shard index (step 2 fetched it) - not a fixed list;
+rem the table's hint (1017: 44-46) only if the index cannot be read
+set "MTP=%CK_MTP_HINT%"
+for /f "usebackq delims=" %%s in (`""%PY%" tools\v41\ckpt.py mtp-shards "%D%\model.safetensors.index.json""`) do set "MTP=%%s"
+"%PY%" tools\v41\serve\hf_get.py %DS% %MTP% --local-dir "%D%" || exit /b 1
+"%PY%" tools\v41\hf_verify.py --repo %DS% --dir "%D%" %MTP% || exit /b 1
 set "V41_SRC=%D%"
-set "V41_SRC_NAME=DeepSeek V4.1 Flash 1017"
+set "V41_SRC_NAME=%CK_LABEL%"
 set "V41_SRC_URL=https://huggingface.co/%DS%"
-"%PY%" tools\v41\v41_sidecar.py --out "%M%\V41-1017-MTP.gguf.part" --no-vision || exit /b 1
-move /y "%M%\V41-1017-MTP.gguf.part" "%M%\V41-1017-MTP.gguf" >nul || exit /b 1
-for %%s in (44 45 46) do del /q "%D%\model-000%%s-of-00048.safetensors" "%D%\model-000%%s-of-00048.safetensors.ok" 2>nul
+"%PY%" tools\v41\v41_sidecar.py --out "%M%\%CK_DRAFT_SRC%.part" --no-vision || exit /b 1
+move /y "%M%\%CK_DRAFT_SRC%.part" "%M%\%CK_DRAFT_SRC%" >nul || exit /b 1
+for %%s in (%MTP%) do del /q "%D%\%%s" "%D%\%%s.ok" 2>nul
 
 :requant
 if not exist "%REQ%" (
@@ -125,24 +161,27 @@ if not exist "%REQ%" (
 echo Shrinking the drafter's experts to IQ2_XXS: ~5 minutes on a fast CPU, ~20 on a 4-core one.  It prints little
 echo until each block of experts is done - it is not stuck.
 if not defined IMX goto requant_uniform
-"%REQ%" --in "%M%\V41-1017-MTP.gguf" --out "%M%\V41-1017-MTP-iq2xxs-imx.gguf.part" --type IQ2_XXS --imatrix "%IMX%" && goto requant_imx_ok
+"%REQ%" --in "%M%\%CK_DRAFT_SRC%" --out "%M%\%CK_DRAFT_IMX%.part" --type IQ2_XXS --imatrix "%IMX%" && goto requant_imx_ok
 rem an engine build from before 0.94 does not know --imatrix (the matrix came with a source checkout): the uniform drafter
 echo This engine build cannot use the drafter's importance matrix - making the uniform drafter instead.
-del /q "%M%\V41-1017-MTP-iq2xxs-imx.gguf.part" 2>nul
-if exist "%M%\V41-1017-MTP-iq2xxs.gguf" goto requant_cleanup
+del /q "%M%\%CK_DRAFT_IMX%.part" 2>nul
+if exist "%M%\%CK_DRAFT_UNI%" goto requant_cleanup
 :requant_uniform
-"%REQ%" --in "%M%\V41-1017-MTP.gguf" --out "%M%\V41-1017-MTP-iq2xxs.gguf.part" --type IQ2_XXS --uniform-imatrix || exit /b 1
-move /y "%M%\V41-1017-MTP-iq2xxs.gguf.part" "%M%\V41-1017-MTP-iq2xxs.gguf" >nul || exit /b 1
+"%REQ%" --in "%M%\%CK_DRAFT_SRC%" --out "%M%\%CK_DRAFT_UNI%.part" --type IQ2_XXS --uniform-imatrix || exit /b 1
+move /y "%M%\%CK_DRAFT_UNI%.part" "%M%\%CK_DRAFT_UNI%" >nul || exit /b 1
+rem the checkpoint the drafter was made from, beside it (ds41_local.py compares it with the model's)
+"%PY%" tools\v41\ckpt.py stamp "%M%\%CK_DRAFT_UNI%" --role drafter --id %CK_ID% --from %DS% >nul
 goto requant_cleanup
 :requant_imx_ok
-move /y "%M%\V41-1017-MTP-iq2xxs-imx.gguf.part" "%M%\V41-1017-MTP-iq2xxs-imx.gguf" >nul || exit /b 1
+move /y "%M%\%CK_DRAFT_IMX%.part" "%M%\%CK_DRAFT_IMX%" >nul || exit /b 1
+"%PY%" tools\v41\ckpt.py stamp "%M%\%CK_DRAFT_IMX%" --role drafter --id %CK_ID% --from %DS% >nul
 :requant_cleanup
 rem the full-size drafter (7.9 GB) is only the requant's input
-del /q "%M%\V41-1017-MTP.gguf" 2>nul
+del /q "%M%\%CK_DRAFT_SRC%" "%M%\%CK_DRAFT_SRC%.ckpt.json" 2>nul
 
 :drafter_done
 rem the 0.93 drafter is not deleted here: it is the user's file.  Say once that it can go.
-if exist "%M%\V41-1017-MTP-iq2xxs-imx.gguf" if exist "%M%\V41-1017-MTP-iq2xxs.gguf" echo The older drafter V41-1017-MTP-iq2xxs.gguf ^(4.2 GB^) in the model folder is no longer used: you can delete it.
+if exist "%M%\%CK_DRAFT_IMX%" if exist "%M%\%CK_DRAFT_UNI%" echo The older drafter %CK_DRAFT_UNI% ^(4.2 GB^) in the model folder is no longer used: you can delete it.
 
 :main
 rem 5. Pictures (on unless vision-choice.txt or DS41_VISION says off; "setup-ds41-models.bat pictures ..." sets it):
@@ -158,10 +197,14 @@ for /f "usebackq tokens=1,2" %%a in (`""%PY%" tools\v41\serve\ds41_local.py --vi
   set "VTORCH=%%b"
 )
 if /i "%VPLAN%"=="off" goto voice
-set "VG=DeepSeek-V4.1-Flash-1017-Vision.gguf"
+set "VG=%CK_VISION%"
+rem a checkpoint whose vision file is not published (yet): text only - never another checkpoint's vision tower
+if not defined CK_VISION_REPO echo %CK_LABEL%: no vision file to download yet - pictures stay off until there is one.
+if not defined CK_VISION_REPO goto voice
 if exist "%M%\%VG%.ok" goto vision_torch
-"%PY%" tools\v41\serve\hf_get.py nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %VG% --local-dir "%M%" || exit /b 1
-"%PY%" tools\v41\hf_verify.py --repo nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF --dir "%M%" %VG% || exit /b 1
+"%PY%" tools\v41\serve\hf_get.py %CK_VISION_REPO% %VG% --local-dir "%M%" || exit /b 1
+"%PY%" tools\v41\hf_verify.py --repo %CK_VISION_REPO% --dir "%M%" %VG% || exit /b 1
+"%PY%" tools\v41\ckpt.py stamp "%M%\%VG%" --role vision --id %CK_ID% --from %CK_VISION_REPO% >nul
 :vision_torch
 rem PyTorch: any build does on the CPU; a card needs the CUDA one (a CPU build there is replaced)
 if /i "%VTORCH%"=="cuda" goto voice
@@ -216,9 +259,10 @@ rem 7. The main model: the ds4 Q2 GGUF of DeepSeek's official 1017 weights (366 
 rem    Engram tables - DeepSeek's own bytes - and the engine reads them straight from it.
 if defined SKIPMAIN goto done
 set "BIGDL=1"
-"%PY%" tools\v41\serve\hf_get.py nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF %Q2% --local-dir "%M%" || exit /b 1
+"%PY%" tools\v41\serve\hf_get.py %CK_Q2_REPO% %Q2% --local-dir "%M%" || exit /b 1
 rem the SHA-256 check reads all 366 GB (minutes): the PC stays awake for it too
-"%PY%" tools\v41\serve\hf_get.py --awake "%PY%" tools\v41\hf_verify.py --repo nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF --dir "%M%" %Q2% || exit /b 1
+"%PY%" tools\v41\serve\hf_get.py --awake "%PY%" tools\v41\hf_verify.py --repo %CK_Q2_REPO% --dir "%M%" %Q2% || exit /b 1
+"%PY%" tools\v41\ckpt.py stamp "%M%\%Q2%" --role model --id %CK_ID% --from %CK_Q2_REPO% >nul
 
 :done
 echo Setup finished.

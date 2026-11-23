@@ -117,6 +117,20 @@ class OldEngine(unittest.TestCase):
         self.engine(cpu_level.ENGINE_MARK + b" " + cpu_level.UTF8_MARK)
         self.assertEqual(cpu_level.pick_build(), ("build-ds41-portable", None))
 
+    def test_an_engine_without_the_prompt_margin_is_out_of_date(self):
+        # an engine from before --prompt-margin (it has the earlier 0.95 builds' mark) would refuse the option the launcher
+        # passes for files with bigger experts: it is replaced like any older engine
+        self.assertEqual(cpu_level.ENGINE_MARK, b"VRAM: the prompt path keeps")
+        self.engine(b"dense graph launches/pass " + cpu_level.UTF8_MARK)
+        folder, why = cpu_level.pick_build()
+        self.assertIsNone(folder)
+        self.assertIn("build-ds41-portable is older than this version of the scripts (an update)", why)
+
+    def test_the_mark_is_in_the_engine_this_tree_builds(self):
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engine", "ds41_generate.cpp"), encoding="utf-8").read()
+        self.assertIn(cpu_level.ENGINE_MARK.decode(), src)   # a string the engine prints, so the compiled exe holds it
+        self.assertIn('"--prompt-margin"', src)
+
     def test_a_path_with_other_letters_keeps_its_reason(self):
         self.engine(b"old")
         with mock.patch.dict(os.environ, {"DS41_MODELS": "C:/Users/Jos\u00e9/models"}):

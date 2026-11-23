@@ -1375,6 +1375,8 @@ if(STRATA_NATIVE_EXPERTS)
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
                                            src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
                                            src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
+                                           # STRATA_CPU_Q8_1: the pool's q8_1 activations and rows
+                                           src/kernels/cpu/q8_1_cpu.cpp src/kernels/cpu/q8_1_avx2.cpp
                                            # Delta: EXL3 experts (Project Maya's port of exllamav3's CPU kernels, MIT:
                                            # third_party/project-maya); exl3_cpu.cpp is AVX2 (below), entered only
                                            # after exl3_native_fmt's cpu_avx2_ok()
@@ -1387,6 +1389,7 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/exl3_cpu.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")   # Delta
     set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(src/kernels/cpu/q8_1_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")   # STRATA_CPU_Q8_1
     # the router lookahead's AVX1 dot (older CPUs; called behind cpu_avx1_ok): no FMA, no 256-bit integer ops
     set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
     # the older CPUs' Q2_0 rows and activation quantizer (q2_avx1.cpp, issue #1699): 128-bit integer lanes,
@@ -1400,6 +1403,7 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    set_source_files_properties(src/kernels/cpu/q8_1_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")   # STRATA_CPU_Q8_1
     set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
     # the older CPUs' Q2_0 rows and activation quantizer (q2_avx1.cpp, issue #1699): SSE4.2 + AVX with
     # AVX2/FMA/F16C explicitly off, so a -march=native build host cannot leak AVX2 code into the file that

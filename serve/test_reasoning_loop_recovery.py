@@ -36,6 +36,50 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(reasoning_repeat_coverage(' '.join(str(i) for i in range(4000))), 0)
         self.assertGreater(reasoning_repeat_coverage(self.loop), .9)
 
+    def test_sentences_that_differ_only_in_their_numbers(self):
+        """C2: FLE Link's loop tails (sirfyyn/flelink 5b46f56 tests/fixtures/loop-tails.json, MIT: the last 4,800 chars
+        of ISTA IQ2_XXS answers, one in a loop whose sentences differ only in their numbers, six long ones that are
+        not) - with STRATA_SERVE_LOOP_SHAPE=1 the loop reads as full coverage, the six as before (no shape
+        signal); by default (off) the 12-word count alone decides, and ordinary enumeration is not cut."""
+        import json
+        import os
+        from pathlib import Path
+        from serve.server import sentence_shape, sentence_shape_loop
+        old = os.environ.pop('STRATA_SERVE_LOOP_SHAPE', None)
+        try:
+            self._shape_cases(json, os, Path, sentence_shape, sentence_shape_loop)
+        finally:
+            if old is None:
+                os.environ.pop('STRATA_SERVE_LOOP_SHAPE', None)
+            else:
+                os.environ['STRATA_SERVE_LOOP_SHAPE'] = old
+
+    def _shape_cases(self, json, os, Path, sentence_shape, sentence_shape_loop):
+        # the reviewer's enumerations: the shape fires on them, so the default (off) must leave them at the 12-word count
+        enum1 = '\n'.join(f'n = {i}: f(n) = {i * i + 1}, which is odd so we continue.' for i in range(29))
+        enum2 = '\n'.join(f'Row {i}: expected {3 * i}, got {3 * i}, matches the column total.' for i in range(30))
+        steps = ' '.join(f'Case {i}: the remainder of {i * 7} divided by 5 is {i * 7 % 5}.' for i in range(40))
+        for text in (enum1, enum2, steps):
+            self.assertTrue(sentence_shape_loop(text))
+            self.assertEqual(reasoning_repeat_coverage(text), 0.0)     # default off: not a loop
+        tails = json.loads((Path(__file__).parent / 'fixtures' / 'loop_tails_flelink.json').read_text(encoding='utf-8'))
+        loop = tails['loop_soft_P1_greedy_16000']['tail']
+        self.assertLess(reasoning_repeat_coverage(loop), 1.0)           # default off: the 12-word count alone
+        os.environ['STRATA_SERVE_LOOP_SHAPE'] = '1'
+        self.assertEqual(len(tails), 7)
+        for name, v in tails.items():
+            self.assertEqual(sentence_shape_loop(v['tail']), name.startswith('loop_soft'), name)
+        self.assertEqual(reasoning_repeat_coverage(loop), 1.0)
+        for name, v in tails.items():           # the non-loops: exactly what the 12-word count alone gives
+            if not name.startswith('loop_soft'):
+                self.assertLess(reasoning_repeat_coverage(v['tail']), 1.0, name)
+        self.assertEqual(sentence_shape('x = -12.5 and  y=3, then 7.'), 'x = # and y=#, then #.')
+        # novel counting and plain numbers: no loop (the minimum length and the 40 % share)
+        self.assertFalse(sentence_shape_loop(' '.join(str(i) for i in range(4000))))
+        self.assertFalse(sentence_shape_loop('\n'.join(f'Step {i}: we check that {i} squared is {i * i}, '
+                                                       f'then we try {i + 1}.' for i in range(10))))
+        self.assertEqual(reasoning_repeat_coverage(steps), 1.0)        # on: enumeration reads as a loop (why off)
+
     def test_a_loop_written_as_one_long_word(self):
         """#1753: a 24k-digit string cycling an 11-digit pattern is one word to the split and never one token twice."""
         self.assertEqual(reasoning_repeat_coverage('Counting the digits of 9^104. ' + '58747693387' * 3000), 1)
