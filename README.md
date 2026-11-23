@@ -2,237 +2,162 @@
 
 **DeepSeek-V4.1-Flash on one NVIDIA GPU, natively on Windows.**
 
-Delta runs all 552 billion parameters of **DeepSeek-V4.1-Flash-1017** (2-bit experts) on one
-consumer PC, natively on Windows. It serves an OpenAI-compatible API at `http://127.0.0.1:8080/v1` with up to 1M tokens
-of context.
+Delta runs all 552 billion parameters of **DeepSeek-V4.1-Flash-1017** on one consumer PC: one NVIDIA RTX card plus 64 GB of RAM or more,
+natively on Windows (not WSL).  Double-click `Start DeepSeek.bat`: it installs what it needs, recommends the model file
+that suits your RAM, and opens a chat page plus OpenAI- and Anthropic-compatible APIs at `http://127.0.0.1:8080`, with
+up to 1M tokens of context.  Free, MIT license.
 
 This is a Windows port of [Xolotl](https://github.com/Indras-Mirror/Xolotl), which is built on
-[Strata](https://github.com/Niko1221/Strata). Upstream targets Linux; its README is
-[README.xolotl.md](README.xolotl.md).
+[Strata](https://github.com/Niko1221/Strata).  Upstream targets Linux; its README is [README.xolotl.md](README.xolotl.md).
+
+| RAM | Writing speed (RTX 3090, 0.95) | Model it picks | Agreement with DeepSeek's own model |
+|---|---|---|---|
+| 192 GB | 44.6 tok/s | Unsloth UD-IQ2_XXS | 91.1% |
+| 128 GB | 43.7 tok/s | Unsloth UD-IQ2_XXS | 90.5% |
+| 96 GB | 40.2 tok/s | Unsloth UD-IQ1_M | 90.0% |
+| 64 GB | 35.2 tok/s | Unsloth UD-IQ1_M | 89.9% |
+
+Greedy, whole chats with thinking on.  Agreement = how often the top next token matches DeepSeek's own API on general
+text (two hosts of the full model agree with each other on 98.3-98.9%).  More in "Speed" and "Quality" below.
 
 ## Quick start
 
-**Which download?** Just this repository: **Code > Download ZIP** (or `git clone`). You do not need any of the
-`build-ds41-*.zip` files on the Releases page - `Start DeepSeek.bat` downloads the right engine for your CPU by
-itself.  (Only if you set it up by hand: almost every PC wants `build-ds41-portable.zip`; the two `compat` zips are for
-CPUs from before 2013.)
+**Get Delta only from [github.com/musicurgy/delta-inference-engine](https://github.com/musicurgy/delta-inference-engine).**
+It is free and never asks for payment, a login or an account; it downloads models only from the Hugging Face
+repositories named in its own scripts, and its engine only from this repository's Releases page.
 
-**Beware of fakes.** Get Delta only from [github.com/musicurgy/delta-inference-engine](https://github.com/musicurgy/delta-inference-engine).
-It downloads models only from the Hugging Face repositories written into its own scripts (the model ones are named in
-this README and in `Choose Model.bat`), and its engine only from this repository's Releases page.  It is free and never
-asks for payment, a login or an account.  A download that wants payment or a login, or a model this README does not
-name, is not from this project.
+1. Get this folder: **Code > Download ZIP**, or
+   `git clone -c core.longpaths=true https://github.com/musicurgy/delta-inference-engine C:\AI\Delta`, somewhere with a
+   short path.  You do not need the `build-ds41-*.zip` files on the Releases page: the first start downloads the right
+   engine by itself.  Check "What you need" below first.
+2. Double-click **`Start DeepSeek.bat`**.  If Windows shows "Windows protected your PC" (the files are not
+   code-signed): More info, then Run anyway.  The first time it sets up what is missing, step by step, and asks
+   before anything big: Python (it offers to install 3.11), the prebuilt engine for your CPU, a folder for the model
+   (it lists your drives and their speed), and the model (233-395 GB from Hugging Face, SHA-256 checked).  You can
+   leave the download alone: the PC stays awake and a stalled download restarts by itself.
+3. The chat page opens at once and shows the model loading (about a minute on later starts).  Apps use
+   `http://127.0.0.1:8080/v1` (OpenAI) or `/v1/messages` (Anthropic) with any API key.
 
-1. Get this folder (**Code > Download ZIP**, or
-   `git clone -c core.longpaths=true https://github.com/musicurgy/delta-inference-engine C:\AI\Delta`) somewhere with
-   a short path, and check "What you need" below: an NVIDIA RTX card with 12 GB+ (24 GB is fastest), 64 GB+ of RAM (128 GB+ recommended),
-   ~320 GB free on a fast NVMe drive for the default model (its speed matters - see below).
-2. Double-click **`Start DeepSeek.bat`**. The first time, it sets up everything that is missing, step by step, and
-   asks before anything big.  Windows may first show a blue "Windows protected your PC" box, because these files are
-   not code-signed: if you got them from this repository, choose More info, then Run anyway.
-   - Python and its packages (no Python 3.10-3.14 on the PC: it offers to install python.org's Python 3.11 with
-     Windows' own winget, for your Windows user only),
-   - the engine: the prebuilt one for your CPU from the
-     [Releases page](https://github.com/musicurgy/delta-inference-engine/releases) (under 1 GB, no compiler needed) - or it builds
-     it, if you have Visual Studio Build Tools, the CUDA Toolkit and Git,
-   - where the model goes: it lists your drives with their free space and type (NVMe is best; USB and hard disks are
-     slow), checks Windows' page file, measures your download speed and says how long the download takes; press
-     Enter for the recommended folder, or type another (it is saved as `DS41_MODELS` in `ds41-paths.bat`),
-   - the model: it asks which one you want and marks the one that suits your RAM, then downloads it from Hugging Face
-     (233-395 GB, checked against the published SHA-256; it checks the free space first).  You can leave it alone:
-     the PC stays awake while it downloads, a download that stops moving is started again by itself, one line shows
-     the progress and the time left, and a Windows notification says when it is done.  (Laptop lid or power button:
-     it still sleeps.  If it stops for good, start again: it goes on where it was.)
-3. Then the server starts and the chat page opens in your browser at once: it shows the start's steps and how long
-   the last start took, and a question typed meanwhile is answered when the model is ready.  Apps use
-   `http://127.0.0.1:8080/v1` (OpenAI) or `/v1/messages` (Anthropic), any API key.  (Another port: `DS41_PORT` in
-   `ds41-paths.bat`.)
+**Updating:** a git clone: `UPDATE.bat` (or `git pull`).  A ZIP copy: unpack the new ZIP over this folder.  With a ZIP,
+keep your `ds41-paths.bat` (it holds your model folder): copy it aside before unpacking and back after, or re-enter
+your model folder when the first start asks where the model files go.  Then `Start DeepSeek.bat` gets a new engine or
+packages if the version needs them; your model files stay.
 
-**Every day in the chat page:**
-- **Pause / Resume** (top right): Pause frees the model's RAM and the graphics card for games or other programs;
-  Resume, or simply the next message or app request, loads it again (about a minute).  Setup > "Pause by itself when
-  a game needs the graphics card" (off by default) does it for you while DeepSeek is idle - never during an answer.
-- **Use from your phone** (Setup tab): one switch makes an API key, listens on your home network and restarts; scan
-  the QR code with the phone (the page opens with the key in it), allow Windows Firewall when asked, and "Add to Home
-  Screen" makes it an app.  Off: this PC only again.
-- **Chats** (the list button beside the message box): turn on "Save chats in this browser" to keep a chat list with
-  search, pins, rename, delete and export / import (JSON).  Off by default: then each chat lives in its tab only.
-  "New temporary chat" makes one that is never saved.
-- **Modes** above the message box: Quick (no thinking), Think (the default), Code and Write - starting points, not
-  tuned presets (Sampling changes them); under them, how long answers in that mode took to start on this PC.
-- **Answer-ready notifications** (Setup > Settings, off by default): a Windows notification when an answer finishes
-  while the tab is in the background (on `http://127.0.0.1` only; browsers refuse it on a LAN address).
-- **Connect an app** (Setup > Connect your tools): the exact settings for Claude Code, OpenCode, Cline / Aider /
-  Open WebUI and others, with Copy buttons and a Test button.
+**Coming from 0.94 with under 110 GB of RAM?**  0.95 recommends UD-IQ1_M there (closer to DeepSeek on small PCs);
+`Choose Model.bat` downloads it.  Your current model keeps working.
 
-Every later start: double-click `Start DeepSeek.bat` again - it finds everything in place and starts the server
-(ready in about a minute). To run another quant (see "Other quants" below), double-click **`Choose Model.bat`**.
-Everything else in this folder is the engine's source, upstream's files and tools - you do not need to open them.
+**Something wrong?** Double-click `Start DeepSeek (debug).bat`: it checks the PC and the install, and packs a log zip
+(no prompts or answers, your user name replaced) to attach to an issue.
 
-**Updating:** a git clone: `git pull` in this folder (or double-click `UPDATE.bat`, which does that). A ZIP copy:
-download the new ZIP and unpack it over this folder, or next to it with `models\` moved across. Then double-click
-`Start DeepSeek.bat`: if the new version needs a new engine or new Python packages, it gets them first. Your model
-files stay as they are. With a ZIP, keep your `ds41-paths.bat` (it holds your model folder): copy it aside before
-unpacking and back after, or re-enter your model folder when the first start asks where the model files go.
+More: [installing, updating and setting up by hand](docs/delta/SETUP.md).
 
-**Updating from 0.94 to 0.95:** the first start downloads the 0.95 engine (SHA-256 checked) and updates the Python
-packages. Your model and drafter stay. If you start DeepSeek some other way than `Start DeepSeek.bat`, see "What's new
-in 0.95" for the new switches.
+## What you need
 
-**Something wrong?** Double-click **`Start DeepSeek (debug).bat`** instead. It checks the PC and the install (a
-PASS / FAIL list), starts DeepSeek in a second window with everything it prints saved, and when you close that window
-it packs it all into `logs\debug-<time>.zip`. Attach that zip to an issue with a line on what went wrong. It holds no
-prompts or answers, and your Windows user name is replaced by `<user>`.
+- Windows 10 or 11, 64-bit.
+- An NVIDIA RTX card with 12 GB of VRAM or more (RTX 20 or newer), driver 580 or newer.  24 GB (RTX 3090 / 4090, or a
+  32 GB 5090) is the fast path; with less, fewer experts fit on the card (measured with 0.93: 16 GB 31 tok/s, 12 GB
+  17, against 41 on 24 GB).  GTX 10 and older cannot run it.
+- **64 GB of RAM or more, 128 GB or more recommended.**  Below 56 GB it will probably not start.
+- **A fast NVMe SSD with room to spare** - the model is read from it while it runs.  About 320 GB free for UD-IQ2_XXS
+  (110 GB of RAM and up), about 270 GB for UD-IQ1_M (under 110 GB).  Not a SATA SSD, hard disk or USB drive.
+- An x86-64 CPU (AVX2 is the fast path; older CPUs get an engine built for them).
+- Python 3.10 to 3.14 - `Start DeepSeek.bat` offers to install it.
+
+Smaller cards, older CPUs and why the SSD matters: [docs/delta/SPEED.md](docs/delta/SPEED.md).
 
 ## What's new in 0.95
 
-The 192 GB figures below were measured on the 0.95 release build against 0.94 as published, both through their own
-`Start DeepSeek.bat`, one after the other on the same PC: RTX 3090, 192 GB of RAM, UD-IQ2_XXS. The per-change 64-128 GB
-figures in the bullets come from single A/B tests during the 0.95 work; the speeds by RAM size (the first bullet, and
-"Speed by RAM size" under Speed) were measured on the release build.
+- **Up to 72% faster on 64 GB PCs** (UD-IQ2_XXS, against 0.93): 36.2 tok/s at 64 GB (21 before), 41.6 at 96 GB (29),
+  43.7 at 128 GB (34), about 45 at 192 GB.  (Under 110 GB the recommended UD-IQ1_M writes 35.2 / 40.2, closer to DeepSeek.)  Experts read from the SSD are no longer memory-mapped, and prompts go
+  through in wider batches.
+- **Smaller PCs agree more with DeepSeek:** under 110 GB the first start offers UD-IQ1_M, run at route bias 0.10:
+  89.9 / 90.0% agreement at 64 / 96 GB against 87.8 / 89.5% for UD-IQ2_XXS, at about the same speed (35.0 / 40.5
+  against 35.3 / 40.9 tok/s at the default sampling).
+- **A Fast / Quality / Most exact switch** in the chat page's Setup tab, showing the measured agreement and speed of
+  each choice for your model at your RAM.
+- **Faster writing:** +6.7% at the default sampling and +9% greedy against 0.94 (192 GB).  A learned draft gate (on by
+  default) adds about 2% to sampled replies with the same output distribution.
+- **Coding agents:** turns write 7.5% faster and start 8-15% sooner; 16 conversations stay cached, so agents with
+  sub-agents resume in under a second; an edited message or a new question about the same long document starts in
+  about 3 s; Claude Code compacts instead of stopping on a context overflow.
+- **Long prompts:** a 32K-token prompt reads 19-43% faster at 96-192 GB and 12-26% faster at 64 GB (in our A/Bs).
+- **Safer:** control tokens typed inside a message stay text (no forged turns or tool calls), more origin checks, and
+  no single request can stall the server.
+- **Quality:** a 99-question bake-off averaged 56 of 99 over four runs, against 58 for 0.94 (one run varies by about 2).
 
-- **Up to 72% faster on 64 GB PCs.** UD-IQ2_XXS writing whole chats (greedy) on the release build: **36.2 tok/s at 64 GB**
-  against 21 for 0.93 (+72%), **41.6 at 96 GB** against 29 (+43%), **43.7 at 128 GB** against 34 (+29%), and about 45 at
-  192 GB (44.6).  The baselines are 0.93's own measurements (0.94 was only measured at 192 GB).  The full table is under
-  "Speed by RAM size".
-- **Smaller PCs agree more with DeepSeek.**  Under 110 GB of RAM the first start offers UD-IQ1_M, and the launcher now
-  runs the 1-bit files there at route bias 0.10 instead of 0.28.  On a 64 / 96 GB PC UD-IQ1_M agrees with DeepSeek more
-  than UD-IQ2_XXS at 0.28 (89.9 / 90.0% vs 87.8 / 89.5% on general text) at the same speed (35.0 / 40.5 vs 35.3 / 40.9
-  tok/s at the default sampling); UD-IQ1_S at 0.10 is the faster choice (39.9 / 44.9 tok/s, 88.8 / 89.6%).  From 110 GB
-  up UD-IQ2_XXS stays the pick, at 0.28.  The chat page's Setup card shows it as a Fast / Quality / Most exact switch
-  (route bias 0.28 / 0.10 / 0) on every PC: Quality is the default for a 1-bit file under 110 GB, Fast elsewhere, and
-  each choice shows its measured agreement and speed for that model at this PC's RAM.  `DS41_ROUTE_BIAS` still
-  overrides it.
-- **Faster writing.** Plain chat at the default sampling (temperature 1, top-p 0.95; six chats with thinking on, two
-  seeds): 42.0 tok/s while writing, against 39.5 for 0.94 (+6.3%); counting whole chats 43.4 against 40.7 (+6.7%).
-  This test gives each chat a longer instruction than the test behind the 0.94 figure in the Speed table below, so
-  compare 0.95 with 0.94 within this line, not across the two.
-- **The same test at greedy** (temperature 0, as in the Speed table): **about 45 tok/s - 44.6 measured on the final
-  build** counting whole chats, against 40.9 for 0.94 (+9%).
-- **Learned draft gate (new, on by default):** a small model on the drafter's own confidence, uncertainty and top-2
-  margin decides how many drafted tokens each pass checks, with the accept coins drawn first, so the output
-  distribution is unchanged.  It acts only on sampled replies (temperature above 0, the default): +2.0% on chat,
-  +2.3% on agent turns; greedy replies are unchanged.  Four 99-question bake-offs with it
-  averaged 56 (55, 53, 56, 61) against 58 without it (56, 60) - inside the run-to-run spread of about 2 points.
-  `set STRATA_DSPARK_LGATE=0` turns it off.
-- **64-128 GB PCs read prompts faster again:** at 64 GB a long prompt goes through in fewer, wider batches - 32K-40K
-  token prompts +12-13% (measured at a real 64 GB) - and on every PC that reads experts from the SSD the Engram rows
-  are read ahead in blocks (+1-2.5% on prompts at 96 / 128 GB, the same output).
-- **Opt-in fast mode, 47 tok/s:** `set STRATA_EXPERTS_DROP_MISS=5` skips a low-ranked expert when it is not on the
-  graphics card. The greedy test above gives 47.4 tok/s counting whole chats (+9% over 0.95's default, +16% over
-  0.94). It changes the answers: in two 99-question bake-offs it averaged 54 against 58 for the default, so it trades
-  some quality for speed and stays off unless you set it.
-- **Agent loops write faster and start sooner.** On a coding agent's short turns (greedy, 28 turns): 49.5 tok/s against
-  46.1 (+7.5%), first token after 4.5 s instead of 4.9 s (-8%). On turns that write ~500 tokens: 39.2 against 36.5
-  tok/s (+7.5%), first token after 4.6 s instead of 5.4 s (-15%).
-- **Much faster on 64-128 GB PCs:** experts read from the SSD are no longer memory-mapped. In our A/Bs writing got
-  +29% / +10% / +7% faster and 32K-token prompts +26% / +11% / +17% at 64 / 96 / 128 GB (not re-measured on the final
-  build).
-- **Long prompts read faster:** wide prompt batches, a faster expert top-k and a prefill read-ahead where experts sit
-  on the SSD: a 32K prompt +19% at 192 GB, +23% at 128 GB, +43% at 96 GB (not re-measured on the final build).
-- **Edits and revisits resume:** each cached conversation keeps its last 1024 window rows, so an edited last message or
-  a new question about the same long document starts in about 3 s instead of re-reading 8-32K tokens.
-- **The first answer comes sooner:** the drafter loads while the model starts.
-- **Fewer garbled tokens:** a sampled token that turns into an "attention sink" (after which the model writes noise) is
-  replaced by the next candidate.
-- **Agents and APIs:** 16 conversations kept in RAM (agents with sub-agents resume in under a second), loop guard over
-  the last 12 tool calls, Claude Code compacts on a context overflow, thinking a client dropped is put back, DeepSeek's
-  own API paths, and fixes for streaming, batch slots, stop tokens and the Windows console.
-- **Quality:** 99-question bake-off (maths, knowledge, reasoning, coding), as shipped (learned draft gate on), four runs with different seeds: 55, 53, 56 and 61 out of 99, average 56; without the gate 56 and 60 (average 58), 0.94 58.  One run varies by about 2 points.
-- **Same input, same answer?** At temperature 0 a reply can differ slightly from one run to the next: the draft gate
-  sizes each pass from live timings, and a different pass width rounds the sums differently.  The answers are as good,
-  just not byte-identical between runs; `set STRATA_DSPARK_GATE=0` restores repeatable greedy
-  output at a small speed cost.
-
-All of these are on by default; docs/DETAILS.md lists each switch and how to turn it off. Opt-in (off unless you
-`set` them before starting):
-- `STRATA_EXPERTS_DROP_MISS=5`, an **experimental fast mode**: it skips a low-ranked expert when it is not on the
-  graphics card. +6.8% writing in our A/B at 192 GB, but it changes the answers: two 99-question runs averaged 54
-  against 58 without it. Use it only if you want speed over answer quality.
-- `STRATA_X3B=1`: launches the next layer's work ahead. Not recommended: in our last test a pass still had to be
-  rescued by its watchdog, and it was not faster.
-- `STRATA_IDLE_PREFETCH=1`: copies experts ahead only while the bus is idle. Not recommended: it was 6-13% slower in
-  our tests.
-
-What was new in 0.94 (pictures on by default, documents, voice, pause, chat history, use from your phone, Claude Code's
-helper calls, bounded prompt replay, a safer server) and in 0.93 (a model picker and Setup tab, Unsloth's UD-IQ2_XXS as
-the default from 128 GB, 64 and 96 GB of RAM supported, the second-GPU helper, release zips built by GitHub), and the
-full list for every version, are on the [Releases page](https://github.com/musicurgy/delta-inference-engine/releases).
+Every change, with its numbers and switches: [docs/delta/CHANGES.md](docs/delta/CHANGES.md).  Earlier versions: the
+[Releases page](https://github.com/musicurgy/delta-inference-engine/releases).
 
 ## Speed
 
-These numbers are from an RTX 3090 with an NVMe SSD, through the server.  In this README a speed was measured with
-0.93 (or earlier) unless it says 0.94 or 0.95.  0.94 changes the drafter, bounds the prompt replay and turns pictures on, so
-the 0.93 figures may differ slightly.
+Writing speed through the server on the 0.95 release engine, RTX 3090, six chats of up to 1,500 tokens with thinking
+on, greedy, counting whole chats.  Below 192 GB the rest of the PC's RAM was locked away, so Windows could not use it.
 
-| UD-IQ2_XXS (the default) | 192 GB RAM, 0.94 | 192 GB RAM, 0.93 | 128 GB RAM, 0.93 |
-|---|---|---|---|
-| Writing (6 chats, up to 1,500 tokens each, thinking on), greedy | **41.7 tok/s** | 40.8 tok/s (41.1 on its release card) | 34 tok/s |
-| Writing, the default sampling (temperature 1, top-p 0.95) | **41.3 tok/s** | 39.2 tok/s (39.7 on its release card) | - |
-| Reading a long prompt (~60K tokens, fresh) | **811 tok/s** (860 at ~30K) | 747 tok/s the same evening (up to 740 on its release card) | up to 600 tok/s |
-
-The two 192 GB writing rows were measured the same evening on the same PC, one version after the other, with the
-graphics card cooled down before each run.  Speeds on one PC vary by about 1% from day to day, which is why 0.93's
-own release card is a little higher than its run here.  The 128 GB column is the same PC with the expert memory a 128 GB PC gets.  Greedy means temperature 0 in the
-request; the default sampling is what a client gets when it sends no temperature.  Sampling accepts fewer of the
-drafter's guesses, so it writes a little slower (0.93: ds4 Q2 40.7 -> 40.3 tok/s, UD-IQ2_XXS 41.1 -> 39.7; 0.94: UD-IQ2_XXS 41.7 -> 41.3).  0.93 narrowed
-that gap from ~12%: the drafter's guesses are now
-sampled instead of taken as its top pick (`STRATA_DSPARK_SAMPLE` in `Start DeepSeek.bat`); the answers'
-distribution is unchanged.
-
-**New in 0.93: from 128 GB of RAM up the default is Unsloth's UD-IQ2_XXS** (below 110 GB the first start offers UD-IQ1_M;
-the ds4 Q2 GGUF stays one answer away).  On 192 GB it writes about as fast as the ds4 Q2 GGUF - 41.1 vs 40.7 tok/s greedy, 39.7 vs
-40.3 at the default sampling - and on 128 GB about 5% slower (34.0 vs 35.9 tok/s, greedy).  It agrees with DeepSeek's own model more often: 91.1% vs 89.9% on general text, 94.5%
-vs 93.1% on code and maths at the settings that ship (below: "Other quants").
-
-With less RAM, more of the model's experts are read from the SSD as they are needed. That is slower, most of all on
-long prompts, but the output is the same.
-
-### Speed by RAM size (0.95)
-
-Writing speed through the server on the 0.95 release engine, RTX 3090: six chats of up to 1,500 tokens each with
-thinking on, greedy (temperature 0), counting whole chats.  Below 192 GB the rest of the PC's RAM was locked away, so
-neither Windows' file cache nor the page file could use it, and the launcher set the PC up for that much RAM.
-
-| RAM | UD-IQ2_XXS (the pick from 110 GB) | UD-IQ1_M (the pick below 110 GB) | UD-IQ1_S | UD-IQ3_XXS |
+| RAM | UD-IQ2_XXS | UD-IQ1_M | UD-IQ1_S | UD-IQ3_XXS |
 |---|---|---|---|---|
-| 192 GB | 43.7 tok/s (44.6 on the final-build test) | 48.1 | 49.8 | 27.1 |
+| 192 GB | 44.6 tok/s | 48.1 | 49.8 | 27.1 |
 | 128 GB | 43.7 | 46.6 | 48.9 | 25.8 |
 | 96 GB | 41.6 | 40.2 (46.2 at bias 0.28) | 43.9 (48.5 at 0.28) | 23.2 |
 | 64 GB | 36.2 | 35.2 (41.5 at bias 0.28) | 40.3 (45.0 at 0.28) | 18.7 |
 
-The 1-bit files run at route bias 0.10 below 110 GB of RAM (the launcher sets it), every other cell at 0.28.
+The 1-bit files run at route bias 0.10 under 110 GB of RAM (the launcher sets it); every other cell is at 0.28.  At the
+default sampling (temperature 1) UD-IQ2_XXS writes 43.4 / 42.7 / 40.9 / 35.3 tok/s at 192 / 128 / 96 / 64 GB.  With
+less RAM more experts are read from the SSD, so new prompts take longer, but the output is the same.  A second NVIDIA
+card can hold extra experts for a few percent more (the Setup tab's Multi-GPU switch).
 
-- At the default sampling (temperature 1, learned draft gate on): UD-IQ2_XXS 43.4 tok/s at 192 GB, 42.7 at 128 GB,
-  40.9 at 96 GB and 35.3 at 64 GB; at bias 0.10 UD-IQ1_M 40.5 at 96 GB and 35.0 at 64 GB, UD-IQ1_S 44.9 and 39.9.
-- Download sizes: UD-IQ2_XXS 301 GB, UD-IQ1_M 250 GB, UD-IQ1_S 233 GB, UD-IQ3_XXS 395 GB (it also needs the ds4 Q2 file
-  for its Engram tables).
-- Agreement with DeepSeek's own model (general text, the shipped route bias): UD-IQ2_XXS 91.1% at 192 GB and 90.5%
-  at 128 GB, 89.5% at 96 GB and 87.8% at 64 GB; UD-IQ1_M 89.4% and UD-IQ1_S 89.1% at 192 GB; at bias 0.10 UD-IQ1_S
-  89.6% at 96 GB and 88.8% at 64 GB, UD-IQ1_M 90.0% and 89.9%.  It dips on smaller PCs because the
-  route bias picks experts that are already loaded more often when fewer of them fit; with exact routing a model agrees
-  the same at any RAM size (UD-IQ2_XXS 93.1%, UD-IQ1_M 91.2%, UD-IQ1_S 90.0%).
-- **UD-IQ2_XXS from 110 GB of RAM up, UD-IQ1_M below.**  On 128 / 192 GB the 1-bit files write faster at about two
-  points less agreement; on 64 / 96 GB UD-IQ1_M at bias 0.10 agrees more than UD-IQ2_XXS at 0.28 (89.9 / 90.0% vs
-  87.8 / 89.5%) at its speed, and UD-IQ1_S at 0.10 beats it on both counts (88.8 / 89.6%, 10-13% faster at the default
-  sampling).  `Choose Model.bat` downloads any of them.  New prompts take
-  longer on small PCs, because the experts that do not fit are read from the SSD as they are needed.
-- Below 56 GB of RAM it will probably not start.
+Earlier versions, prompt speeds, smaller cards, a second GPU: [docs/delta/SPEED.md](docs/delta/SPEED.md).
 
-Measured with 0.93 on the 192 GB PC: a new 6k-token prompt takes about 15 s and a 25k-token prompt about 41 s (UD-IQ2_XXS). Writing is fastest on
-maths and code (~48 and ~45 tok/s) and ~35 tok/s on plain prose; counting the prompt and the thinking, a client sees
-~38 tok/s.
+## Quality
 
-### A second GPU
+How often the top choice matches DeepSeek's own API on the same text (teacher-forced, general text; this is agreement,
+not task accuracy).  Two hosts of the full model agree with each other on 98.3% and 98.9%.
 
-The Setup tab in the chat page has a Multi-GPU switch: a helper on a second card of 8 GB or more holds experts the
-main card has no room for.  The main card needs 20 GB or more for this switch; the engine itself runs from 12 GB.  With
-an RTX 3060 12 GB in an x4 slot beside the 3090 it adds a few percent: 0.94 on UD-IQ2_XXS writes 42.9 tok/s greedy
-and 42.2 at the default sampling, against 41.7 / 41.3 on the 3090 alone (the same evening).  The second card must be an RTX 20
-or newer; of two equal cards, the one on the wider PCIe link is used.  If the helper stops or cannot start, the model
-still starts and runs on one card (the server window says so).  It does not split the model across cards, so it
-does not scale: for two or more big cards use [Project Maya](https://github.com/mw00/project-maya), which runs
-DeepSeek in tensor parallel.
+| Model | RAM | As shipped | Exact routing (slower) |
+|---|---|---|---|
+| UD-IQ2_XXS (bias 0.28) | 192 / 128 GB | 91.1% / 90.5% | 93.1% |
+| UD-IQ2_XXS (bias 0.28) | 96 / 64 GB | 89.5% / 87.8% | 93.1% |
+| UD-IQ1_M (bias 0.10) | 96 / 64 GB | 90.0% / 89.9% | 91.2% |
+
+The route bias prefers experts that are already loaded, which is faster; it costs more agreement when less of the
+model fits in RAM, which is why small PCs run a smaller file at a lower bias.  The chat page's Setup tab switches
+between **Fast / Quality / Most exact** (route bias 0.28 / 0.10 / 0) and shows the measured numbers for your PC;
+`DS41_ROUTE_BIAS` in `ds41-paths.bat` overrides it.  On a 99-question bake-off (maths, knowledge, reasoning, coding)
+0.95 scored 55, 53, 56 and 61 of 99 (average 56; one run varies by about 2), 0.94 58.
+
+Code, maths and agentic scores, every model file and how to pick one: [docs/delta/MODELS.md](docs/delta/MODELS.md).
+
+## Apps, agents and the chat page
+
+The server is at `http://127.0.0.1:8080`; any API key works unless you set one, and it answers under any model name.
+Give apps the real context size (1,000,000), or they may compact early.  The chat page's **Setup > Connect your tools**
+shows the exact settings for each app, with Copy and Test buttons.
+
+- **Claude Code**, in the Command Prompt you start it from:
+  ```bat
+  set ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+  set ANTHROPIC_AUTH_TOKEN=local
+  set ANTHROPIC_MODEL=deepseek-v4.1-flash-1017
+  set CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000
+  claude
+  ```
+- **OpenCode, Codex CLI, Cline, Aider, Continue, Open WebUI** and other OpenAI-compatible apps: base URL
+  `http://127.0.0.1:8080/v1`, model `deepseek-v4.1-flash-1017`.
+- Tool calls, JSON output, pictures (OpenAI `image_url`, Anthropic `image`), documents (PDF, Word, Excel, PowerPoint)
+  and optional voice (`/v1/audio/...`) all work through the APIs.  Requests are answered one at a time.
+
+**In the chat page:** pictures (paste, drop, screenshot, camera), documents, optional voice (`Enable Voice.bat`:
+dictation, read-aloud, hands-free talk), Quick / Think / Code / Write modes, chat history (off by default), **Pause**
+to free the GPU for a game (and an optional auto-pause), and use from your phone with a QR code.
+
+Configs for each app, the conversation cache, pictures, documents and voice in detail: [docs/delta/APPS.md](docs/delta/APPS.md).
+
+## Privacy
+
+- The server listens on this PC only (`127.0.0.1:8080`).  The Setup tab's "Use from your phone" switch opens it to
+  your network with an API key; without a key the server refuses to listen beyond this PC.
+- Nothing from your prompts or answers is written to disk unless you turn it on (chat history is kept in your
+  browser, never on the server).  Downloads send no telemetry.
+- More (opening it to your network by hand, the opt-in logs): [privacy in detail](docs/delta/SETUP.md#privacy-in-detail).
 
 ## Windows settings for speed
 
@@ -258,361 +183,37 @@ three together +12% writing speed (21.7 -> 24.3 tok/s at the time), the RAM spee
 While it writes, a busy browser or game on the same PC can slow the CPU side down a lot; the engine already runs above
 normal priority.
 
-## Agents, chats and tools
-
-**Connecting an agent or chat app.**  Start DeepSeek first.  The server is at `http://127.0.0.1:8080`, any API key
-works unless you set one, and it answers under any model name.  Give the app the real context size, or it may
-compact your conversation early.
-
-- **Claude Code**, in the Command Prompt you start it from:
-
-  ```bat
-  set ANTHROPIC_BASE_URL=http://127.0.0.1:8080
-  set ANTHROPIC_AUTH_TOKEN=local
-  set ANTHROPIC_MODEL=deepseek-v4.1-flash-1017
-  set CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000
-  claude
-  ```
-
-  Without the last `set`, Claude Code assumes 200K tokens and compacts there.
-  Claude Code's WebSearch works once you give the server a search service (`"web_tools"`, off by default; see
-  [docs/DETAILS.md](docs/DETAILS.md#web-search-and-web-fetch-off-by-default-094)).
-- **OpenCode**, in `opencode.jsonc` (in your project, or `~/.config/opencode/`):
-
-  ```jsonc
-  {
-    "$schema": "https://opencode.ai/config.json",
-    "provider": {
-      "delta": {
-        "npm": "@ai-sdk/openai-compatible",
-        "name": "Delta (local)",
-        "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "local" },
-        "models": {
-          "deepseek-v4.1-flash-1017": {
-            "name": "DeepSeek V4.1 Flash",
-            "limit": { "context": 1000000, "output": 32768 }
-          }
-        }
-      }
-    }
-  }
-  ```
-
-- **Cline, Aider, Continue, Open WebUI and other OpenAI-compatible apps:** base URL `http://127.0.0.1:8080/v1`, any API
-  key, model name `deepseek-v4.1-flash-1017`.  Where the app asks for a context window, enter `1000000`.
-- **Codex CLI:** see [the Responses API](docs/DETAILS.md#the-responses-api-and-codex-cli).
-
-- **Conversation cache:** the server keeps up to 8 conversations in memory (about 20 MB per 10k tokens). An agent that
-  switches between conversations, or makes a side request between turns, resumes each one in a second or two instead
-  of reading its whole prompt again (measured: 16-18 s per switch before, 1-3 s now; a 9-turn session alternating two
-  ~8k-token conversations: 95 s before, 49 s now).
-- **Follow-up messages** only read what is new. In thinking mode, the next turn no longer re-reads the history. A
-  follow-up of a few hundred to 2,000 new tokens (a tool result, a pasted file) keeps most of the GPU's expert cache
-  instead of emptying and refilling it, which saves 0.6-0.9 s per turn.
-- **Tool calls** (OpenAI `tools`, including a forced `tool_choice`: `"required"` or a named function) and **JSON
-  output** (`response_format` `json_object` / `json_schema`) work through the OpenAI-compatible API. Requests sent at
-  the same time are answered one after another.
-- **Pictures** are on. The first start downloads DeepSeek's vision encoder (0.97 GB, checked) and PyTorch (124 MB).
-  In the chat page, attach, drop or paste a picture, or use the screen and camera buttons; apps send one through the
-  OpenAI (`image_url`) or Anthropic (`image`) API. Pictures never take VRAM from the model's card:
-  - **One graphics card:** pictures are read on the CPU. A 1024x701 photo takes ~8-11 s on an i5-13600K; writing
-    speed was within run-to-run spread of text-only in our one measurement (0.92).  On PCs with less than about
-    170 GB of RAM the picture reader starts with the first picture (about 7 s once, longer while the model is
-    writing) and stops after 10 idle minutes, so its ~4 GB of RAM is free the rest of the time.
-  - **If the picture reader cannot start** (a broken PyTorch, say), the model still starts and answers text; a
-    picture then gets an error that says why.
-  - **Multi-GPU on** (the chat page's Setup card): pictures are read on the second card, in under half a second. This
-    needs PyTorch's CUDA build, a 2.0 GB download that the next start offers; the second card keeps ~2 GB less for
-    the model's experts.
-  - **Faster, smaller pictures:** an app can send `"detail": "low"` with a picture (OpenAI's `image_url`): at most 256
-    tokens instead of up to 1,024, read about twice as fast. Small text may become hard to read.
-  - **Turn them off:** double-click **`Disable Pictures.bat`** and start DeepSeek again. **`Enable Pictures.bat`** turns
-    them back on. To choose where pictures are read, put one word in `vision-choice.txt`: `on` (the default), `cpu`,
-    `gpu:1` (a card by its `nvidia-smi` number), `main` (the model's own card: fastest, but ~1.5 GB of its VRAM) or
-    `off`.
-- **Documents**: attach or drop a PDF, Word, Excel or PowerPoint file (or text, Markdown, CSV, HTML) in the chat page.
-  Its text goes into the message, and the page shows how many tokens it is and how long the first read takes
-  (~650 tokens/s; follow-ups reuse it) before you send. Through the API: Anthropic `document` blocks, OpenAI `file`
-  parts and Responses `input_file` parts (the file itself, base64; URLs and file ids are not fetched). Scanned PDFs
-  have no text to read; old `.doc` / `.xls` / `.ppt` files need saving as the new formats first.
-- **Voice** is off by default. Double-click **`Enable Voice.bat`** once, then start DeepSeek again: it downloads the
-  speech models (1.1 GB, checked) and sherpa-onnx (28 MB). Then the chat page has a **microphone** (hold to talk, or
-  click to start and again to stop; the text lands in the message box), a **speaker** under every answer, and a
-  **Talk** button for a hands-free conversation (a short pause sends; talking over the answer interrupts it). Any
-  OpenAI app can use `/v1/audio/transcriptions` and `/v1/audio/speech`. The speech models start with their first use
-  (a few seconds) and stop after 10 idle minutes. They run on the CPU's efficiency cores: a 5 s clip is written out in
-  ~0.7 s and an answer is spoken about twice as fast as it plays - while the model is not writing. While it writes,
-  they share the CPU with it and are much slower. `Enable Voice.bat gpu` (from a command window) puts read-aloud on a
-  second NVIDIA card instead (~2 GB more to download). The microphone works on `http://127.0.0.1` / `localhost`;
-  from another device the page needs HTTPS. To turn voice off again, put `off` in `voice-choice.txt`.
-
-## Privacy
-
-- The server listens on this PC only (`127.0.0.1:8080`). To reach it from other devices, use the Setup tab's "Use
-  from your phone" switch (it makes the API key, kept in `delta-settings.json` on this PC), or add `"host": "0.0.0.0"`
-  AND `"api_key": "<a long secret>"` to `tools/v41/serve/ds41-windows.json` (clients send the key as their API key).
-  Without a key the server refuses to listen beyond this PC.
-- Nothing from your prompts or answers is written to disk unless you turn it on: conversations live in memory and
-  are gone when the server stops. Opt-in only: the plain-text watch log (`STRATA_TEXT_LOG=<a file path>`), the
-  request monitor page (`"api_monitor": true` in `tools/v41/serve/ds41-windows.json`; memory only) and, in the
-  built-in chat page, "Save chats in this browser" (the Chats list or Sampling; kept in the browser's own storage on
-  this PC, never on the server; off = the chat lives in the tab only).
-
-## Quality
-
-How often the top choice matches DeepSeek's own API, on the same prompts:
-
-| Model | Routing | General | Code + maths | Agentic |
-|---|---|---|---|---|
-| **Unsloth UD-IQ2_XXS (the default)** | **Route bias 0.28, as shipped** | **91.1%** | **94.5%** | **95.9%** |
-| Unsloth UD-IQ2_XXS | Exact routing | 93.1% | 95.9% | 96.5% |
-| ds4 Q2 | Route bias 0.28, as shipped | 89.9% | 93.1% | 95.1% |
-| ds4 Q2 | Route bias 0.10 | 91.8% | 92.8% | - |
-| ds4 Q2 | Exact routing | 91.5% | 93.0% | 96.1% |
-
-Every model is in the tables under "Other quants".
-
-- **Want the most agreement?** Set `DS41_ROUTE_BIAS=0` in `ds41-paths.bat` for exact routing: +2.0 points on UD-IQ2_XXS,
-  about 25% slower.  `0.10` costs about 18% of writing speed at 192 GB of RAM on ds4 Q2 (34 instead of 41 tok/s) and
-  12-26% on 96 / 64 GB PCs (0.93 measurements); it has not been measured on UD-IQ2_XXS.  The startup line shows the
-  bias in use.
-- **Exact routing for answers only (0.94, opt-in):** `set STRATA_ANSWER_ROUTE_BIAS=0` the same way keeps the shipped
-  bias while the model thinks and routes exactly in the answer after it (or give another bias, such as `0.10`).  It
-  is off by default: it cost 10-13% of writing speed in agent sessions, and its quality gain is not measured yet.
-- Route bias prefers experts that are already on the GPU, so fewer have to come from RAM: about 25% faster than exact
-  routing at 192 GB, more on smaller PCs.  It follows the GPU's experts as they change during an answer
-  (`STRATA_BIAS_REFRESH=1` in the launcher), which made it both faster and closer to DeepSeek's own model (at 0.3:
-  89.3% / 92.7% with the bias fixed at the start of each answer, 89.8-90.0% / 92.9% with the refresh).  The test moves
-  by about 0.2 points between identical runs.
-- On agentic, tool-calling text (53 transcripts with tools, tool calls and tool results, 46K tokens) the bias costs the
-  same as on prose: on the default model (UD-IQ2_XXS) exact routing agrees with DeepSeek's own model on 96.48% of next
-  tokens, bias 0.28 on 95.93% (one run each, about 0.15 points between identical runs).  The tool-call syntax itself
-  costs nothing; the cost is in the argument values and the prose around the calls.  There is no collapse at this
-  setting (reports of collapse come from a bias of 1.0, which this launcher does not use).
-- `--kv-fp4` (the compressed KV cache, on by default) is exact: the logits are bit-identical with and without it.
-- For exact routing, set `--route-bias` and `--route-bias-file` to `0` in `tools/v41/serve/ds41-windows.json`, or
-  per request with `"strata_tune": {"route_bias": 0, "route_bias_file": 0}` - about 25% slower.
-
-## Other quants: Unsloth (the default and the quality mode), ISTA-DASLab's GSQ-RCO, EXL3
-
-Besides the ds4 Q2 GGUF, the engine runs the two other most-downloaded quant families of 1017, and EXL3 experts.  Some
-of them read their dense layers or Engram tables from the ds4 Q2 GGUF (the first default), so keep that file for them.
-**`Choose Model.bat`** lists the models in your model folder and the ones you can add, builds or downloads the one you
-pick and saves your choice (`model-choice.txt`); the next start loads it.
-
-- **ISTA-DASLab's GSQ-RCO** ([ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)):
-  IQ2_XS, IQ2_XXS and IQ1_M.  A script builds each one into the engine's layout: the ds4 Q2 GGUF's dense weights and
-  metadata with GSQ's routed experts, streamed from Hugging Face (every shard SHA-256-checked; 20-30 min at 100 MB/s).
-  They read their Engram tables from the ds4 Q2 GGUF, so keep it.  By hand:
-  `.venv\Scripts\python tools\v41\gsq_stream_merge.py --ours models\DeepSeek-V4.1-Flash-1017-Q2.gguf --build IQ2_XS --out models\ds41-gsq-iq2_xs.gguf`
-  (`--build IQ2_XXS` or `IQ1_M` for the others), then put the file's name in `model-choice.txt`.
-- **Unsloth** ([unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)):
-  UD-IQ1_S to UD-Q8_K_XL, downloaded as they are into `models\unsloth\` (every file SHA-256-checked).  They carry their
-  own Engram tables (IQ4_NL or Q5_K - on UD-IQ1_S as good as DeepSeek's exact ones: 89.3 vs 89.0% -, DeepSeek's
-  exact FP8 from UD-Q3_K_XL), so they need no other file - except UD-IQ3_XXS, whose Q6_K tables the engine does not
-  read: it uses the ds4 Q2 GGUF's, so keep that file for it (Choose Model refuses it without).  To install another
-  Unsloth quant, pick it when the first start asks which model to use, or later in `Choose Model.bat`, then start
-  `Start DeepSeek.bat` again.
-- **The quality mode: Unsloth UD-Q2_K_XL** (Choose Model, 335 GB): 92.5% / 95.3% agreement at the shipped bias at 31 tok/s
-  on 192 GB of RAM (95.0% / 96.8% exact routing, more than EXL3 2.5 bpw's 94.4 / 95.6) and ~25% faster than EXL3.  Unsloth
-  UD-IQ3_XXS (395 GB + the ds4 Q2 file) is the most exact, 92.7% / 95.9% at 28 tok/s; UD-Q2_K_XL stays the faster quality pick.  On 192 GB the launcher gives files with
-  experts this big a 158 GiB arena (20 GiB of RAM kept back instead of 28: close other big programs).  **The default (from
-  110 GB of RAM; UD-IQ1_M below): Unsloth UD-IQ2_XXS** (301 GB): 91.1% / 94.5% - about a point more than the ds4 Q2 GGUF on general text and on
-  code and maths - and about as fast (41.1 vs 40.7 tok/s greedy, 39.7 vs 40.3 at the default sampling).
-  UD-Q2_K_XL and UD-IQ2_XXS: measured on revision 60ad3651 (Unsloth's files of 10-20; the re-made UD-Q2_K_XL tied them in our test), the one Choose Model
-  downloads (UD-IQ1_S and UD-IQ1_M: 8a6ec9cf, the files measured here; UD-IQ1_S's re-made files agree 1.3-1.6 points more than the older ones at the same size; re-download
-  to get them), with the ds4 Q2 file's exact FP8 Engram tables.  They carry their own (Q5_K, in the last file), which
-  the engine reads: as good as the FP8 ones (UD-IQ2_XXS 93.1 vs 92.9% top-1, the same speed), so they need no other
-  file.
-- **EXL3 2.5 bpw** ([bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw](https://huggingface.co/bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw)):
-  routed experts in exllamav3's trellis format (EXL3, 2.5 bits a weight), run by the engine's own EXL3 kernels on the
-  GPU and CPU, with the ds4 Q2 file's dense layers and Engram tables (keep it).  Downloaded as they are into
-  `models\exl3\` (185 GB, every shard SHA-256-checked).  It agrees more with DeepSeek's own model than the ds4 Q2 file
-  (94.4% / 95.6% vs 91.5 / 93.0%) and **writes slower: 25 vs 41 tok/s** on 192 GB of RAM - its experts take
-  more GPU time each, and 159 GiB of them do not all fit the 140 GiB arena, so a few are read from the drive as it
-  writes.  Keep `models\exl3\` on an **internal NVMe** drive: from a USB drive it wrote as fast, but new prompts read
-  ~30% slower and the first load (140 GiB into RAM) took ~6.5 min.  Not measured with less than 192 GB of RAM; there,
-  most of its experts would come from the drive.  By hand: put
-  `exl3/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw` in `model-choice.txt`, or set `DS41_EXL3` to the folder.
-
-Measured here at the settings that ship (route bias 0.28), top-1 agreement with DeepSeek's own model (teacher-forced,
-every token), and writing speed through the server (measured with 0.93; 0.94 changes the drafter and turns pictures
-on, so the speeds may differ slightly):
-
-| | download | general | code + maths | agentic | writing (0.93), 192 / 128 / 96 / 64 GB RAM |
-|---|---|---|---|---|---|
-| ds4 Q2 | 366 GB | 89.9% | 93.1% | 95.1% | 41 / 36 / 27 / 20 tok/s |
-| Unsloth UD-IQ1_S | 233 GB | 89.1% | 91.5% | 95.3% | 41 / 40 / 36 / 31 tok/s |
-| **Unsloth UD-IQ2_XXS** (the default) | 301 GB | **91.1%** | **94.5%** | **95.9%** | 41 / 34 / 29 / 21 tok/s |
-| **Unsloth UD-Q2_K_XL** (the quality mode) | 335 GB | **92.5%** | **95.3%** | **97.0%** | 31 / 27 / 23 / 15 tok/s |
-| Unsloth UD-IQ3_XXS | 395 GB + the ds4 Q2 file | **92.7%** | **95.9%** | **97.4%** | 28 / 23 / 18 / 12 tok/s |
-
-Two hosts of the full model agreed with each other on 98.3% and 98.9% of the same tokens.  Exact routing, what each file
-reaches with no route bias (slower):
-
-| | download | general | code + maths | writing (0.93), 192 / 128 GB RAM | notes |
-|---|---|---|---|---|---|
-| ds4 Q2 | 366 GB | 91.5% | 93.0% | 41 / 36 tok/s | DeepSeek's exact Engram tables |
-| GSQ IQ2_XS | 159 GB + the ds4 Q2 file | 90.0% | 92.9% | 38 / 26 tok/s | answered our task questions as well as the ds4 Q2 file |
-| GSQ IQ2_XXS | 142 GB + the ds4 Q2 file | 87.8% | 89.5% | 41 / 32 tok/s | fewer knowledge questions right; long prompts slower |
-| GSQ IQ1_M | 125 GB + the ds4 Q2 file | 85.5% | - | 42 / 37.5 tok/s | long prompts slower (no fast prompt kernel for IQ1_M) |
-| Unsloth UD-IQ1_S | 233 GB | 90.0% | - | 50 / 49 tok/s (0.95) | faster on small PCs (0.95, bias 0.10: 40 tok/s at 64 GB) |
-| Unsloth UD-IQ1_S (the older files) | 233 GB | 89.3% | 91.1% | 40 / 37.5 tok/s | GSQ IQ1_M's speed with 4 points more agreement |
-| Unsloth UD-IQ1_M | 250 GB | 91.2% | - | 48 / 47 tok/s (0.95) | the pick under 110 GB (0.95, bias 0.10: 35 tok/s, 89.9% at 64 GB) |
-| **Unsloth UD-IQ2_XXS** (the default) | 301 GB | **93.1%** | **95.9%** | 41 / 34 tok/s | +1.6 points general, +3 on code and maths; about as fast as ds4 Q2 (39.7 vs 40.3 at the default sampling) |
-| **Unsloth UD-Q2_K_XL** (the quality mode) | 335 GB | **95.0%** | **96.8%** | 31 / - tok/s | the faster quality pick; ~25% faster than EXL3 2.5 |
-| Unsloth UD-IQ3_XXS | 395 GB + the ds4 Q2 file | **95.5%** | **97.6%** | 28 / - tok/s | the most exact measured here; reads the ds4 Q2 file's Engram tables |
-| Unsloth UD-IQ3_S ... UD-Q8_K_XL | 424-508 GB | - | - | - | load and run (every expert type checked on real weights); not measured |
-| EXL3 2.5 bpw | 185 GB + the ds4 Q2 file | 94.4% | 95.6% | 25 / - tok/s | below UD-Q2_K_XL on both counts; 192 GB of RAM and an internal NVMe |
-
-On 192 GB of RAM ds4 Q2, UD-IQ2_XXS and UD-IQ1_S write about as fast as anything at the default sampling, and of those
-UD-IQ2_XXS agrees best with DeepSeek.  UD-Q2_K_XL agrees more, about 21% slower than the ds4 Q2 GGUF (32.2 vs 40.7 tok/s,
-greedy), and UD-IQ3_XXS is the most exact (92.7% / 95.9% at the shipped bias) at 28 tok/s.
-Speed falls once a model's experts (its file without the Engram table) outgrow the RAM (~150-160 GB of them fit at
-192 GB): the rest is read from the SSD on every token.  So on 192 GB the Unsloth quants above
-UD-IQ2_XXS (UD-Q2_K_XL: ~190 GB of experts) are slower (above UD-IQ3_XXS: not measured yet) - in exchange UD-Q4_K_XL /
-Q8_K_XL keep DeepSeek's own MXFP4 experts.  With 0.93, on 128 GB the smaller files wrote fastest (more of their experts
-fit in RAM): Unsloth UD-IQ1_S 41 and GSQ IQ1_M 37.5 vs 36 tok/s for ds4 Q2 - UD-IQ1_S at about a point less agreement than
-ds4 Q2, IQ1_M at about 6 (exact routing).  UD-IQ1_S also reads long prompts faster than ds4 Q2 (a 16K-token prompt at ~655 vs ~580
-tok/s) and loaded in 25 s vs ~60 s here.  Checked
-against ISTA's files as of 2026-10-25: the merged experts are byte-identical to theirs; their norms, router and router
-bias are bit-identical to the ds4 Q2 file's (GSQ-RCO only changes the routed experts).  Unsloth's Engram hash constants
-(token map, primes, multipliers) are identical to the ds4 Q2 file's.
-
-## What you need
-
-- Windows 10 or 11, 64-bit.
-- An NVIDIA RTX card with 12 GB of VRAM or more, and driver 580 or newer.  24 GB (RTX 3090 / 4090, or a 32 GB 5090)
-  is the fast path; with less, fewer experts fit on the card.  Measured with 0.93 on the 3090 with the expert budget of
-  a smaller card (the default model, 192 GB RAM): 24 GB 41 tok/s, 23 GB (a monitor on the card) 39, 16 GB 31, 12 GB 17
-  (0.94 changes which drafter experts each card keeps, so these may differ slightly).  The
-  launcher adapts by itself: under 20 GB it pins at most 48 GiB of RAM for the card; under 14 GB it pins none and runs
-  without the drafter (a real 12 GB RTX 3060 ran out of memory with them and answers without).  Below 12 GB it
-  probably does not fit (~9 GB is fixed: dense weights, KV, buffers).  RTX 20 (Titan RTX, Quadro RTX): the engine is
-  built for it, not tested here.  GTX 10 series (Pascal) and older cards cannot run it, whatever the driver: CUDA 13
-  supports compute capability 7.5 and newer only.  `Start DeepSeek.bat` says so before downloading anything.
-- 64 GB of RAM or more, 128 GB or more recommended.  Below 56 GB it will probably not start.
-- An x86-64 CPU.  AVX2 (Intel from 2013 / Haswell on, any AMD Ryzen, Threadripper or EPYC) is the fast path; newer
-  instructions (AVX-512, AVX-VNNI) are used where the CPU has them.  Older CPUs get an engine built for them, picked
-  automatically: with AVX but not AVX2 (Sandy / Ivy Bridge Xeons) 38 tok/s, with neither (e.g. Westmere Xeons) 17 -
-  measured on this PC with the newer kernels switched off, against 40 with AVX2.
-- **A fast NVMe SSD - its speed matters.**  The model is read from it while it runs, not just at the start: the Engram
-  tables (~190 GB of the file) for every new piece of text, and the experts that do not fit in RAM on every token.
-  Measured on this PC, the same model on a PCIe 4.0 NVMe (Corsair MP600 PRO, 5.4 GB/s) against a nearly full system
-  SSD (0.8 GB/s): it starts in about 1 minute instead of 4-5, reads a new 4K-token prompt ~40% faster (168 vs 120
-  tok/s) and writes 6-9% faster.  With 128 GB of RAM, more experts come from the SSD, so it matters more.  Use a PCIe
-  4.0 or 5.0 NVMe with room to spare (a nearly full SSD slows down) - not a SATA SSD, a hard disk or a USB drive.
-  The model files take 233-395 GB: about 320 GB free for UD-IQ2_XXS, 270 GB for UD-IQ1_M (a GSQ build adds its 125-159 GB).
-- Python 3.10 to 3.14 (3.11 recommended) - `Start DeepSeek.bat` offers to install it.
-- To build (not needed with the prebuilt engine from the Releases page):
-  - Visual Studio 2019 or 2022 (Build Tools are enough) with "Desktop development with C++";
-  - the CUDA Toolkit 13.0;
-  - Git.
-
-## Prebuilt engine: built by CI
-
-The three `build-ds41-*.zip` files on the Releases page are built on GitHub's public Windows runners by
-[`.github/workflows/release.yml`](.github/workflows/release.yml), not on anyone's PC.  A version tag starts it; the
-log of every build is public under [Actions](https://github.com/musicurgy/delta-inference-engine/actions/workflows/release.yml).
-Each zip is what `build-ds41.bat portable` / `compat-avx` / `compat` builds (CUDA Toolkit 13.0.2 from NVIDIA's
-SHA-256-checked archives, archs 75;86;89;120a), packed by `tools/v41/make_release.py`.  (Releases up to 0.92 were
-built here by hand.)
-
-`Start DeepSeek.bat` checks the zip it downloads against the release's `SHA256SUMS.txt` by itself.  To check one by
-hand:
-
-- **Checksum:** compare `certutil -hashfile build-ds41-portable.zip SHA256` (or `Get-FileHash build-ds41-portable.zip`
-  in PowerShell) with the zip's line in `SHA256SUMS.txt`.
-- **Attestation** (that the zip came from this repository's workflow, at which commit), with the
-  [GitHub CLI](https://cli.github.com/):
-  ```bat
-  gh attestation verify build-ds41-portable.zip --repo musicurgy/delta-inference-engine
-  ```
-  It prints the workflow run and commit the zip was built from; a zip that was not built there fails.
-
-## Setup by hand (what `Start DeepSeek.bat` does for you)
-
-1. **Python environment**, in this folder:
-   ```bat
-   py -3.11 -m venv .venv
-   .venv\Scripts\pip install -r requirements.txt tokenizers==0.23.3 "huggingface_hub[cli]==2.2.0"
-   ```
-2. **Build** with `build-ds41.bat` (10-25 minutes the first time). It builds for this PC's CPU and GPU (on a CPU
-   without AVX2, for that CPU); `build-ds41.bat portable` builds one for any AVX2 CPU and RTX 20, 30, 40 and 50 cards,
-   to copy to other PCs; `build-ds41.bat compat-avx` one for CPUs with AVX but not AVX2, `build-ds41.bat compat` one
-   for any x86-64 CPU (SSE4.2).  The launcher takes the first of `build-ds41`, `build-ds41-portable`,
-   `build-ds41-compat-avx`, `build-ds41-compat` that this CPU can run.
-3. **Model folder:** `DS41_MODELS` in `ds41-paths.bat`, on your fastest NVMe drive (default: `models\` here).
-4. **Model files:** `setup-ds41-models.bat` for ds4 Q2, or `Choose Model.bat` for the others (resumable; every large file is checked against its published SHA-256):
-   - the ds4 Q2 GGUF from
-     [nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF)
-     (366 GB): the model, and DeepSeek's Engram tables inline (byte for byte the official ones), which the engine
-     reads straight from it;
-   - the tokenizer, config and shard index from
-     [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (a few MB);
-   - the speculative-decoding drafter (the biggest single speed-up), built from DeepSeek's own MTP heads in the same
-     repository (three shards, 7.9 GB, removed afterwards) and shrunk to 4.2 GB. The drafter only proposes tokens;
-     the main model checks every one.  From 0.94 it is shrunk with an importance matrix
-     (`tools\v41\serve\drafter-imatrix.bin`): the same size, 0.6% more of its guesses accepted (greedy).  A 0.93
-     install keeps its drafter; `setup-ds41-models.bat drafter-imx` makes the new one (it downloads the 7.9 GB once).
-5. **Start** with `Start DeepSeek.bat`. Use the model name `/v1/models` shows (`deepseek-v4.1-flash-1017-ds4-q2` for
-   ds4 Q2, `deepseek-v4.1-flash-1017-ud-iq2_xxs` for UD-IQ2_XXS; the server answers any name) with any
-   OpenAI-compatible client.
-
 ## Settings
 
-- **One setting file:** `Start DeepSeek.bat` sets everything. Each line in it carries a short note.
-- **Paths:** they live in `ds41-paths.bat`.
-- **Model:** the one the first start or `Choose Model.bat` picked (saved in `model-choice.txt`).
-- **RAM:** the memory used for experts is sized from your installed RAM at every start: total minus 28 GiB, at most
-  140 GiB (on 192 GB-class PCs: 150 for UD-IQ2_XXS, and 158 with 20 GiB kept back for files with bigger experts).
-  `DS41_ARENA_GIB` or `DS41_RAM_RESERVE_GIB` in `ds41-paths.bat` override it.
-- **The first minutes after a reboot are slower** (measured: ~13 instead of ~25 tok/s on a cold start): the model's
-  Engram tables are read from the SSD until Windows has cached the rows your text uses. It speeds up by itself as
-  you use it. An optional Engram hot set (`engram-hot-2g.bin` in the model folder) keeps the most-used rows in RAM
-  from the start; build it with `ds41_engram_hot.exe` - the header of `tools/v41/engine/ds41_engram_hot.cpp` explains
-  how.
+`Start DeepSeek.bat` sets everything, with a short note on each line; paths live in `ds41-paths.bat`, the model in
+`model-choice.txt` (`Choose Model.bat` changes it), the route bias in the chat page's Setup tab.  The memory for
+experts is sized from your installed RAM at every start.  More: [settings in detail](docs/delta/SETUP.md#settings)
+(RAM, port, the first minutes after a reboot) and [every switch](docs/DETAILS.md).
 
-## Uninstall
+## Setup by hand
 
-Delta installs nothing system-wide except Python, and only if the first start installed it for you.  To remove it:
+What `Start DeepSeek.bat` does for you, step by step: [docs/delta/SETUP.md](docs/delta/SETUP.md#setup-by-hand).  In short:
 
-1. Stop DeepSeek (close its window).
-2. If you used "Use from your phone" and allowed it through Windows Firewall: in the chat page, Setup tab, press
-   **Remove the rule** - or run this in an administrator Command Prompt (`8080` is your `DS41_PORT`, if you changed it):
-   ```bat
-   netsh advfirewall firewall delete rule name="Delta DeepSeek 8080"
-   ```
-   If Windows' own firewall prompt asked instead and you allowed it, remove "Python" under Windows Security >
-   Firewall & network protection > Allow an app through firewall.
-3. Delete the model folder: `DS41_MODELS` in `ds41-paths.bat` (by default `models\` inside this folder, so step 4
-   deletes it too).
-4. Delete this folder.  That removes the engine, the Python environment (`.venv\`), your settings and the logs.
+1. **Python environment**, in this folder: `py -3.11 -m venv .venv`, then
+   `.venv\Scripts\pip install -r requirements.txt tokenizers==0.23.3 "huggingface_hub[cli]==2.2.0"`.
+2. **Build** with `build-ds41.bat` (10-25 minutes; Visual Studio Build Tools, the CUDA Toolkit 13.0 and Git), or use
+   the prebuilt engine from the Releases page.
+3. **Model files** with `Choose Model.bat` (or `setup-ds41-models.bat` for ds4 Q2), including the drafter
+   (`setup-ds41-models.bat drafter-imx` makes it).
 
-Also, if you want:
-- Python 3.11, if the first start installed it: Settings > Apps, uninstall "Python 3.11".
-- Download caches in your Windows user folder: `%USERPROFILE%\.cache\huggingface` and `%LOCALAPPDATA%\pip\Cache`.
-- Saved chats live in your browser: delete them in the Chats list first, or clear the browser's data for
-  `127.0.0.1`.
-- Anything you changed yourself under "Windows settings for speed" (power plan, Lock pages in memory, Defender
-  exclusions) stays until you change it back.
+Also there: [checking a release zip](docs/delta/SETUP.md#prebuilt-engine-built-by-ci) and
+[uninstalling](docs/delta/SETUP.md#uninstall).
 
 ## Credits
 
 - [Xolotl](https://github.com/Indras-Mirror/Xolotl) and [Strata](https://github.com/Niko1221/Strata) and their
   contributors: the engine.
 - [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp): the tensor library.
-- nazeshinjite: the ds4 Q2 GGUF.
-- ISTA-DASLab: the GSQ-RCO quants.
 - DeepSeek: the model, and the MTP heads the drafter is built from.
-- Voice (optional): [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0); NVIDIA's
-  [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (CC-BY-4.0), in sherpa-onnx's int8
-  conversion; [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) by hexgrad (Apache-2.0);
-  [Silero VAD](https://github.com/snakers4/silero-vad) (MIT).
-- Documents: [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) / PDFium (Apache-2.0 / BSD-3),
-  python-docx, openpyxl and python-pptx (MIT).
-- [Project Maya](https://github.com/mw00/project-maya) and [antirez/ds4](https://github.com/antirez/ds4): server fixes
-  ported in 0.93 (the end of thinking by its token, TCP_NODELAY; a blank replayed reasoning read as absent); the
-  EXL3 CPU / CUDA kernels started from Project Maya's port of exllamav3's (MIT).
+- [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF): the UD quants; nazeshinjite: the ds4 Q2
+  GGUF; ISTA-DASLab: the GSQ-RCO quants.
+- [Project Maya](https://github.com/mw00/project-maya) and [antirez/ds4](https://github.com/antirez/ds4): ported fixes
+  and test cases, and the start of the EXL3 kernels; Basalt (jesdga95/basalt): the ideas behind several decode switches.
+- Voice and documents: see [docs/delta/APPS.md](docs/delta/APPS.md#credits).
 
 MIT license: [LICENSE](LICENSE).
