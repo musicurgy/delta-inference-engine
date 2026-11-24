@@ -27,12 +27,13 @@ RANK = {"sse": 0, "avx": 1, "avx2": 2, "avx512": 3}
 # folder -> the level it needs when it has no cpu-level.txt
 BUILDS = [("build-ds41", None), ("build-ds41-portable", "avx2"), ("build-ds41-compat-avx", "avx"),
           ("build-ds41-compat", "sse")]
-# text only the 0.95 release engine contains: the --prompt-margin line (ds41_generate.cpp), which the launcher passes for
-# files with bigger experts (an engine without it stops at the unknown option).  Earlier marks: 0.95's pre-release builds
+# text only the 0.95.1 engine contains: its start-up line for the cache seeded at start (ds41_generate.cpp), so an update
+# from 0.95 gets the 0.95.1 engine (faster prompts) and not just the new scripts.  Earlier marks: 0.95 the --prompt-margin
+# line (an engine without it stops at that option), 0.95's pre-release builds
 # STRATA_X3's stats line ("dense graph launches/pass"), 0.94 bounded replay's start-up line, 0.93 the Q5_K Engram
 # reader's message.  An older engine counts as out of date and is replaced, so an update gets the engine the launcher
 # needs.
-ENGINE_MARK = b"VRAM: the prompt path keeps"
+ENGINE_MARK = b"experts in VRAM at start"
 # text only an engine built with utf8.manifest contains: it opens paths with any letter; older ones only plain A-Z
 # ones ("cannot open C:/Users/Jos?/..."), so they count as out of date where the project or model folder needs it
 UTF8_MARK = b"activeCodePage"

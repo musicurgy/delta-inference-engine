@@ -2854,6 +2854,23 @@ int main(int argc, char ** argv) {
             }).detach();
         }
 #endif
+        // 0.95.1 STRATA_SERVE_SEED_EAGER (default 1; 0 = the old deferred seed): the VRAM expert cache is seeded HERE,
+        // before READY, by the same open_cache() every later request uses, instead of inside the first request (users:
+        // "the first requests are slow" - r472 / r477 first turns paid cache open 0.9-1.1 s + seed 1.4-2.1 s before their
+        // first token, and a first batch prompt ran without VRAM hits or the keep-cache path).  The first request then
+        // takes the path request 2 onward always took.  A failed seed falls back to the deferred one (cache stays shut).
+        static const bool seed_eager = !(std::getenv("STRATA_SERVE_SEED_EAGER") && std::getenv("STRATA_SERVE_SEED_EAGER")[0] == '0');
+        if (seed_eager && defer_vram && !cache_open) {
+            const double te = now_ms();
+            if (open_cache()) {
+                cache_open = true;
+                std::fprintf(stderr, "\nserve: VRAM %.2f GiB free -> %lld experts in VRAM at start (STRATA_SERVE_SEED_EAGER, %.1f s)\n",
+                             seed_free, (long long) tier.resident(), (now_ms() - te) / 1000.0);
+            } else {
+                std::fprintf(stderr, "\nserve: seed at start failed (%s) - the first request seeds as before\n", err.c_str());
+                err.clear();
+            }
+        }
         host_pin.pin();   // STRATA_DS41_HOST_PIN (off by default): this thread runs every request from here on
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
@@ -3475,8 +3492,19 @@ int main(int argc, char ** argv) {
                     // value calibrated on long batches.  A short turn gives up about 520 slots of 1,335 for it (a measured log).  Above 512
                     // tokens the 4.3 stays: the batch width below is sized from what this leaves free.
                     static const double keep_fix = std::getenv("STRATA_KEEP_FIX_GIB") ? std::atof(std::getenv("STRATA_KEEP_FIX_GIB")) : 4.3;
+                    // 0.95.1 STRATA_KEEP_PAD_MIB (default one STRATA_VRAM_QUANT_MIB step + 64; 0 = off), batches over 512 tokens:
+                    // shrink_cache_for frees exactly the deficit against a rounded-down free reading, and the width below
+                    // rounds the free VRAM down by a quant step again - so a 1K-8K turn got a cap 24-128 columns under its
+                    // length (r472 / r477 at 128 GB: 940 -> 916, 3657 -> 3610, 7285 -> 7248) and a SECOND full expert sweep
+                    // for the leftover: +2.1-3.6 s for 128 leftover rows (5.9K: 9.45 vs 11.86 s, the "2-8K bimodal").  The pad
+                    // frees ~25 more tail slots so the batch fits in one sweep.  Same routing and maths, one batch cut fewer.
+                    static const double keep_pad = [] {
+                        if (const char * e = std::getenv("STRATA_KEEP_PAD_MIB")) return std::max(0.0, std::atof(e));
+                        return (double) ds41_vram_quant_mib() + 64.0;
+                    }();
                     const double need = ((dh <= 512 ? keep_fix : 4.3) * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
-                                        a.prompt_margin() * 1073741824.0;   // 0.95: the prompt path's margin
+                                        a.prompt_margin() * 1073741824.0 +   // 0.95: the prompt path's margin
+                                        (dh > 512 ? keep_pad * 1048576.0 : 0.0);
                     std::string kerr;
                     const int64_t g = tier.shrink_cache_for((int64_t) need, kerr);
                     if (g >= 0) {

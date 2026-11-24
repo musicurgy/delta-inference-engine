@@ -1600,7 +1600,7 @@ index a9038f1f4..7bcac8c94 100644
  }
  
 diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
-index 5edc967e0..10c10ef59 100644
+index 5edc967e0..d5e5937e2 100644
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
 +++ b/ggml/src/ggml-cuda/lightning-indexer.cu
 @@ -24,7 +24,7 @@ static __global__ void lightning_indexer_kernel_wmma(
@@ -1687,7 +1687,229 @@ index 5edc967e0..10c10ef59 100644
      const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
      const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
  
-@@ -393,7 +427,7 @@ static __global__ void lightning_indexer_kernel_vec(
+@@ -382,6 +416,221 @@ static __global__ void lightning_indexer_kernel_vec(
+     }
+ }
+ 
++// Strata DS4.1 --kv-fp4, STRATA_INDEXER_V2=1: the vec kernel's scores, bit for bit, without its warp shuffles.
++//
++// The vec kernel gives a key to a warp: lane l holds K[4l..4l+3] and Q[h][4l..4l+3], forms the partial
++//   p_l = fma(q.w, k.w, fma(q.z, k.z, fma(q.y, k.y, fma(q.x, k.x, 0))))
++// and warp_reduce_sum adds the 32 partials in xor-butterfly order (offsets 16, 8, 4, 2, 1): lane 0 ends with
++//   s16[j] = p[j] + p[j+16], s8[j] = s16[j] + s16[j+8], s4[j] = s8[j] + s8[j+4], s2[j] = s4[j] + s4[j+2], s2[0] + s2[1]
++// (all lanes hold the same value: an IEEE add is commutative).  Then relu, and score = fma(relu, w[h], score) head by
++// head (nvcc contracts "score += sum*w" and "acc += v*u" under -use_fast_math - fma.rn.ftz.f32 in the PTX).
++//
++// Here one THREAD owns a key: its 128 K values are dequantized once into registers (the same dequantize_V call the
++// vec kernel makes per lane, so the same floats), Q comes from shared memory as a warp-wide broadcast, and the 32
++// partials are made in bit-reversed lane order (0, 16, 8, 24, 4, ...) so the butterfly tree above folds incrementally
++// with at most 5 partials in flight - the same adds of the same operands, in the same tree.  The fma / add / relu
++// are written as explicit __fmaf_rn / __fadd_rn so nothing depends on contraction (both compile to fma.rn.ftz.f32 /
++// add.rn.ftz.f32 under -use_fast_math, as the vec kernel's do).
++//
++// Masked-block skip: the vec kernel decides per 64-key block (K_VECS_PER_BLOCK); a skipped block writes the mask
++// value (-inf) where the full path would write score + -inf (also -inf unless the score is +inf / NaN).  To keep even
++// that case identical this kernel makes the same decision on the same 64-key groups (a block holds
++// KEYS_PER_BLOCK / 64 of them; a dead group's two warps skip the math but still meet the barriers).
++template <int KEYS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
++static __global__ void __launch_bounds__(KEYS_PER_BLOCK) lightning_indexer_kernel_v2(
++        const float * Q, const char * K, const float * W, const half * M, float * dst,
++        int64_t n_stream, int64_t n_batch, int64_t n_kv,
++        size_t nb1, size_t nb2, size_t nb3,
++        size_t nbq1, size_t nbq2, size_t nbq3,
++        size_t nbk1, size_t nbk2, size_t nbk3,
++        size_t nbw1, size_t nbw2, size_t nbw3,
++        size_t nbm1, size_t nbm2, size_t nbm3,
++        int64_t nem3, int skip_masked
++    ) {
++    static_assert(N_EMBD == 128 && WARP_SIZE == 32, "the lane split mirrors the vec kernel: 32 lanes x float4 = 128");
++    constexpr int SKIP_GROUP = 64;                    // the vec kernel's K_VECS_PER_BLOCK (8 warps x 8 keys)
++    static_assert(KEYS_PER_BLOCK % SKIP_GROUP == 0, "whole skip groups per block");
++    constexpr int N_GROUPS     = KEYS_PER_BLOCK / SKIP_GROUP;
++    constexpr int N_LANES      = N_EMBD / 4;          // 32: the vec kernel's lanes
++    constexpr int N_HEAD_INNER = N_HEAD / 4;          // Q / w staged in shared memory N_HEAD/4 heads at a time
++
++    const int i_batch  = blockIdx.y;
++    const int i_stream = blockIdx.z;
++    const int tid      = threadIdx.x;
++
++    const int64_t start_kv_block = (int64_t) blockIdx.x * KEYS_PER_BLOCK;
++    const int64_t i_kv           = start_kv_block + tid;
++
++    const half * m_base   = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
++    float      * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
++
++    bool active = true;   // warp-uniform: a skip group is two whole warps
++    if (skip_masked) {
++        __shared__ int group_live[N_GROUPS];
++        if (tid < N_GROUPS) {
++            group_live[tid] = 0;
++        }
++        __syncthreads();
++        if (i_kv < n_kv && __half2float(m_base[i_kv]) != -INFINITY) {
++            group_live[tid / SKIP_GROUP] = 1;
++        }
++        __syncthreads();
++        active = group_live[tid / SKIP_GROUP] != 0;
++        bool any = false;
++#pragma unroll
++        for (int g = 0; g < N_GROUPS; ++g) {
++            any = any || group_live[g] != 0;
++        }
++        if (!active && i_kv < n_kv) {
++            dst_base[i_kv] = __half2float(m_base[i_kv]);   // -inf, as the vec kernel's skipped block writes
++        }
++        if (!any) {
++            return;   // block-uniform
++        }
++    }
++
++    const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
++    const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
++
++    // this thread's key, dequantized exactly as the vec kernel's lane l dequantizes K[4l..4l+3]
++    float4 k_reg[N_LANES];
++    if (active && i_kv < n_kv) {
++        if constexpr (TYPE_K == GGML_TYPE_F32) {
++            const float4 * k_base = (const float4 *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
++#pragma unroll
++            for (int l = 0; l < N_LANES; ++l) {
++                k_reg[l] = k_base[l];
++            }
++        } else {
++            constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, float, 4>();
++            const void * k_base = (const void *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
++#pragma unroll
++            for (int l = 0; l < N_LANES; ++l) {
++                dequantize_k(k_base, &k_reg[l], l * 4);
++            }
++        }
++    } else {
++#pragma unroll
++        for (int l = 0; l < N_LANES; ++l) {
++            k_reg[l] = make_float4(0, 0, 0, 0);
++        }
++    }
++
++    float score = 0.0f;
++
++    __shared__ float  w_shared[N_HEAD_INNER];
++    __shared__ float4 q_shared_f[N_HEAD_INNER][N_LANES];
++
++    for (int i_head_0 = 0; i_head_0 < N_HEAD; i_head_0 += N_HEAD_INNER) {
++        if (tid < N_HEAD_INNER) {
++            w_shared[tid] = w_base[i_head_0 + tid];
++        }
++        constexpr int n_q = N_HEAD_INNER * N_LANES;
++#pragma unroll
++        for (int i_q = tid; i_q < n_q; i_q += KEYS_PER_BLOCK) {
++            const int i_head_inner = i_q / N_LANES;
++            const int i_head = i_head_0 + i_head_inner;
++            const int i_embd = i_q % N_LANES;
++            q_shared_f[i_head_inner][i_embd] = *(const float4 *) (q_base + i_head*nbq1 + i_embd*sizeof(float4));
++        }
++
++        __syncthreads();
++
++        if (active) {
++            for (int i_head_inner = 0; i_head_inner < N_HEAD_INNER; ++i_head_inner) {
++                // butterfly tree, folded in bit-reversed lane order: a_n holds the pending left operand of level n
++                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f;
++                float sum = 0.0f;
++#pragma unroll
++                for (int t = 0; t < N_LANES; ++t) {
++                    const int l = ((t & 1) << 4) | ((t & 2) << 2) | (t & 4) | ((t & 8) >> 2) | ((t & 16) >> 4);
++                    const float4 q = q_shared_f[i_head_inner][l];
++                    float p = 0.0f;
++                    p = __fmaf_rn(q.x, k_reg[l].x, p);
++                    p = __fmaf_rn(q.y, k_reg[l].y, p);
++                    p = __fmaf_rn(q.z, k_reg[l].z, p);
++                    p = __fmaf_rn(q.w, k_reg[l].w, p);
++                    if (t & 1) {
++                        p = __fadd_rn(a0, p);                       // s16
++                        if (t & 2) {
++                            p = __fadd_rn(a1, p);                   // s8
++                            if (t & 4) {
++                                p = __fadd_rn(a2, p);               // s4
++                                if (t & 8) {
++                                    p = __fadd_rn(a3, p);           // s2
++                                    if (t & 16) {
++                                        sum = __fadd_rn(a4, p);     // s1 (t == 31)
++                                    } else {
++                                        a4 = p;
++                                    }
++                                } else {
++                                    a3 = p;
++                                }
++                            } else {
++                                a2 = p;
++                            }
++                        } else {
++                            a1 = p;
++                        }
++                    } else {
++                        a0 = p;
++                    }
++                }
++
++                // ReLU, weight - as the vec kernel's lane 0
++                sum = (sum > 0.0f) ? sum : 0.0f;
++                score = __fmaf_rn(sum, w_shared[i_head_inner], score);
++            }
++        }
++
++        __syncthreads();
++    }
++
++    if (active && i_kv < n_kv) {
++        dst_base[i_kv] = __fadd_rn(score, __half2float(m_base[i_kv]));
++    }
++}
++
++// STRATA_INDEXER_V2 launch (also called by tools/v41/engine/test_indexer_v2.cu)
++template <int64_t N_HEAD, ggml_type TYPE_K>
++static void lightning_indexer_launch_v2(
++        const float * q_d, const char * k_d, const float * w_d, const half * m_d, float * dst_d,
++        int64_t n_stream, int64_t n_batch, int64_t n_kv,
++        size_t nb1, size_t nb2, size_t nb3,
++        size_t nbq1, size_t nbq2, size_t nbq3,
++        size_t nbk1, size_t nbk2, size_t nbk3,
++        size_t nbw1, size_t nbw2, size_t nbw3,
++        size_t nbm1, size_t nbm2, size_t nbm3,
++        int64_t nem3, int skip_masked, cudaStream_t stream) {
++    constexpr int KEYS_PER_BLOCK = 128;
++    const dim3 block(KEYS_PER_BLOCK, 1, 1);
++    const dim3 grid((unsigned) ((n_kv + KEYS_PER_BLOCK - 1) / KEYS_PER_BLOCK), (unsigned) n_batch, (unsigned) n_stream);
++    lightning_indexer_kernel_v2<KEYS_PER_BLOCK, 128, N_HEAD, TYPE_K><<<grid, block, 0, stream>>>(
++        q_d, k_d, w_d, m_d, dst_d,
++        n_stream, n_batch, n_kv,
++        nb1, nb2, nb3,
++        nbq1, nbq2, nbq3,
++        nbk1, nbk2, nbk3,
++        nbw1, nbw2, nbw3,
++        nbm1, nbm2, nbm3,
++        nem3, skip_masked);
++}
++
++#define LIGHTNING_INDEXER_V2_CASE(n_head, K, type_K)                                       \
++    if (indexer_v2 && K->type == (type_K)) {                                                \
++        lightning_indexer_launch_v2<n_head, type_K>(                                        \
++            q_d, k_d, w_d, m_d, dst_d,                                                      \
++            n_stream, n_batch, n_kv,                                                        \
++            nb1, nb2, nb3,                                                                  \
++            nbq1, nbq2, nbq3,                                                               \
++            nbk1, nbk2, nbk3,                                                               \
++            nbw1, nbw2, nbw3,                                                               \
++            nbm1, nbm2, nbm3,                                                               \
++            nem3, skip_masked, ctx.stream());                                               \
++    } else
++
++#ifndef GGML_CUDA_LIGHTNING_INDEXER_KERNELS_ONLY   // the standalone test takes the kernels and the v2 launch only
++
+ #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
+     if (K->type == (type_K)) {                                                              \
+         lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
+@@ -393,7 +642,7 @@ static __global__ void lightning_indexer_kernel_vec(
              nbk1, nbk2, nbk3,                                                               \
              nbw1, nbw2, nbw3,                                                               \
              nbm1, nbm2, nbm3,                                                               \
@@ -1696,7 +1918,7 @@ index 5edc967e0..10c10ef59 100644
          );                                                                                  \
      } else
  
-@@ -446,9 +480,15 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -446,9 +695,23 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
      const int device = ggml_cuda_get_device();
      const int cc     = ggml_cuda_info().devices[device].cc;
  
@@ -1706,6 +1928,14 @@ index 5edc967e0..10c10ef59 100644
 +        return v && v[0] == '0' ? 0 : 1;
 +    }();
 +
++    // Strata: STRATA_INDEXER_V2 (default on; =0 the vec kernel) scores MXFP4 keys with lightning_indexer_kernel_v2 (thread
++    // per key, no shuffles, bit-identical to the vec kernel: 95 of 95 unit cases, 3.5x the kernel; a 147K-token prompt
++    // at 128 GB 931 -> 1,143 tok/s, decode unchanged)
++    static const bool indexer_v2 = [] {
++        const char * v = getenv("STRATA_INDEXER_V2");
++        return !(v && v[0] == '0');
++    }();
++
      if (n_embd == 128 && n_head == 64) {
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 -        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
@@ -1713,11 +1943,12 @@ index 5edc967e0..10c10ef59 100644
              // use wmma kernel
              constexpr int K_VECS_PER_BLOCK = 32;
              constexpr int WARPS_PER_BLOCK = 8;
-@@ -484,12 +524,14 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -484,12 +747,15 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q5_1)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q8_0)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_BF16)
 +            // Strata DS4.1 --kv-fp4: MXFP4 keys on the fp32 vec kernel (as BF16) - the wmma kernel computes in fp16
++            LIGHTNING_INDEXER_V2_CASE(64, k, GGML_TYPE_MXFP4)
 +            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_MXFP4)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_F32)
              GGML_ABORT("fatal error");
@@ -1729,16 +1960,17 @@ index 5edc967e0..10c10ef59 100644
              // use wmma kernel
              constexpr int K_VECS_PER_BLOCK = 32;
              constexpr int WARPS_PER_BLOCK = 8;
-@@ -525,6 +567,8 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -525,6 +791,9 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q5_1)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q8_0)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_BF16)
 +            // Strata DS4.1 --kv-fp4: MXFP4 keys on the fp32 vec kernel (as BF16) - the wmma kernel computes in fp16
++            LIGHTNING_INDEXER_V2_CASE(32, k, GGML_TYPE_MXFP4)
 +            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_MXFP4)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
              GGML_ABORT("fatal error");
          }
-@@ -581,6 +625,7 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
+@@ -581,8 +850,11 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
          case GGML_TYPE_Q5_0:
          case GGML_TYPE_Q4_1:
          case GGML_TYPE_Q4_0:
@@ -1746,6 +1978,10 @@ index 5edc967e0..10c10ef59 100644
              return true;
          default:
              return false;
+     }
+ }
++
++#endif // GGML_CUDA_LIGHTNING_INDEXER_KERNELS_ONLY
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
 index b13b34ee9..20d07e579 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
@@ -1876,10 +2112,18 @@ index b13b34ee9..20d07e579 100644
      ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
  }
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 6923f3510..c4359210d 100644
+index 6923f3510..8090a1fab 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
-@@ -208,7 +208,7 @@ struct ggml_cuda_mmq_config {
+@@ -85,6 +85,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
+         case GGML_TYPE_Q6_K:
+         case GGML_TYPE_IQ2_XXS:
+         case GGML_TYPE_IQ2_XS:
++        case GGML_TYPE_IQ1_M:
+         case GGML_TYPE_IQ2_S:
+         case GGML_TYPE_IQ3_XXS:
+         case GGML_TYPE_IQ3_S:
+@@ -208,7 +209,7 @@ struct ggml_cuda_mmq_config {
          static_assert((nthreads_) %  32 == 0 && (nthreads_)       <= 512, "bad nthreads");                                                \
          static_assert(                          (occupancy_)      <=   8, "bad occupancy");                                               \
          static_assert((I_)        %  32 == 0,                             "bad I");                                                       \
@@ -1888,7 +2132,7 @@ index 6923f3510..c4359210d 100644
          static_assert((K_vram_)   % 256 == 0,                             "bad K_vram");                                                  \
          return ggml_cuda_mmq_config((type_), (nthreads_), (occupancy_), (I_), (J_), (sram_layout_), (K_vram_), (stream_k_), (fallback_)); \
      }                                                                                                                                     \
-@@ -369,15 +369,8 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
+@@ -369,15 +370,8 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
      return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback));
  }
  
@@ -1906,7 +2150,41 @@ index 6923f3510..c4359210d 100644
  }
  
  static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback) {
-@@ -1382,7 +1375,7 @@ struct mmq_args {
+@@ -413,6 +407,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
+         case GGML_TYPE_Q6_K:    return MMQ_DP4A_TXS_Q6_K;
+         case GGML_TYPE_IQ2_XXS: return MMQ_DP4A_TXS_Q8_0;
+         case GGML_TYPE_IQ2_XS:  return MMQ_DP4A_TXS_Q8_0_16;
++        case GGML_TYPE_IQ1_M:   return MMQ_DP4A_TXS_Q8_0_16;
+         case GGML_TYPE_IQ2_S:   return MMQ_DP4A_TXS_Q8_0_16;
+         case GGML_TYPE_IQ3_XXS: return MMQ_DP4A_TXS_Q8_0;
+         case GGML_TYPE_IQ3_S:   return MMQ_DP4A_TXS_Q8_0;
+@@ -637,6 +632,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
+                     ggml_cuda_mmq_load_tiles_iq2_xs<type, J, fallback>,
+                     ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,
+                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
++            case GGML_TYPE_IQ1_M:
++                return ggml_cuda_mmq_util_funcs(
++                    VDR_IQ2_XS_Q8_1_MMQ,
++                    ggml_cuda_mmq_load_tiles_iq1_m<type, J, fallback>,
++                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,
++                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+             case GGML_TYPE_IQ2_S:
+                 return ggml_cuda_mmq_util_funcs(
+                     VDR_IQ2_S_Q8_1_MMQ,
+@@ -801,6 +802,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
+                 ggml_cuda_mmq_load_tiles_iq2_xs<type, J, fallback>,
+                 ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>,
+                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
++        case GGML_TYPE_IQ1_M:
++            return ggml_cuda_mmq_util_funcs(
++                -1,
++                ggml_cuda_mmq_load_tiles_iq1_m<type, J, fallback>,
++                ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>,
++                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+         case GGML_TYPE_IQ2_S:
+             return ggml_cuda_mmq_util_funcs(
+                 -1,
+@@ -1382,7 +1389,7 @@ struct mmq_args {
      int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
      int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
      int64_t ncols_max;
@@ -1915,7 +2193,7 @@ index 6923f3510..c4359210d 100644
  };
  
  static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
-@@ -1441,7 +1434,17 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+@@ -1441,7 +1448,17 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
      const int ntiles_dst = ntx * nty * ntzw;
      const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
      const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
@@ -1934,7 +2212,7 @@ index 6923f3510..c4359210d 100644
  
      GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
  
-@@ -1476,32 +1479,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+@@ -1476,32 +1493,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
  
  template <ggml_type type, bool fallback>
  void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -1968,7 +2246,7 @@ index 6923f3510..c4359210d 100644
          case   8:
              launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);
              break;
-@@ -1551,7 +1529,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1551,7 +1543,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
              launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
              break;
          default:
@@ -1977,7 +2255,7 @@ index 6923f3510..c4359210d 100644
              GGML_ABORT("fatal error");
              break;
      }
-@@ -1559,11 +1537,11 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1559,11 +1551,11 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
  
  template <ggml_type type>
  void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -1992,6 +2270,14 @@ index 6923f3510..c4359210d 100644
          mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
      }
  }
+@@ -1588,6 +1580,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q6_K);
+ extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
+ extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XXS);
+ extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XS);
++extern DECL_MMQ_CASE(GGML_TYPE_IQ1_M);
+ extern DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
+ extern DECL_MMQ_CASE(GGML_TYPE_IQ3_XXS);
+ extern DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
 index 6305230b1..1c6aa45ae 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
@@ -2886,3 +3172,390 @@ index a74f63767..f991f1407 100644
 +// test hook: the fused kernel vs rms_norm_mul + quantize_row_q8_1_cuda on host data (norm.cu)
 +int ggml_cuda_qfuse_compare_rms(int device, const float * x, const float * w, int ncols, int nrows, float eps,
 +                                float * f_fused, float * f_ref, void * q_fused, void * q_ref);
+diff --git a/ggml/src/ggml-cuda/mmq-config-ampere.cuh b/ggml/src/ggml-cuda/mmq-config-ampere.cuh
+index 9f9fd1973..daa3aced6 100644
+--- a/ggml/src/ggml-cuda/mmq-config-ampere.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-ampere.cuh
+@@ -242,21 +242,37 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_IQ2_XXS, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+ 
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+ 
+     CASE(GGML_TYPE_IQ2_S, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_IQ2_S, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+diff --git a/ggml/src/ggml-cuda/mmq-config-cdna.cuh b/ggml/src/ggml-cuda/mmq-config-cdna.cuh
+index 4a8d89f72..74f7c42a5 100644
+--- a/ggml/src/ggml-cuda/mmq-config-cdna.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-cdna.cuh
+@@ -116,12 +116,19 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_IQ2_XXS, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+ 
+     CASE(GGML_TYPE_IQ2_XS, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_IQ1_M, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_IQ2_XS, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_IQ1_M, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_IQ2_XS, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_IQ1_M, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_IQ2_XS, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 512, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 512, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_IQ2_XS, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_IQ1_M, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, false);
+ 
+     CASE(GGML_TYPE_IQ2_S, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_IQ2_S, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, true, true);
+diff --git a/ggml/src/ggml-cuda/mmq-config-gcn.cuh b/ggml/src/ggml-cuda/mmq-config-gcn.cuh
+index 24af2ef2b..cbcf4a91c 100644
+--- a/ggml/src/ggml-cuda/mmq-config-gcn.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-gcn.cuh
+@@ -180,16 +180,27 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_IQ2_XXS, 512, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_XS, 256, 2,  64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2,  64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 512, 2, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 512, 2, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 512, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 512, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2,  64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2,  64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2,  64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2,  64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 512, 2, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 512, 2, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2,  64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2,  64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 512, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 512, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_S, 256, 2,  64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_S, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+index 83eb7c146..cf2cefc1a 100644
+--- a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+@@ -172,16 +172,27 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_IQ2_XXS, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_S, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_S, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh b/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh
+index 2a8dc9e1a..71cce3ec9 100644
+--- a/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh
+@@ -172,16 +172,27 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_IQ2_XXS, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_S, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_S, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-config-rdna2.cuh b/ggml/src/ggml-cuda/mmq-config-rdna2.cuh
+index 8324d9e1a..7782f2b3d 100644
+--- a/ggml/src/ggml-cuda/mmq-config-rdna2.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-rdna2.cuh
+@@ -172,16 +172,27 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_IQ2_XXS, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_S, 256, 2, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_S, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh b/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
+index 180b2d937..1fdef2766 100644
+--- a/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
+@@ -181,17 +181,29 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_IQ2_XXS, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_S, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_S, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-config-rdna3.cuh b/ggml/src/ggml-cuda/mmq-config-rdna3.cuh
+index 3a3ef7bd9..645fc5409 100644
+--- a/ggml/src/ggml-cuda/mmq-config-rdna3.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-rdna3.cuh
+@@ -173,16 +173,27 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_IQ2_XXS, 128, 4,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 128, 4,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 4,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 128, 4,  64,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 4,  64,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 128, 4,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 4,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_S, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_S, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-config-rdna4.cuh b/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
+index 9293d9d55..968cae447 100644
+--- a/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
+@@ -181,17 +181,29 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_IQ2_XXS, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_IQ2_XS, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_IQ1_M, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);
+ 
+     CASE(GGML_TYPE_IQ2_S, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_IQ2_S, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+index 7f00bad94..fcc43287b 100644
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+@@ -1224,6 +1224,77 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+     }
+ }
+ 
++// xolotl: IQ1_M on MMQ, in IQ2_XS's tile layout (int8 weights, one float scale per 16 weights).  Per 8 weights a grid
++// index (qs + 3 bits of a qh nibble) and a delta sign (bit 3 of that nibble); per 16 a 3-bit scale s; the fp16 super-scale
++// D in the top nibbles of the 4 scale words.  weight = D*(2s+1)*(g + delta), g in {0,1,2}, delta -7/8 or -9/8
++// = (D*(2s+1)/8) * q with q = 8g - 7 or 8g - 9: integer-exact, so the result matches vec_dot_iq1_m_q8_1 up to float order.
++template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_m(
++        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
++    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
++    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
++    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
++    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
++
++#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++    int   * x_qs = (int   *)  x_tile;
++    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
++#else
++    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ1_M, I);
++    int   * x_qs = (int   *)  x_tile;
++    float * x_df = (float *) (x_qs + txs.qs);
++#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++
++    constexpr int threads_per_row = MMQ_ITER_K / 32;   // one thread per 32 weights (4 groups of 8, 2 scales)
++    constexpr int nrows = warp_size / threads_per_row;
++    const int kqsx = threadIdx.x % threads_per_row;
++
++#pragma unroll
++    for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
++        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
++
++        if (fallback) {
++            i = min(i, i_max);
++        }
++
++        const block_iq1_m * bxi = (const block_iq1_m *) x + kbx0 + i*stride;
++
++        const int       qs_packed = get_int_b2(bxi->qs, kqsx);
++        const uint8_t * qs        = (const uint8_t *) &qs_packed;
++        const int       qh        = bxi->qh[2*kqsx + 0] | (bxi->qh[2*kqsx + 1] << 8);
++
++    #pragma unroll
++        for (int l = 0; l < 4; ++l) {
++            const int n    = qh >> (4*l);
++            const int grid = iq1s_grid_gpu[qs[l] | ((n & 0x07) << 8)];
++            const int k    = (n & 0x08) ? 0x09090909 : 0x07070707;
++
++            const int q0 = __vsub4(((grid >> 0) & 0x0F0F0F0F) << 3, k);
++            const int q1 = __vsub4(((grid >> 4) & 0x0F0F0F0F) << 3, k);
++
++#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++            x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = q0;
++            x_qs[i*sram_stride + 8*kqsx + (2*l + 1)] = q1;
++#else
++            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l + 0)] = q0;
++            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l + 1)] = q1;
++#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++        }
++
++        const uint16_t * sc = (const uint16_t *) bxi->scales;
++        iq1m_scale_t scale;
++        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
++        const float d   = __half2float(scale.f16) * 0.125f;
++        const int   tmp = sc[kqsx/2] >> (6*(kqsx%2));
++#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++        x_df[i*sram_stride                             + 2*kqsx+0] = d * (2*((tmp >> 0) & 0x07) + 1);
++        x_df[i*sram_stride                             + 2*kqsx+1] = d * (2*((tmp >> 3) & 0x07) + 1);
++#else
++        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kqsx+0] = d * (2*((tmp >> 0) & 0x07) + 1);
++        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kqsx+1] = d * (2*((tmp >> 3) & 0x07) + 1);
++#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++    }
++}
++
+ template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq2_s(
+         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+diff --git a/ggml/src/ggml-cuda/template-instances/mmq-instance-iq1_m.cu b/ggml/src/ggml-cuda/template-instances/mmq-instance-iq1_m.cu
+new file mode 100644
+index 000000000..7d04515da
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/mmq-instance-iq1_m.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../mmq.cuh"
++
++DECL_MMQ_CASE(GGML_TYPE_IQ1_M);

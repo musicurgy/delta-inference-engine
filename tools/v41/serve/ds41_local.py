@@ -506,9 +506,11 @@ def expand(cfg):
             ENGINE_ENV["STRATA_DENSE_REQUANT"] = "q5_K"
     except Exception as e:
         print(f"ds41_local: expert-type check skipped ({e})")
-    # STRATA_CHUNK_CPU (Start DeepSeek.bat: 3) helps short prompts only with every expert in RAM: on 96 / 64 GB the CPU pool
-    # also serves the file tier and prompts read ~3.5% slower at k=3 (B2's lowk, 11-03) - off below 192 GB-class RAM
-    if total_ram_gib() < 170 and os.environ.get("STRATA_CHUNK_CPU", "") not in ("", "0"):
+    # STRATA_CHUNK_CPU (Start DeepSeek.bat: 3): on 96 / 64 GB the CPU pool also serves the file tier and prompts read ~3.5%
+    # slower at k=3 (B2's lowk, 11-03, ds4 Q2) - off below 110 GiB.  0.95.1: ON at 128 GB (it was off below 170): at a real
+    # 128 GB (57 GiB pinned, UD-IQ2_XXS, two clean pairs) prompts of 200 / 500 / 4K tokens read 19 / 10 / 18%
+    # faster (3.85 vs 4.77 s, 5.4 vs 6.1, 9.5 vs 11.6), 1K the same, writing unchanged
+    if total_ram_gib() < 110 and os.environ.get("STRATA_CHUNK_CPU", "") not in ("", "0"):
         ENGINE_ENV["STRATA_CHUNK_CPU"] = "0"
     # Start DeepSeek.bat sets the larger drafter counts (<keep>:112,80,48) on a card of 22 GB or more (measured, at
     # 192 GB: ~+3% writing).  The VRAM they take comes out of the expert cache, and on a 64 GB PC the cache's misses

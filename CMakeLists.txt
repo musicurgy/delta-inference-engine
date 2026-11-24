@@ -1500,6 +1500,9 @@ if(STRATA_NATIVE_EXPERTS)
     # merge they were advertised with no instance and the link failed (undefined mul_mat_q_case<GGML_TYPE_Q4_0>).
     # Adding them here is what the generator's contract asks for: advertised == instantiated.
     list(APPEND _strata_mmq_cuda_types q4_0 q4_1 iq1_s)
+    # 0.95.1: IQ1_M (ISTA's GSQ-RCO IQ2_XXS / IQ1_M experts) - its loader is in xolotl-ggml.patch (IQ2_XS's tile layout);
+    # without it those layers fell back to the token-at-a-time MMVQ kernels: prompts ~3.4x slower on those files
+    list(APPEND _strata_mmq_cuda_types iq1_m)
     if(STRATA_MMQ_KQUANTS)
       # xolotl: the fork and GLM both added q2_k/q3_k/mxfp4 here for the SAME reason (MiMo/DS4 GSQ-RCO experts;
       # without them the dispatch cases in moe_mmq.cu fail to link).  Kept as the fork's two appends.

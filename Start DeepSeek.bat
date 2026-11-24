@@ -135,8 +135,9 @@ rem new prompts: experts that 3 or fewer of the prompt's tokens route to run in 
 rem rest - time to first token -40% (a ~180-token prompt 3.9 -> 2.35 s), decode unchanged (0.93, measured on all three
 rem menu models); batches up to 16,384 tokens: 1,300 tokens -15%, 25K -2%, 64K -3.5%, same agreement.  0 turns it off.
 rem Over 1,024 tokens the limit is 6 tokens: its experts carry more rows and each still costs a whole copy over PCIe: 0.6 s
-rem off prompts of 1-13K tokens, same agreement.  ds41_local.py turns it off (0) on PCs under ~170 GiB of RAM, where
-rem the CPU pool also serves the experts read from the SSD and prompts read ~3.5% slower with it.
+rem off prompts of 1-13K tokens, same agreement.  ds41_local.py turns it off (0) on PCs under ~110 GiB of RAM, where
+rem the CPU pool also serves many experts read from the SSD and prompts read ~3.5% slower with it (on 128 GB it is on
+rem since 0.95.1: 200 / 500 / 4K-token prompts 10-19% faster, measured).
 set STRATA_CHUNK_CPU=3
 set STRATA_CHUNK_CPU_BIG=6
 set STRATA_CHUNK_CPU_MAXN=16384
@@ -167,6 +168,9 @@ set STRATA_SERVE_BATCH_MIN=64
 set STRATA_PASS_CAP_MIN=4096
 set STRATA_ENGRAM_THREADS=64
 set STRATA_KGATHER=1
+rem 0.95.1: long prompts score the attention indexer with a kernel that skips the warp shuffles (STRATA_INDEXER_V2, on
+rem by default in the engine; 'set STRATA_INDEXER_V2=0' before starting turns it off): bit-identical scores, a 147K-token
+rem prompt at 128 GB 931 -> 1,143 tok/s, 60K +8%, 32K +4% (measured)
 set STRATA_PRESTAGE_GIB=0
 set STRATA_SERVE_DSPARK_EVICT=4096
 rem Bounded replay (0.94): only a prompt's last 128 tokens run layers 21-39, as DeepSeek's own design does.  Agent

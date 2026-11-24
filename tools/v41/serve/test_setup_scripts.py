@@ -120,7 +120,7 @@ class OldEngine(unittest.TestCase):
     def test_an_engine_without_the_prompt_margin_is_out_of_date(self):
         # an engine from before --prompt-margin (it has the earlier 0.95 builds' mark) would refuse the option the launcher
         # passes for files with bigger experts: it is replaced like any older engine
-        self.assertEqual(cpu_level.ENGINE_MARK, b"VRAM: the prompt path keeps")
+        self.assertEqual(cpu_level.ENGINE_MARK, b"experts in VRAM at start")
         self.engine(b"dense graph launches/pass " + cpu_level.UTF8_MARK)
         folder, why = cpu_level.pick_build()
         self.assertIsNone(folder)
@@ -130,6 +130,13 @@ class OldEngine(unittest.TestCase):
         src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engine", "ds41_generate.cpp"), encoding="utf-8").read()
         self.assertIn(cpu_level.ENGINE_MARK.decode(), src)   # a string the engine prints, so the compiled exe holds it
         self.assertIn('"--prompt-margin"', src)
+
+    def test_a_095_engine_is_replaced_by_the_0951_one(self):
+        # 0.95's engine has the --prompt-margin line but not the seeded-at-start line: an update replaces it
+        self.engine(b"VRAM: the prompt path keeps " + cpu_level.UTF8_MARK)
+        folder, why = cpu_level.pick_build()
+        self.assertIsNone(folder)
+        self.assertIn("older than this version of the scripts (an update)", why)
 
     def test_a_path_with_other_letters_keeps_its_reason(self):
         self.engine(b"old")
